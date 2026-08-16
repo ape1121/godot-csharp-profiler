@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test-package:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      - name: Build addon and weaver
+        shell: pwsh
+        run: |
+          dotnet build GodotCSharpProfiler.csproj -c Release
+          dotnet build src/GodotCSharpProfiler.Fody/GodotCSharpProfiler.Fody.csproj -c Release
+      - name: Test
+        shell: pwsh
+        run: ./scripts/test-all.ps1
+      - name: Build and validate package
+        shell: pwsh
+        run: ./scripts/build-release.ps1 -Version 0.1.0-ci -SkipTests
+      - name: Packaging tests
+        shell: pwsh
+        run: dotnet run --project tests/GodotCSharpProfiler.Packaging.Tests/GodotCSharpProfiler.Packaging.Tests.csproj -c Release -- --archive artifacts/release/godot-csharp-profiler-0.1.0-ci.zip
+      - uses: actions/upload-artifact@v4
+        if: matrix.os == 'ubuntu-latest'
+        with:
+          name: asset-library-package
+          path: |
+            artifacts/release/*.zip
+            artifacts/release/SHA256SUMS
+            artifacts/release/release.json
+          if-no-files-found: error
+
+  reproducible:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      - shell: pwsh
+        run: |
+          ./scripts/build-release.ps1 -Version 0.1.0-ci -OutputDirectory artifacts/one -SkipTests
+          ./scripts/build-release.ps1 -Version 0.1.0-ci -OutputDirectory artifacts/two -SkipTests
+          $a=(Get-FileHash artifacts/one/godot-csharp-profiler-0.1.0-ci.zip).Hash
+          $b=(Get-FileHash artifacts/two/godot-csharp-profiler-0.1.0-ci.zip).Hash
+          if ($a -ne $b) { throw "Release archives are not reproducible: $a != $b" }

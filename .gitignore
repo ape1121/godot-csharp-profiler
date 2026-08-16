@@ -20,3 +20,6 @@ Thumbs.db
 TestResults/
 artifacts/
 .tmp/
+
+# Publication output
+artifacts/
