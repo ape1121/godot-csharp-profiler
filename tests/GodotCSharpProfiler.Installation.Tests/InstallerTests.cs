@@ -49,7 +49,7 @@ public sealed class InstallerTests
         AssertReference(project, "Fody", "6.9.3", owned: true);
         AssertReference(project, "GodotCSharpProfiler.Fody", "0.1.0-dev", owned: true);
         Assert.Equal(preview.InstallationId.ToString("D"), project.Root!.Elements("PropertyGroup").Elements(ProjectInstaller.OwnershipElementName).Single().Value);
-        Assert.Equal("packages", project.Descendants(ProjectInstaller.PackageSourceElementName).Single().Value);
+        Assert.Equal("addons/godot_csharp_profiler/assets/nuget", project.Descendants(ProjectInstaller.PackageSourceElementName).Single().Value);
         Assert.Equal("$(RestoreAdditionalProjectSources);$(GodotCSharpProfilerPackageSource)",
             project.Descendants(ProjectInstaller.RestoreSourcesElementName).Single().Value);
 
@@ -126,8 +126,8 @@ public sealed class InstallerTests
     public void Apply_refuses_when_exact_profiler_package_is_unavailable_without_changes()
     {
         using var fixture = Fixture.Create();
-        var source = fixture.Path("packages/GodotCSharpProfiler.Fody.0.1.0-dev.nupkg");
-        fixture.Write("packages/placeholder", "local source");
+        var source = fixture.Path("addons/godot_csharp_profiler/assets/nuget/GodotCSharpProfiler.Fody.0.1.0-dev.nupkg");
+        fixture.Write("addons/godot_csharp_profiler/assets/nuget/placeholder", "local source");
         var checker = new FakeAvailabilityChecker(false);
         var installer = fixture.Installer(checker, new PackageSourcePlan([source]));
         var preview = installer.PreviewInstall();
@@ -170,7 +170,7 @@ public sealed class InstallerTests
             new PackageSourcePlan([outsidePackage]));
         Assert.Throws<InstallationRefusedException>(() => outsideInstaller.PreviewInstall());
 
-        var wrongName = fixture.Path("packages/wrong.nupkg");
+        var wrongName = fixture.Path("addons/godot_csharp_profiler/assets/nuget/wrong.nupkg");
         var wrongInstaller = new ProjectInstaller(fixture.Root, new FakeAvailabilityChecker(true),
             new PackageSourcePlan([wrongName]));
         Assert.Throws<InstallationRefusedException>(() => wrongInstaller.PreviewInstall());
@@ -262,7 +262,7 @@ public sealed class InstallerTests
         public static Fixture Create(string project = "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup>\n</Project>\n") => new(project);
         public ProjectInstaller Installer(IPackageAvailabilityChecker? checker = null, PackageSourcePlan? sourcePlan = null, InstrumentationSettings? settings = null)
         {
-            var path = Path("packages/GodotCSharpProfiler.Fody.0.1.0-dev.nupkg");
+            var path = Path("addons/godot_csharp_profiler/assets/nuget/GodotCSharpProfiler.Fody.0.1.0-dev.nupkg");
             return new ProjectInstaller(Root, checker ?? new FakeAvailabilityChecker(true), sourcePlan ?? new PackageSourcePlan([path]), settings);
         }
         public string Path(string relative) => System.IO.Path.Combine(Root, relative.Replace('/', System.IO.Path.DirectorySeparatorChar));
