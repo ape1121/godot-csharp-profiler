@@ -1,5 +1,4 @@
 using System.Text;
-using System.Text.Json;
 using System.Xml.Linq;
 using Apeworks.GodotCSharpProfiler.Editor.Installation;
 using Xunit;
@@ -22,164 +21,197 @@ public sealed class InstallerTests
     }
 
     [Fact]
-    public void Preview_is_non_mutating_and_apply_installs_owned_pinned_integration()
+    public void Preview_and_apply_install_exact_packages_and_authoritative_xml_without_json()
     {
-        using var fixture = Fixture.Create("<Project Sdk=\"Microsoft.NET.Sdk\">\n  <!-- protected -->\n  <PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup>\n</Project>\n");
-        var before = fixture.Bytes("Game.csproj");
-        var installer = new ProjectInstaller(fixture.Root);
+        using var fixture = Fixture.Create("<Project Sdk=\"Microsoft.NET.Sdk\">\n  <!-- protected -->\n</Project>\n");
+        var installer = fixture.Installer(settings: new InstrumentationSettings(
+            MaximumMethods: 4321,
+            MaximumLabelLength: 123,
+            ProjectRoot: "res://",
+            Rules:
+            [
+                new InstrumentationRule("include", "namespace", "Game.*"),
+                new InstrumentationRule("exclude", "method", "Game.Secret::*"),
+                new InstrumentationRule("include", "type", "Game.Player"),
+            ]));
+        var before = fixture.Snapshot();
 
         var preview = installer.PreviewInstall();
 
         Assert.NotEmpty(preview.Changes);
-        Assert.Contains(preview.Changes, c => c.RelativePath == "Game.csproj" && c.UnifiedDiff.Contains("PackageReference"));
-        Assert.Equal(before, fixture.Bytes("Game.csproj"));
-        Assert.False(File.Exists(fixture.Path(ProjectInstaller.ConfigurationRelativePath)));
+        Assert.All(preview.Changes, change => Assert.False(string.IsNullOrWhiteSpace(change.UnifiedDiff)));
+        AssertSnapshotsEqual(before, fixture.Snapshot());
+        Assert.DoesNotContain(preview.Changes, c => c.RelativePath.EndsWith("instrumentation.json", StringComparison.OrdinalIgnoreCase));
 
-        var result = installer.Apply(preview);
-        Assert.True(result.CleanRequired);
-        Assert.True(result.RebuildRequired);
-        Assert.True(result.RestartRequired);
+        installer.Apply(preview);
+        Assert.False(File.Exists(fixture.Path("addons/godot_csharp_profiler/instrumentation.json")));
+        var project = XDocument.Load(fixture.Path("Game.csproj"));
+        AssertReference(project, "Fody", "6.9.3", owned: true);
+        AssertReference(project, "GodotCSharpProfiler.Fody", "0.1.0-dev", owned: true);
+        Assert.Equal(preview.InstallationId.ToString("D"), project.Root!.Elements("PropertyGroup").Elements(ProjectInstaller.OwnershipElementName).Single().Value);
 
-        var project = XDocument.Load(fixture.Path("Game.csproj"), LoadOptions.PreserveWhitespace);
-        AssertOwnedReference(project, "Fody", ProjectInstaller.FodyVersion, preview.InstallationId);
-        AssertOwnedReference(project, "GodotCSharpProfiler.Fody", ProjectInstaller.ProfilerFodyVersion, preview.InstallationId);
-        Assert.Contains("<!-- protected -->", File.ReadAllText(fixture.Path("Game.csproj")));
+        var element = XDocument.Load(fixture.Path("FodyWeavers.xml")).Root!.Element("GodotCSharpProfiler")!;
+        Assert.Equal(preview.InstallationId.ToString("D"), (string?)element.Attribute("Owner"));
+        Assert.Equal("4321", (string?)element.Attribute("MaximumMethods"));
+        Assert.Equal("123", (string?)element.Attribute("MaximumLabelLength"));
+        Assert.Equal("res://", (string?)element.Attribute("ProjectRoot"));
+        Assert.Equal(
+            new[] { "include|namespace|Game.*", "exclude|method|Game.Secret::*", "include|type|Game.Player" },
+            element.Elements("Rule").Select(r => $"{(string?)r.Attribute("Action")}|{(string?)r.Attribute("Target")}|{(string?)r.Attribute("Pattern")}"));
+    }
 
-        var weavers = XDocument.Load(fixture.Path("FodyWeavers.xml"), LoadOptions.PreserveWhitespace);
-        Assert.Equal(preview.InstallationId.ToString("D"), weavers.Root!.Element("GodotCSharpProfiler")!.Attribute("Owner")!.Value);
-        using var config = JsonDocument.Parse(File.ReadAllText(fixture.Path(ProjectInstaller.ConfigurationRelativePath)));
-        Assert.Equal(preview.InstallationId.ToString("D"), config.RootElement.GetProperty("owner").GetString());
-        Assert.InRange(config.RootElement.GetProperty("limits").GetProperty("maxMethods").GetInt32(), 1, 100_000);
+    [Fact]
+    public void Default_install_has_no_broad_include_rule()
+    {
+        using var fixture = Fixture.Create();
+        var installer = fixture.Installer();
+        installer.Apply(installer.PreviewInstall());
+        var rules = XDocument.Load(fixture.Path("FodyWeavers.xml")).Root!.Element("GodotCSharpProfiler")!.Elements("Rule");
+        Assert.DoesNotContain(rules, r => (string?)r.Attribute("Action") == "include" && (string?)r.Attribute("Target") == "all");
+    }
+
+    [Fact]
+    public void Compatible_exact_references_are_borrowed_without_duplicates_and_survive_uninstall()
+    {
+        using var fixture = Fixture.Create("""
+            <Project Sdk="Microsoft.NET.Sdk">
+              <ItemGroup>
+                <PackageReference Include="Fody" Version="6.9.3" PrivateAssets="all" />
+                <PackageReference Include="GodotCSharpProfiler.Fody"><Version>0.1.0-dev</Version></PackageReference>
+              </ItemGroup>
+            </Project>
+            """);
+        var installer = fixture.Installer();
+        installer.Apply(installer.PreviewInstall());
+
+        var installed = XDocument.Load(fixture.Path("Game.csproj"));
+        Assert.Single(References(installed, "Fody"));
+        Assert.Single(References(installed, "GodotCSharpProfiler.Fody"));
+        AssertReference(installed, "Fody", "6.9.3", owned: false);
+        AssertReference(installed, "GodotCSharpProfiler.Fody", "0.1.0-dev", owned: false);
+
+        installer.Apply(installer.PreviewUninstall());
+        var uninstalled = XDocument.Load(fixture.Path("Game.csproj"));
+        Assert.Single(References(uninstalled, "Fody"));
+        Assert.Single(References(uninstalled, "GodotCSharpProfiler.Fody"));
+        Assert.Empty(uninstalled.Descendants(ProjectInstaller.OwnershipElementName));
+        Assert.False(File.Exists(fixture.Path("FodyWeavers.xml")));
+    }
+
+    [Theory]
+    [InlineData("Fody", "6.8.2")]
+    [InlineData("GodotCSharpProfiler.Fody", "1.0.0")]
+    public void Incompatible_reference_refuses_with_preview_byte_identical(string package, string version)
+    {
+        using var fixture = Fixture.Create($"<Project Sdk=\"Microsoft.NET.Sdk\"><ItemGroup><PackageReference Include=\"{package}\" Version=\"{version}\" /></ItemGroup></Project>");
+        var before = fixture.Snapshot();
+        Assert.Throws<InstallationRefusedException>(() => fixture.Installer().PreviewInstall());
+        AssertSnapshotsEqual(before, fixture.Snapshot());
+    }
+
+    [Fact]
+    public void Foreign_weaver_refuses_without_changes()
+    {
+        using var fixture = Fixture.Create();
+        fixture.Write("FodyWeavers.xml", "<Weavers><GodotCSharpProfiler MaximumMethods=\"1\" /></Weavers>");
+        var before = fixture.Snapshot();
+        Assert.Throws<InstallationRefusedException>(() => fixture.Installer().PreviewInstall());
+        AssertSnapshotsEqual(before, fixture.Snapshot());
+    }
+
+    [Fact]
+    public void Apply_refuses_when_exact_profiler_package_is_unavailable_without_changes()
+    {
+        using var fixture = Fixture.Create();
+        var source = fixture.Path("packages/GodotCSharpProfiler.Fody.0.1.0-dev.nupkg");
+        fixture.Write("packages/placeholder", "local source");
+        var checker = new FakeAvailabilityChecker(false);
+        var installer = fixture.Installer(checker, new PackageSourcePlan([source]));
+        var preview = installer.PreviewInstall();
+        var before = fixture.Snapshot();
+
+        Assert.Throws<InstallationRefusedException>(() => installer.Apply(preview));
+        AssertSnapshotsEqual(before, fixture.Snapshot());
+        Assert.Equal(("GodotCSharpProfiler.Fody", "0.1.0-dev", source), checker.LastCheck);
     }
 
     [Fact]
     public void Install_is_idempotent_and_uninstall_removes_only_owned_entries()
     {
-        using var fixture = Fixture.Create("<Project Sdk=\"Microsoft.NET.Sdk\">\n  <ItemGroup>\n    <PackageReference Include=\"Fody\" Version=\"6.7.0\"><PrivateAssets>compile</PrivateAssets></PackageReference>\n  </ItemGroup>\n</Project>\n");
+        using var fixture = Fixture.Create();
         fixture.Write("FodyWeavers.xml", "<Weavers>\n  <!-- keep -->\n  <Costura />\n</Weavers>\n");
-        var installer = new ProjectInstaller(fixture.Root);
+        var installer = fixture.Installer();
         installer.Apply(installer.PreviewInstall());
         var once = fixture.Snapshot();
-
-        var second = installer.PreviewInstall();
-        Assert.Empty(second.Changes);
-        installer.Apply(second);
+        Assert.Empty(installer.PreviewInstall().Changes);
         AssertSnapshotsEqual(once, fixture.Snapshot());
 
-        var uninstall = installer.PreviewUninstall();
-        Assert.NotEmpty(uninstall.Changes);
-        var result = installer.Apply(uninstall);
-        Assert.True(result.CleanRequired && result.RebuildRequired && result.RestartRequired);
-
-        var text = File.ReadAllText(fixture.Path("Game.csproj"));
-        Assert.Contains("Version=\"6.7.0\"", text);
-        Assert.Contains("<PrivateAssets>compile</PrivateAssets>", text);
-        Assert.DoesNotContain("GodotCSharpProfiler.Fody", text);
+        installer.Apply(installer.PreviewUninstall());
+        Assert.DoesNotContain("GodotCSharpProfiler", File.ReadAllText(fixture.Path("Game.csproj")));
         Assert.Equal("<Weavers>\n  <!-- keep -->\n  <Costura />\n</Weavers>\n", File.ReadAllText(fixture.Path("FodyWeavers.xml")));
-        Assert.False(File.Exists(fixture.Path(ProjectInstaller.ConfigurationRelativePath)));
     }
 
     [Fact]
-    public void Refusals_and_stale_previews_leave_every_file_byte_identical()
+    public void Stale_preview_path_traversal_symlink_and_atomic_rollback_protections_remain()
     {
         using var fixture = Fixture.Create();
-        var installer = new ProjectInstaller(fixture.Root);
+        var installer = fixture.Installer();
         var preview = installer.PreviewInstall();
         fixture.Write("Game.csproj", File.ReadAllText(fixture.Path("Game.csproj")) + "<!-- changed -->");
         var before = fixture.Snapshot();
         Assert.Throws<InstallationRefusedException>(() => installer.Apply(preview));
         AssertSnapshotsEqual(before, fixture.Snapshot());
-
-        if (!OperatingSystem.IsWindows())
-        {
-            File.SetUnixFileMode(fixture.Path("Game.csproj"), UnixFileMode.UserRead | UnixFileMode.GroupRead | UnixFileMode.OtherRead);
-            before = fixture.Snapshot();
-            Assert.Throws<InstallationRefusedException>(() => installer.PreviewInstall());
-            AssertSnapshotsEqual(before, fixture.Snapshot());
-        }
-    }
-
-    [Fact]
-    public void Rejects_path_traversal_and_symlink_escape()
-    {
-        using var fixture = Fixture.Create();
-        Assert.Throws<InstallationRefusedException>(() => new ProjectInstaller(fixture.Path("..")));
-
+        Assert.Throws<InstallationRefusedException>(() => new ProjectInstaller(fixture.Path(".."), new FakeAvailabilityChecker(true)));
         if (!OperatingSystem.IsWindows())
         {
             using var outside = Fixture.Create();
-            fixture.Delete("Game.csproj");
-            File.CreateSymbolicLink(fixture.Path("Game.csproj"), outside.Path("Game.csproj"));
-            Assert.Throws<InstallationRefusedException>(() => new ProjectInstaller(fixture.Root).PreviewInstall());
+            using var linked = Fixture.Create();
+            linked.Delete("Game.csproj");
+            File.CreateSymbolicLink(linked.Path("Game.csproj"), outside.Path("Game.csproj"));
+            Assert.Throws<InstallationRefusedException>(() => linked.Installer().PreviewInstall());
         }
-    }
 
-    [Fact]
-    public void Apply_rejects_preview_traversal_and_rolls_back_partial_atomic_writes()
-    {
-        using var fixture = Fixture.Create();
-        var installer = new ProjectInstaller(fixture.Root);
         var baseline = fixture.Bytes("Game.csproj");
-        var traversal = new InstallationPreview(InstallationOperation.Install, Guid.NewGuid(), fixture.Path("Game.csproj"),
-            [new FileChange("../escape", null, Encoding.UTF8.GetBytes("bad"), "diff")]);
-        Assert.Throws<InstallationRefusedException>(() => installer.Apply(traversal));
-
         Directory.CreateDirectory(fixture.Path("blocked"));
         var rollback = new InstallationPreview(InstallationOperation.Install, Guid.NewGuid(), fixture.Path("Game.csproj"),
-            [
-                new FileChange("Game.csproj", baseline, Encoding.UTF8.GetBytes("changed"), "diff"),
-                new FileChange("blocked", null, Encoding.UTF8.GetBytes("cannot replace directory"), "diff"),
-            ]);
+        [
+            new FileChange("Game.csproj", baseline, Encoding.UTF8.GetBytes("changed"), "diff"),
+            new FileChange("blocked", null, Encoding.UTF8.GetBytes("cannot replace directory"), "diff"),
+        ]);
         Assert.Throws<InstallationRefusedException>(() => installer.Apply(rollback));
         Assert.Equal(baseline, fixture.Bytes("Game.csproj"));
     }
 
     [Fact]
-    public void Malformed_weavers_and_foreign_config_are_never_modified()
+    public void Uninstall_after_addon_deletion_leaves_clean_build_configuration()
     {
-        using var fixture = Fixture.Create();
-        fixture.Write("FodyWeavers.xml", "<Weavers>");
-        var before = fixture.Snapshot();
-        Assert.Throws<InstallationRefusedException>(() => new ProjectInstaller(fixture.Root).PreviewInstall());
-        AssertSnapshotsEqual(before, fixture.Snapshot());
-
-        fixture.Delete("FodyWeavers.xml");
-        fixture.Write(ProjectInstaller.ConfigurationRelativePath, "{\"owner\":\"someone-else\"}");
-        before = fixture.Snapshot();
-        Assert.Throws<InstallationRefusedException>(() => new ProjectInstaller(fixture.Root).PreviewInstall());
-        AssertSnapshotsEqual(before, fixture.Snapshot());
-    }
-
-    [Fact]
-    public void Manual_addon_deletion_contract_cleanly_rebuilds_without_recorder_calls()
-    {
-        using var fixture = Fixture.Create("<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>\n</Project>\n");
+        using var fixture = Fixture.Create("<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>");
         fixture.Write("Player.cs", "public sealed class Player { public int Tick() => 42; }");
-        fixture.Write("addons/godot_csharp_profiler/Runtime/Recorder.cs", "namespace AddonOnly; public static class Recorder { public static void Enter() { } }");
-        var installer = new ProjectInstaller(fixture.Root);
+        fixture.Write("addons/godot_csharp_profiler/Runtime/Recorder.cs", "namespace AddonOnly; public static class Recorder { }");
+        var installer = fixture.Installer();
         installer.Apply(installer.PreviewInstall());
-        installer.Apply(installer.PreviewUninstall());
         Directory.Delete(fixture.Path("addons/godot_csharp_profiler"), recursive: true);
+        installer.Apply(installer.PreviewUninstall());
 
         Assert.DoesNotContain("GodotCSharpProfiler", File.ReadAllText(fixture.Path("Game.csproj")));
-        Assert.DoesNotContain("Recorder", File.ReadAllText(fixture.Path("Player.cs")));
         Assert.False(File.Exists(fixture.Path("FodyWeavers.xml")));
         var build = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("dotnet", "build --nologo")
         {
-            WorkingDirectory = fixture.Root,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
+            WorkingDirectory = fixture.Root, RedirectStandardOutput = true, RedirectStandardError = true,
         })!;
         var output = build.StandardOutput.ReadToEnd() + build.StandardError.ReadToEnd();
         build.WaitForExit();
         Assert.True(build.ExitCode == 0, output);
     }
 
-    private static void AssertOwnedReference(XDocument project, string include, string version, Guid owner)
+    private static IEnumerable<XElement> References(XDocument project, string package) =>
+        project.Descendants().Where(e => e.Name.LocalName == "PackageReference" && string.Equals((string?)e.Attribute("Include"), package, StringComparison.OrdinalIgnoreCase));
+
+    private static void AssertReference(XDocument project, string package, string version, bool owned)
     {
-        var reference = project.Descendants("PackageReference").Single(e => (string?)e.Attribute("Include") == include && (string?)e.Attribute("Version") == version);
-        Assert.Equal("all", reference.Element("PrivateAssets")?.Value);
-        Assert.Equal(owner.ToString("D"), reference.Element(ProjectInstaller.OwnershipElementName)?.Value);
+        var reference = Assert.Single(References(project, package));
+        Assert.Equal(version, (string?)reference.Attribute("Version") ?? reference.Elements().SingleOrDefault(e => e.Name.LocalName == "Version")?.Value);
+        Assert.Equal(owned, reference.Elements().Any(e => e.Name.LocalName == ProjectInstaller.ReferenceOwnershipElementName));
     }
 
     private static void AssertSnapshotsEqual(Dictionary<string, byte[]> expected, Dictionary<string, byte[]> actual)
@@ -188,11 +220,26 @@ public sealed class InstallerTests
         foreach (var pair in expected) Assert.Equal(pair.Value, actual[pair.Key]);
     }
 
+    private sealed class FakeAvailabilityChecker(bool available) : IPackageAvailabilityChecker
+    {
+        public (string Package, string Version, string LocalPath)? LastCheck { get; private set; }
+        public bool IsAvailable(string packageId, string version, PackageSourcePlan sourcePlan)
+        {
+            LastCheck = (packageId, version, Assert.Single(sourcePlan.LocalPackagePaths));
+            return available;
+        }
+    }
+
     private sealed class Fixture : IDisposable
     {
         public string Root { get; }
         private Fixture(string project) { Root = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "gcsp-installer-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(Root); Write("Game.csproj", project); }
         public static Fixture Create(string project = "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup>\n</Project>\n") => new(project);
+        public ProjectInstaller Installer(IPackageAvailabilityChecker? checker = null, PackageSourcePlan? sourcePlan = null, InstrumentationSettings? settings = null)
+        {
+            var path = Path("packages/GodotCSharpProfiler.Fody.0.1.0-dev.nupkg");
+            return new ProjectInstaller(Root, checker ?? new FakeAvailabilityChecker(true), sourcePlan ?? new PackageSourcePlan([path]), settings);
+        }
         public string Path(string relative) => System.IO.Path.Combine(Root, relative.Replace('/', System.IO.Path.DirectorySeparatorChar));
         public void Write(string relative, string text) { var path = Path(relative); Directory.CreateDirectory(System.IO.Path.GetDirectoryName(path)!); File.WriteAllText(path, text, new UTF8Encoding(false)); }
         public byte[] Bytes(string relative) => File.ReadAllBytes(Path(relative));

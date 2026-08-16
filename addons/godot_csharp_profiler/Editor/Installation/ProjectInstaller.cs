@@ -1,6 +1,5 @@
 using System.Security.Cryptography;
 using System.Text;
-using System.Text.Json;
 using System.Xml;
 using System.Xml.Linq;
 
@@ -8,16 +7,23 @@ namespace Apeworks.GodotCSharpProfiler.Editor.Installation;
 
 public sealed class ProjectInstaller
 {
-    public const string FodyVersion = "6.8.2";
-    public const string ProfilerFodyVersion = "1.0.0";
-    public const string ConfigurationRelativePath = "addons/godot_csharp_profiler/instrumentation.json";
+    public const string FodyVersion = "6.9.3";
+    public const string ProfilerFodyVersion = "0.1.0-dev";
     public const string OwnershipElementName = "GodotCSharpProfilerInstallation";
+    public const string ReferenceOwnershipElementName = "GodotCSharpProfilerOwned";
 
     private const string WeaversPath = "FodyWeavers.xml";
     private readonly string root;
     private readonly string projectPath;
+    private readonly IPackageAvailabilityChecker packageAvailability;
+    private readonly PackageSourcePlan packageSources;
+    private readonly InstrumentationSettings settings;
 
-    public ProjectInstaller(string projectRoot)
+    public ProjectInstaller(
+        string projectRoot,
+        IPackageAvailabilityChecker? packageAvailability = null,
+        PackageSourcePlan? packageSources = null,
+        InstrumentationSettings? settings = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(projectRoot);
         var supplied = Path.GetFullPath(projectRoot);
@@ -26,6 +32,11 @@ public sealed class ProjectInstaller
             throw new InstallationRefusedException("The project root must be an existing canonical directory.");
         EnsureNoSymlink(root);
         projectPath = DiscoverProject(root);
+        this.packageAvailability = packageAvailability ?? new LocalPackageAvailabilityChecker();
+        this.packageSources = packageSources ?? PackageSourcePlan.Empty;
+        var requested = settings ?? new InstrumentationSettings();
+        this.settings = requested with { ProjectRoot = requested.ProjectRoot ?? root.Replace('\\', '/') };
+        ValidateSettings(this.settings);
     }
 
     public static string DiscoverProject(string projectRoot)
@@ -59,31 +70,22 @@ public sealed class ProjectInstaller
         var id = existingId ?? Guid.NewGuid();
         var changes = new List<FileChange>();
 
-        AddPackageReferenceIfMissing(project, "Fody", FodyVersion, id);
-        AddPackageReferenceIfMissing(project, "GodotCSharpProfiler.Fody", ProfilerFodyVersion, id);
+        EnsureCompatiblePackageReference(project, "Fody", FodyVersion, id);
+        EnsureCompatiblePackageReference(project, "GodotCSharpProfiler.Fody", ProfilerFodyVersion, id);
+        EnsureProjectOwnershipMarker(project, id);
         AddChange(changes, Relative(projectPath), projectBytes, SaveXml(project, projectBytes));
 
-        var weavers = SafePath(WeaversPath);
-        var weaverBytes = File.Exists(weavers) ? File.ReadAllBytes(weavers) : null;
-        var weaverDocument = weaverBytes is null
-            ? new XDocument(new XElement("Weavers"))
-            : LoadXml(weaverBytes);
-        if (weaverDocument.Root?.Name.LocalName != "Weavers") throw new InstallationRefusedException("FodyWeavers.xml must have a Weavers root.");
-        var profilerWeavers = weaverDocument.Root.Elements().Where(e => e.Name.LocalName == "GodotCSharpProfiler").ToArray();
-        if (profilerWeavers.Any(e => !string.Equals((string?)e.Attribute("Owner"), id.ToString("D"), StringComparison.OrdinalIgnoreCase)))
-            throw new InstallationRefusedException("A GodotCSharpProfiler weaver not owned by this installer already exists.");
-        if (profilerWeavers.Length == 0) weaverDocument.Root.Add(new XElement("GodotCSharpProfiler", new XAttribute("Owner", id.ToString("D"))));
-        AddChange(changes, WeaversPath, weaverBytes, SaveXml(weaverDocument, weaverBytes));
+        var weaversPath = SafePath(WeaversPath);
+        var weaverBytes = File.Exists(weaversPath) ? File.ReadAllBytes(weaversPath) : null;
+        var weavers = weaverBytes is null ? new XDocument(new XElement("Weavers")) : LoadXml(weaverBytes);
+        if (weavers.Root?.Name.LocalName != "Weavers") throw new InstallationRefusedException("FodyWeavers.xml must have a Weavers root.");
+        var existing = weavers.Root.Elements().Where(e => e.Name.LocalName == "GodotCSharpProfiler").ToArray();
+        if (existing.Length > 1 || existing.Any(e => !string.Equals((string?)e.Attribute("Owner"), id.ToString("D"), StringComparison.OrdinalIgnoreCase)))
+            throw new InstallationRefusedException("A foreign GodotCSharpProfiler weaver already exists.");
+        var desired = CreateWeaverElement(id);
+        if (existing.Length == 0) weavers.Root.Add(desired); else existing[0].ReplaceWith(desired);
+        AddChange(changes, WeaversPath, weaverBytes, SaveXml(weavers, weaverBytes));
 
-        var configPath = SafePath(ConfigurationRelativePath);
-        var configBytes = File.Exists(configPath) ? File.ReadAllBytes(configPath) : null;
-        if (configBytes is not null)
-        {
-            var owner = ReadConfigOwner(configBytes);
-            if (owner != id) throw new InstallationRefusedException("Instrumentation configuration is not owned by this installation.");
-        }
-        var desiredConfig = CreateConfiguration(id);
-        AddChange(changes, ConfigurationRelativePath, configBytes, desiredConfig);
         return new InstallationPreview(InstallationOperation.Install, id, projectPath, changes);
     }
 
@@ -95,30 +97,28 @@ public sealed class ProjectInstaller
         var id = ReadOwnedInstallationId(project);
         if (id is null) return new InstallationPreview(InstallationOperation.Uninstall, Guid.Empty, projectPath, Array.Empty<FileChange>());
         var changes = new List<FileChange>();
+
         foreach (var reference in project.Descendants().Where(e => e.Name.LocalName == "PackageReference").ToArray())
         {
-            var marker = reference.Elements().FirstOrDefault(e => e.Name.LocalName == OwnershipElementName);
-            if (marker?.Value == id.Value.ToString("D")) reference.Remove();
+            var owned = reference.Elements().Any(e => e.Name.LocalName == ReferenceOwnershipElementName &&
+                string.Equals(e.Value, id.Value.ToString("D"), StringComparison.OrdinalIgnoreCase));
+            if (owned) reference.Remove();
         }
-        foreach (var group in project.Descendants().Where(e => e.Name.LocalName == "ItemGroup" && !e.Elements().Any()).ToArray()) group.Remove();
+        foreach (var marker in project.Descendants().Where(e => e.Name.LocalName == OwnershipElementName &&
+                     string.Equals(e.Value, id.Value.ToString("D"), StringComparison.OrdinalIgnoreCase)).ToArray()) marker.Remove();
+        RemoveEmptyGroups(project);
         AddChange(changes, Relative(projectPath), projectBytes, SaveXml(project, projectBytes));
 
-        var weavers = SafePath(WeaversPath);
-        if (File.Exists(weavers))
+        var weaversPath = SafePath(WeaversPath);
+        if (File.Exists(weaversPath))
         {
-            var bytes = File.ReadAllBytes(weavers);
+            var bytes = File.ReadAllBytes(weaversPath);
             var document = LoadXml(bytes);
-            var owned = document.Root?.Elements().Where(e => e.Name.LocalName == "GodotCSharpProfiler" && (string?)e.Attribute("Owner") == id.Value.ToString("D")).ToArray() ?? [];
+            var owned = document.Root?.Elements().Where(e => e.Name.LocalName == "GodotCSharpProfiler" &&
+                string.Equals((string?)e.Attribute("Owner"), id.Value.ToString("D"), StringComparison.OrdinalIgnoreCase)).ToArray() ?? [];
             foreach (var element in owned) element.Remove();
             var meaningfulNodes = document.Root?.Nodes().Any(n => n is XElement or XComment) == true;
             AddChange(changes, WeaversPath, bytes, meaningfulNodes ? SaveXml(document, bytes) : null);
-        }
-
-        var config = SafePath(ConfigurationRelativePath);
-        if (File.Exists(config))
-        {
-            var bytes = File.ReadAllBytes(config);
-            if (ReadConfigOwner(bytes) == id) AddChange(changes, ConfigurationRelativePath, bytes, null);
         }
         return new InstallationPreview(InstallationOperation.Uninstall, id.Value, projectPath, changes);
     }
@@ -126,7 +126,12 @@ public sealed class ProjectInstaller
     public InstallationResult Apply(InstallationPreview preview)
     {
         ArgumentNullException.ThrowIfNull(preview);
-        if (!string.Equals(Path.GetFullPath(preview.ProjectPath), projectPath, PathComparison)) throw new InstallationRefusedException("Preview belongs to another project.");
+        if (!string.Equals(Path.GetFullPath(preview.ProjectPath), projectPath, PathComparison))
+            throw new InstallationRefusedException("Preview belongs to another project.");
+        if (preview.Operation == InstallationOperation.Install &&
+            !packageAvailability.IsAvailable("GodotCSharpProfiler.Fody", ProfilerFodyVersion, packageSources))
+            throw new InstallationRefusedException($"Exact package GodotCSharpProfiler.Fody {ProfilerFodyVersion} is unavailable from the configured sources.");
+
         foreach (var change in preview.Changes)
         {
             var path = SafePath(change.RelativePath);
@@ -156,30 +161,36 @@ public sealed class ProjectInstaller
     private void ValidateWritableInputs()
     {
         EnsureSafeFile(root, projectPath, true, true);
-        foreach (var relative in new[] { WeaversPath, ConfigurationRelativePath })
-        {
-            var path = SafePath(relative);
-            if (File.Exists(path)) EnsureSafeFile(root, path, true, true);
-        }
+        var weavers = SafePath(WeaversPath);
+        if (File.Exists(weavers)) EnsureSafeFile(root, weavers, true, true);
     }
 
-    private static void AddPackageReferenceIfMissing(XDocument document, string package, string version, Guid id)
+    private static void EnsureCompatiblePackageReference(XDocument document, string package, string version, Guid id)
     {
-        var ownedReference = document.Descendants().FirstOrDefault(e =>
-            e.Name.LocalName == "PackageReference" &&
-            string.Equals((string?)e.Attribute("Include"), package, StringComparison.OrdinalIgnoreCase) &&
-            e.Elements().Any(marker => marker.Name.LocalName == OwnershipElementName));
-        if (ownedReference is not null) return;
-        // Borrowed references are deliberately left semantically untouched; the separately
-        // marked exact reference is the installer's responsibility.
+        var references = document.Descendants().Where(e => e.Name.LocalName == "PackageReference" &&
+            string.Equals((string?)e.Attribute("Include"), package, StringComparison.OrdinalIgnoreCase)).ToArray();
+        if (references.Length > 1) throw new InstallationRefusedException($"Multiple {package} package references are ambiguous.");
+        if (references.Length == 1)
+        {
+            var actual = (string?)references[0].Attribute("Version") ?? references[0].Elements().FirstOrDefault(e => e.Name.LocalName == "Version")?.Value;
+            if (!string.Equals(actual, version, StringComparison.Ordinal))
+                throw new InstallationRefusedException($"Existing {package} reference must use exact version {version}.");
+            return;
+        }
         var ns = document.Root!.Name.Namespace;
-        var group = new XElement(ns + "ItemGroup",
+        document.Root.Add(new XElement(ns + "ItemGroup",
             new XElement(ns + "PackageReference",
                 new XAttribute("Include", package),
                 new XAttribute("Version", version),
                 new XElement(ns + "PrivateAssets", "all"),
-                new XElement(ns + OwnershipElementName, id.ToString("D"))));
-        document.Root.Add(group);
+                new XElement(ns + ReferenceOwnershipElementName, id.ToString("D")))));
+    }
+
+    private static void EnsureProjectOwnershipMarker(XDocument project, Guid id)
+    {
+        if (ReadOwnedInstallationId(project) is not null) return;
+        var ns = project.Root!.Name.Namespace;
+        project.Root.Add(new XElement(ns + "PropertyGroup", new XElement(ns + OwnershipElementName, id.ToString("D"))));
     }
 
     private static Guid? ReadOwnedInstallationId(XDocument project)
@@ -190,35 +201,32 @@ public sealed class ProjectInstaller
         return id;
     }
 
-    private static byte[] CreateConfiguration(Guid id)
+    private XElement CreateWeaverElement(Guid id)
     {
-        using var stream = new MemoryStream();
-        using (var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true }))
-        {
-            writer.WriteStartObject();
-            writer.WriteString("schema", "godot-csharp-profiler.instrumentation/v1");
-            writer.WriteString("owner", id);
-            writer.WriteStartObject("filters");
-            writer.WriteStartArray("include"); writer.WriteStringValue("**/*.dll"); writer.WriteEndArray();
-            writer.WriteStartArray("exclude"); writer.WriteStringValue("Godot*.dll"); writer.WriteStringValue("GodotCSharpProfiler*.dll"); writer.WriteEndArray();
-            writer.WriteEndObject();
-            writer.WriteStartObject("limits"); writer.WriteNumber("maxMethods", 10000); writer.WriteNumber("maxLabelLength", 256); writer.WriteEndObject();
-            writer.WriteEndObject();
-        }
-        return stream.ToArray().Concat(new byte[] { (byte)'\n' }).ToArray();
+        var element = new XElement("GodotCSharpProfiler",
+            new XAttribute("Owner", id.ToString("D")),
+            new XAttribute("MaximumMethods", settings.MaximumMethods),
+            new XAttribute("MaximumLabelLength", settings.MaximumLabelLength),
+            new XAttribute("ProjectRoot", settings.ProjectRoot!));
+        foreach (var rule in settings.OrderedRules)
+            element.Add(new XElement("Rule", new XAttribute("Action", rule.Action), new XAttribute("Target", rule.Target), new XAttribute("Pattern", rule.Pattern)));
+        return element;
     }
 
-    private static Guid ReadConfigOwner(byte[] bytes)
+    private static void ValidateSettings(InstrumentationSettings settings)
     {
-        try
+        if (settings.MaximumMethods is <= 0 or > 16_384 || settings.MaximumLabelLength <= 0 || string.IsNullOrWhiteSpace(settings.ProjectRoot))
+            throw new InstallationRefusedException("Instrumentation limits and project root must be valid.");
+        foreach (var rule in settings.OrderedRules)
         {
-            using var json = JsonDocument.Parse(bytes);
-            return Guid.TryParse(json.RootElement.GetProperty("owner").GetString(), out var owner) ? owner : Guid.Empty;
+            if (rule.Action is not ("include" or "exclude") || rule.Target is not ("namespace" or "type" or "method" or "all") || string.IsNullOrWhiteSpace(rule.Pattern))
+                throw new InstallationRefusedException("Instrumentation rules contain an unsupported action, target, or pattern.");
         }
-        catch (Exception ex) when (ex is JsonException or InvalidOperationException or KeyNotFoundException)
-        {
-            throw new InstallationRefusedException("Instrumentation configuration is malformed.", ex);
-        }
+    }
+
+    private static void RemoveEmptyGroups(XDocument project)
+    {
+        foreach (var group in project.Descendants().Where(e => (e.Name.LocalName is "ItemGroup" or "PropertyGroup") && !e.Elements().Any()).ToArray()) group.Remove();
     }
 
     private static XDocument LoadXml(byte[] bytes)
@@ -228,26 +236,25 @@ public sealed class ProjectInstaller
             using var stream = new MemoryStream(bytes, writable: false);
             return XDocument.Load(stream, LoadOptions.PreserveWhitespace | LoadOptions.SetLineInfo);
         }
-        catch (XmlException ex)
-        {
-            throw new InstallationRefusedException("XML input is malformed.", ex);
-        }
+        catch (XmlException ex) { throw new InstallationRefusedException("XML input is malformed.", ex); }
     }
+
     private static byte[] SaveXml(XDocument document, byte[]? original)
     {
         var encoding = DetectEncoding(original);
         using var stream = new MemoryStream();
-        var settings = new XmlWriterSettings { Encoding = encoding, Indent = false, OmitXmlDeclaration = document.Declaration is null, NewLineHandling = NewLineHandling.None };
-        using (var writer = XmlWriter.Create(stream, settings)) document.Save(writer);
+        var xmlSettings = new XmlWriterSettings { Encoding = encoding, Indent = false, OmitXmlDeclaration = document.Declaration is null, NewLineHandling = NewLineHandling.None };
+        using (var writer = XmlWriter.Create(stream, xmlSettings)) document.Save(writer);
         return stream.ToArray();
     }
 
-    private static Encoding DetectEncoding(byte[]? bytes) => bytes is { Length: >= 2 } && bytes[0] == 0xff && bytes[1] == 0xfe ? new UnicodeEncoding(false, true) : new UTF8Encoding(bytes is { Length: >= 3 } && bytes[0] == 0xef && bytes[1] == 0xbb && bytes[2] == 0xbf);
+    private static Encoding DetectEncoding(byte[]? bytes) => bytes is { Length: >= 2 } && bytes[0] == 0xff && bytes[1] == 0xfe
+        ? new UnicodeEncoding(false, true)
+        : new UTF8Encoding(bytes is { Length: >= 3 } && bytes[0] == 0xef && bytes[1] == 0xbb && bytes[2] == 0xbf);
 
     private static void AddChange(List<FileChange> changes, string relative, byte[]? before, byte[]? after)
     {
-        if (BytesEqual(before, after)) return;
-        changes.Add(new FileChange(relative, before, after, CreateDiff(relative, before, after)));
+        if (!BytesEqual(before, after)) changes.Add(new FileChange(relative, before, after, CreateDiff(relative, before, after)));
     }
 
     private static string CreateDiff(string path, byte[]? before, byte[]? after)
@@ -279,7 +286,8 @@ public sealed class ProjectInstaller
         if (!File.Exists(full)) return;
         EnsureNoSymlink(full);
         if (requireWritable && (File.GetAttributes(full) & FileAttributes.ReadOnly) != 0) throw new InstallationRefusedException("Input file is read-only.");
-        if (requireWritable && !OperatingSystem.IsWindows() && (File.GetUnixFileMode(full) & (UnixFileMode.UserWrite | UnixFileMode.GroupWrite | UnixFileMode.OtherWrite)) == 0) throw new InstallationRefusedException("Input file is read-only.");
+        if (requireWritable && !OperatingSystem.IsWindows() && (File.GetUnixFileMode(full) & (UnixFileMode.UserWrite | UnixFileMode.GroupWrite | UnixFileMode.OtherWrite)) == 0)
+            throw new InstallationRefusedException("Input file is read-only.");
     }
 
     private static void EnsureNoSymlink(string path)
