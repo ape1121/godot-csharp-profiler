@@ -11,7 +11,8 @@ return await ReleaseBuilder.RunAsync(args);
 static class ReleaseBuilder
 {
     static readonly UTF8Encoding Utf8 = new(false);
-    static readonly string[] Required = ["plugin.cfg", "README.md", "LICENSE", "icon.svg", "Compatibility/GlobalUsings.cs", "Runtime/CsProfiler.cs", "Editor/CsProfilerPlugin.cs", "assets/setup.ps1", "assets/dependencies.json", "assets/GodotCSharpProfiler.Dependencies.props"];
+    static readonly string[] Required = ["plugin.cfg", "README.md", "LICENSE", "THIRD-PARTY-NOTICES.md", "licenses/FodyHelpers-LICENSE.txt", "licenses/Mono.Cecil-LICENSE.txt", "icon.svg", "Compatibility/GlobalUsings.cs", "Runtime/CsProfiler.cs", "Editor/CsProfilerPlugin.cs", "assets/setup.ps1", "assets/dependencies.json", "assets/GodotCSharpProfiler.Dependencies.props"];
+    static readonly string[] RequiredPackageEntries = ["README.md", "THIRD-PARTY-NOTICES.md", "licenses/FodyHelpers-LICENSE.txt", "licenses/Mono.Cecil-LICENSE.txt", "weaver/GodotCSharpProfiler.Fody.dll", "weaver/FodyHelpers.dll", "weaver/Mono.Cecil.dll", "weaver/Mono.Cecil.Pdb.dll", "weaver/Mono.Cecil.Rocks.dll"];
     static readonly HashSet<string> Forbidden = new(StringComparer.OrdinalIgnoreCase) { "bin", "obj", ".godot", "spikes", "tests", "src", "docs", ".git", "TestResults" };
 
     public static async Task<int> RunAsync(string[] args)
@@ -125,6 +126,8 @@ static class ReleaseBuilder
             }
         }
         if (oldCore is null) throw new InvalidDataException("Package core-properties entry is missing.");
+        foreach (var required in RequiredPackageEntries)
+            if (!items.Any(item => string.Equals(item.Name, required, StringComparison.Ordinal))) throw new InvalidDataException($"Package is missing required embedded dependency notice or binary: {required}");
         const string fixedCore = "package/services/metadata/core-properties/godot-csharp-profiler.psmdcp";
         for (var index = 0; index < items.Count; index++)
         {
@@ -158,6 +161,34 @@ static class ReleaseBuilder
         foreach (var path in Directory.EnumerateFileSystemEntries(stage, "*", SearchOption.AllDirectories))
             if (Relative(stage, path).Split('/').Any(Forbidden.Contains)) throw new InvalidDataException($"Forbidden archive content: {path}");
         if (!File.ReadAllText(Path.Combine(addon, "plugin.cfg")).Contains("script=\"Editor/CsProfilerPlugin.cs\"", StringComparison.Ordinal)) throw new InvalidDataException("Invalid plugin.cfg script path.");
+        ValidateNotices(addon, "addon");
+        using var package = ZipFile.OpenRead(Directory.EnumerateFiles(Path.Combine(addon, "assets", "nuget"), "GodotCSharpProfiler.Fody.*.nupkg").Single());
+        foreach (var required in RequiredPackageEntries)
+            if (package.GetEntry(required) is null) throw new InvalidDataException($"Nested package is missing required entry: {required}");
+        ValidateNotices(ReadPackageText(package, "THIRD-PARTY-NOTICES.md"), ReadPackageText(package, "licenses/FodyHelpers-LICENSE.txt"), ReadPackageText(package, "licenses/Mono.Cecil-LICENSE.txt"), "nested package");
+    }
+
+    static void ValidateNotices(string addon, string container)
+    {
+        var notices = File.ReadAllText(Path.Combine(addon, "THIRD-PARTY-NOTICES.md"));
+        var fodyLicense = File.ReadAllText(Path.Combine(addon, "licenses", "FodyHelpers-LICENSE.txt"));
+        var cecilLicense = File.ReadAllText(Path.Combine(addon, "licenses", "Mono.Cecil-LICENSE.txt"));
+        ValidateNotices(notices, fodyLicense, cecilLicense, container);
+    }
+
+    static void ValidateNotices(string notices, string fodyLicense, string cecilLicense, string container)
+    {
+        if (!notices.Contains("FodyHelpers 6.9.3", StringComparison.Ordinal) || !notices.Contains("Mono.Cecil 0.11.6", StringComparison.Ordinal) || !notices.Contains("FodyHelpers.dll", StringComparison.Ordinal) || !notices.Contains("Mono.Cecil.Pdb.dll", StringComparison.Ordinal) || !notices.Contains("Mono.Cecil.Rocks.dll", StringComparison.Ordinal)) throw new InvalidDataException($"{container} third-party notices are incomplete.");
+        if (!fodyLicense.Contains("Copyright (c) The Fody Team and contributors", StringComparison.Ordinal) || !cecilLicense.Contains("Copyright (c) 2008 - 2015 Jb Evain", StringComparison.Ordinal) || !cecilLicense.Contains("Copyright (c) 2008 - 2011 Novell, Inc.", StringComparison.Ordinal)) throw new InvalidDataException($"{container} third-party copyright notices are incomplete.");
+        const string permission = "Permission is hereby granted, free of charge, to any person obtaining";
+        const string warranty = "THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND";
+        if (!fodyLicense.Contains(permission, StringComparison.Ordinal) || !fodyLicense.Contains(warranty, StringComparison.Ordinal) || !cecilLicense.Contains(permission, StringComparison.Ordinal) || !cecilLicense.Contains(warranty, StringComparison.Ordinal)) throw new InvalidDataException($"{container} third-party MIT license text is incomplete.");
+    }
+
+    static string ReadPackageText(ZipArchive package, string name)
+    {
+        using var reader = new StreamReader(package.GetEntry(name)?.Open() ?? throw new InvalidDataException($"Nested package is missing required entry: {name}"));
+        return reader.ReadToEnd();
     }
 
     static void Publish(string output, string workspace, (string Candidate, string Name)[] files)

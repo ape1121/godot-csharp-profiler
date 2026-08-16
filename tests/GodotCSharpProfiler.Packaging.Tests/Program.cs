@@ -27,7 +27,7 @@ using (var zip = ZipFile.OpenRead(path))
     const string root = "addons/godot_csharp_profiler/";
     Assert(names.Length > 10, "Archive is unexpectedly empty.");
     Assert(names.All(n => n.StartsWith(root, StringComparison.Ordinal)), "Every entry must be rooted at addons/godot_csharp_profiler.");
-    foreach (var required in new[] { "plugin.cfg", "README.md", "LICENSE", "icon.svg", "Compatibility/GlobalUsings.cs", "Runtime/CsProfiler.cs", "Editor/CsProfilerPlugin.cs", "assets/setup.ps1", "assets/dependencies.json", "assets/GodotCSharpProfiler.Dependencies.props" })
+    foreach (var required in new[] { "plugin.cfg", "README.md", "LICENSE", "THIRD-PARTY-NOTICES.md", "licenses/FodyHelpers-LICENSE.txt", "licenses/Mono.Cecil-LICENSE.txt", "icon.svg", "Compatibility/GlobalUsings.cs", "Runtime/CsProfiler.cs", "Editor/CsProfilerPlugin.cs", "assets/setup.ps1", "assets/dependencies.json", "assets/GodotCSharpProfiler.Dependencies.props" })
         Assert(names.Contains(root + required, StringComparer.Ordinal), $"Missing {required}.");
     Assert(!names.Any(n => Regex.IsMatch(n, @"(^|/)(bin|obj|\.godot|spikes|tests|src|docs|\.git)(/|$)", RegexOptions.IgnoreCase)), "Development content leaked into archive.");
     Assert(!names.Any(n => n.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase)), "Project files must not be archived.");
@@ -41,16 +41,112 @@ using (var zip = ZipFile.OpenRead(path))
     var setup = Read(zip, root + "assets/setup.ps1");
     Assert(!setup.Contains("PackageReference", StringComparison.Ordinal) && !setup.Contains("FodyWeavers", StringComparison.Ordinal), "setup.ps1 must not duplicate automatic instrumentation installation.");
     Assert(setup.Contains("ProjectInstaller", StringComparison.Ordinal), "Automatic setup must direct users to the tested ProjectInstaller contract.");
+    Assert(setup.Contains("ReparsePoint", StringComparison.Ordinal) && setup.Contains("LinkType", StringComparison.Ordinal), "setup.ps1 must reject symlink/reparse-point paths.");
+    AssertThirdPartyNotices(
+        Read(zip, root + "THIRD-PARTY-NOTICES.md"),
+        Read(zip, root + "licenses/FodyHelpers-LICENSE.txt"),
+        Read(zip, root + "licenses/Mono.Cecil-LICENSE.txt"),
+        "addon");
     var nupkg = zip.Entries.SingleOrDefault(e => e.FullName == root + $"assets/nuget/GodotCSharpProfiler.Fody.{version}.nupkg");
     Assert(nupkg is not null && nupkg.Length > 10_000, "Fody nupkg is absent or implausibly small.");
     using (var package = new ZipArchive(nupkg!.Open(), ZipArchiveMode.Read, leaveOpen: false))
+    {
         Assert(package.GetEntry("README.md") is not null, "Fody nupkg README is missing.");
+        AssertThirdPartyNotices(
+            Read(package, "THIRD-PARTY-NOTICES.md"),
+            Read(package, "licenses/FodyHelpers-LICENSE.txt"),
+            Read(package, "licenses/Mono.Cecil-LICENSE.txt"),
+            "Fody nupkg");
+        foreach (var binary in new[] { "FodyHelpers.dll", "Mono.Cecil.dll", "Mono.Cecil.Pdb.dll", "Mono.Cecil.Rocks.dll" })
+            Assert(package.GetEntry("weaver/" + binary) is not null, $"Fody nupkg is missing embedded {binary}.");
+    }
     Assert(new FileInfo(path).Length < 25 * 1024 * 1024, "Archive exceeds 25 MiB safety budget.");
 }
 
 foreach (var implicitUsings in new[] { "enable", "disable" })
     TestExtractedProject(path, shell, implicitUsings);
-Console.WriteLine($"Validated canonical archive and raw/add/remove clean-project matrix (ImplicitUsings enable/disable), {new FileInfo(path).Length} bytes: {path}");
+if (OperatingSystem.IsLinux()) TestLinuxSymlinkRejections(path, shell);
+Console.WriteLine($"Validated canonical archive, retained third-party notices, raw/add/remove clean-project matrix (ImplicitUsings enable/disable), and Linux project/root/props/parent-chain symlink rejection when applicable; {new FileInfo(path).Length} bytes: {path}");
+
+static void AssertThirdPartyNotices(string notices, string fodyLicense, string cecilLicense, string container)
+{
+    Assert(notices.Contains("FodyHelpers 6.9.3", StringComparison.Ordinal), $"{container} notices omit FodyHelpers 6.9.3.");
+    Assert(notices.Contains("Mono.Cecil 0.11.6", StringComparison.Ordinal), $"{container} notices omit Mono.Cecil 0.11.6.");
+    Assert(notices.Contains("FodyHelpers.dll", StringComparison.Ordinal), $"{container} notices do not identify the embedded FodyHelpers binary.");
+    Assert(notices.Contains("Mono.Cecil.Pdb.dll", StringComparison.Ordinal) && notices.Contains("Mono.Cecil.Rocks.dll", StringComparison.Ordinal), $"{container} notices do not identify all embedded Mono.Cecil binaries.");
+    Assert(fodyLicense.Contains("Copyright (c) The Fody Team and contributors", StringComparison.Ordinal), $"{container} FodyHelpers copyright notice is incomplete.");
+    Assert(cecilLicense.Contains("Copyright (c) 2008 - 2015 Jb Evain", StringComparison.Ordinal) && cecilLicense.Contains("Copyright (c) 2008 - 2011 Novell, Inc.", StringComparison.Ordinal), $"{container} Mono.Cecil copyright notices are incomplete.");
+    const string permission = "Permission is hereby granted, free of charge, to any person obtaining";
+    const string warranty = "THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND";
+    Assert(fodyLicense.Contains(permission, StringComparison.Ordinal) && fodyLicense.Contains(warranty, StringComparison.Ordinal), $"{container} FodyHelpers MIT license text is incomplete.");
+    Assert(cecilLicense.Contains(permission, StringComparison.Ordinal) && cecilLicense.Contains(warranty, StringComparison.Ordinal), $"{container} Mono.Cecil MIT license text is incomplete.");
+}
+
+static void TestLinuxSymlinkRejections(string archive, string shell)
+{
+    TestRejectedSymlinkFixture(archive, shell, "selected project", (root, setup, project) =>
+    {
+        var outside = Path.Combine(Path.GetDirectoryName(root)!, "outside.csproj");
+        File.WriteAllText(outside, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>\n", new UTF8Encoding(false));
+        File.Delete(project);
+        File.CreateSymbolicLink(project, outside);
+        return (setup, project, outside);
+    });
+    TestRejectedSymlinkFixture(archive, shell, "dependency props", (root, setup, project) =>
+    {
+        var props = Path.Combine(root, "addons", "godot_csharp_profiler", "assets", "GodotCSharpProfiler.Dependencies.props");
+        var outside = Path.Combine(Path.GetDirectoryName(root)!, "outside.props");
+        File.Move(props, outside);
+        File.CreateSymbolicLink(props, outside);
+        return (setup, project, project);
+    });
+    TestRejectedSymlinkFixture(archive, shell, "project root", (root, setup, project) =>
+    {
+        var link = Path.Combine(Path.GetDirectoryName(root)!, "linked-root");
+        Directory.CreateSymbolicLink(link, root);
+        return (
+            Path.Combine(link, "addons", "godot_csharp_profiler", "assets", "setup.ps1"),
+            Path.Combine(link, Path.GetFileName(project)),
+            project);
+    });
+    TestRejectedSymlinkFixture(archive, shell, "unsafe parent chain", (root, setup, project) =>
+    {
+        var parent = Path.GetDirectoryName(root)!;
+        var realParent = Path.Combine(parent, "real-parent");
+        Directory.CreateDirectory(realParent);
+        var movedRoot = Path.Combine(realParent, "project");
+        Directory.Move(root, movedRoot);
+        var linkedParent = Path.Combine(parent, "linked-parent");
+        Directory.CreateSymbolicLink(linkedParent, realParent);
+        return (
+            Path.Combine(linkedParent, "project", "addons", "godot_csharp_profiler", "assets", "setup.ps1"),
+            Path.Combine(linkedParent, "project", Path.GetFileName(project)),
+            Path.Combine(movedRoot, Path.GetFileName(project)));
+    });
+}
+
+static void TestRejectedSymlinkFixture(
+    string archive,
+    string shell,
+    string purpose,
+    Func<string, string, string, (string Setup, string Project, string ProtectedFile)> arrange)
+{
+    var container = Path.Combine(Path.GetTempPath(), "gcp-package-symlink-test-" + Guid.NewGuid().ToString("N"));
+    var root = Path.Combine(container, "project");
+    Directory.CreateDirectory(root);
+    try
+    {
+        ZipFile.ExtractToDirectory(archive, root);
+        var project = Path.Combine(root, "Synthetic.csproj");
+        File.WriteAllText(project, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>\n", new UTF8Encoding(false));
+        var setup = Path.Combine(root, "addons", "godot_csharp_profiler", "assets", "setup.ps1");
+        var arranged = arrange(root, setup, project);
+        var before = File.ReadAllBytes(arranged.ProtectedFile);
+        Run(shell, $"-NoProfile -File \"{arranged.Setup}\" -Project \"{arranged.Project}\"", container, $"reject {purpose} symlink/reparse point", expectedExitCode: 1);
+        Assert(BytesEqual(before, File.ReadAllBytes(arranged.ProtectedFile)), $"Rejected {purpose} symlink/reparse-point path changed protected bytes.");
+    }
+    finally { Directory.Delete(container, recursive: true); }
+}
 
 static void TestExtractedProject(string archive, string shell, string implicitUsings)
 {

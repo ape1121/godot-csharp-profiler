@@ -26,5 +26,8 @@
     <None Include="$(NuGetPackageRoot)fodyhelpers/6.9.3/lib/netstandard2.0/Mono.Cecil.dll" Pack="true" PackagePath="weaver/" Visible="false" />
     <None Include="$(NuGetPackageRoot)fodyhelpers/6.9.3/lib/netstandard2.0/Mono.Cecil.Pdb.dll" Pack="true" PackagePath="weaver/" Visible="false" />
     <None Include="$(NuGetPackageRoot)fodyhelpers/6.9.3/lib/netstandard2.0/Mono.Cecil.Rocks.dll" Pack="true" PackagePath="weaver/" Visible="false" />
+    <None Include="../../addons/godot_csharp_profiler/THIRD-PARTY-NOTICES.md" Pack="true" PackagePath="/" />
+    <None Include="../../addons/godot_csharp_profiler/licenses/FodyHelpers-LICENSE.txt" Pack="true" PackagePath="licenses/" />
+    <None Include="../../addons/godot_csharp_profiler/licenses/Mono.Cecil-LICENSE.txt" Pack="true" PackagePath="licenses/" />
   </ItemGroup>
 </Project>
