@@ -1,4 +1,4 @@
-[CmdletBinding(SupportsShouldProcess)]
+[CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
 param(
     [ValidateSet('Install', 'Remove')][string]$Action = 'Install',
     [string]$Project = '',
@@ -6,6 +6,14 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+if ($EnableAutomatic) {
+    throw @'
+setup.ps1 installs sampling dependencies only. It intentionally does not duplicate the automatic instrumentation installer.
+In Godot, enable Godot C# Profiler, open its Automatic mode, choose Install, review the ProjectInstaller preview, and apply it. Then clean/build and restart Godot and the game.
+'@
+}
+
 $root = (Resolve-Path (Join-Path $PSScriptRoot '../../..')).Path
 if (-not $Project) {
     $projects = @(Get-ChildItem -LiteralPath $root -Filter *.csproj -File)
@@ -14,43 +22,60 @@ if (-not $Project) {
 }
 $Project = [IO.Path]::GetFullPath($Project)
 if ([IO.Path]::GetDirectoryName($Project) -ne $root) { throw 'The project must be top-level in the Godot project.' }
-[xml]$xml = [IO.File]::ReadAllText($Project)
-if ($xml.Project.Sdk -eq $null) { throw 'An SDK-style project is required.' }
-$label = 'GodotCSharpProfilerDependencies'
-$owned = @($xml.Project.Import | Where-Object Label -eq $label)
-$feed = (Join-Path $PSScriptRoot 'nuget').Replace('\','/')
-$props = (Join-Path $PSScriptRoot 'GodotCSharpProfiler.Dependencies.props').Replace('\','/')
+if (-not (Test-Path -LiteralPath $Project -PathType Leaf)) { throw "Project does not exist: $Project" }
+
+$props = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'GodotCSharpProfiler.Dependencies.props'))
+if (-not (Test-Path -LiteralPath $props -PathType Leaf)) { throw "Dependency props do not exist: $props" }
+
+# A deliberately narrow, ownership-marked textual edit keeps every unknown project
+# element, comment, encoding, and newline byte unchanged. This script never edits
+# NuGet.Config or the shipped props and never installs automatic instrumentation.
+$label = 'GodotCSharpProfilerSamplingDependencies'
+$begin = "<!-- $label BEGIN -->"
+$end = "<!-- $label END -->"
+$original = [IO.File]::ReadAllBytes($Project)
+$encoding = [Text.UTF8Encoding]::new($false, $true)
+try { $text = $encoding.GetString($original) }
+catch { throw 'The project must be UTF-8 so setup can preserve it safely.' }
+if ($text -notmatch '<Project(?:\s|>)' -or $text -notmatch '</Project\s*>') { throw 'An SDK-style XML project is required.' }
+if (($text.Contains($begin)) -xor ($text.Contains($end))) { throw 'Refusing a project with an incomplete profiler ownership marker.' }
+
+$newText = $text
 if ($Action -eq 'Install') {
-    if ($owned.Count -eq 0) {
-        $import = $xml.CreateElement('Import', $xml.Project.NamespaceURI)
-        $import.SetAttribute('Project', $props)
-        $import.SetAttribute('Label', $label)
-        [void]$xml.Project.AppendChild($import)
+    if (-not $text.Contains($begin)) {
+        $newline = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
+        $escapedProps = [Security.SecurityElement]::Escape($props.Replace('\', '/'))
+        $block = "  $begin$newline  <Import Project=`"$escapedProps`" Label=`"$label`" />$newline  $end$newline"
+        $close = [Text.RegularExpressions.Regex]::Match($text, '</Project\s*>', [Text.RegularExpressions.RegexOptions]::RightToLeft)
+        $newText = $text.Insert($close.Index, $block)
     }
-    if ($EnableAutomatic) {
-        $group = $xml.CreateElement('ItemGroup', $xml.Project.NamespaceURI); $group.SetAttribute('Label', $label)
-        foreach ($spec in @(@('Fody','6.9.3'), @('GodotCSharpProfiler.Fody','0.1.0-dev'))) {
-            $reference = $xml.CreateElement('PackageReference', $xml.Project.NamespaceURI)
-            $reference.SetAttribute('Include', $spec[0]); $reference.SetAttribute('Version', $spec[1]); $reference.SetAttribute('PrivateAssets','all')
-            [void]$group.AppendChild($reference)
-        }
-        [void]$xml.Project.AppendChild($group)
-    }
-    $config = Join-Path $root 'NuGet.Config'
-    if ($EnableAutomatic -and -not (Test-Path $config)) {
-        $configText = "<?xml version=`"1.0`" encoding=`"utf-8`"?>`n<configuration><packageSources><add key=`"nuget.org`" value=`"https://api.nuget.org/v3/index.json`" /><add key=`"GodotCSharpProfilerLocal`" value=`"$feed`" /></packageSources></configuration>`n"
-        [IO.File]::WriteAllText("$config.tmp", $configText, [Text.UTF8Encoding]::new($false)); Move-Item "$config.tmp" $config
-    }
-} else {
-    foreach ($node in @($xml.Project.ChildNodes | Where-Object { $_.Attributes['Label']?.Value -eq $label })) { [void]$xml.Project.RemoveChild($node) }
-    $config = Join-Path $root 'NuGet.Config'
-    if (Test-Path $config) {
-        $text = [IO.File]::ReadAllText($config)
-        if ($text -match 'GodotCSharpProfilerLocal') { Write-Warning 'NuGet.Config names the addon feed; remove that source/file manually after checking other entries.' }
-    }
+} elseif ($text.Contains($begin)) {
+    $pattern = '(?m)^[ \t]*' + [Regex]::Escape($begin) + '\r?\n[\s\S]*?^[ \t]*' + [Regex]::Escape($end) + '(?:\r?\n)?'
+    $newText = [Regex]::Replace($text, $pattern, '', 1)
 }
-$settings = [Xml.XmlWriterSettings]::new(); $settings.Indent = $true; $settings.Encoding = [Text.UTF8Encoding]::new($false)
-$temp = "$Project.gcp.tmp"
-$writer = [Xml.XmlWriter]::Create($temp, $settings); try { $xml.Save($writer) } finally { $writer.Dispose() }
-if ($PSCmdlet.ShouldProcess($Project, "$Action profiler dependencies")) { Move-Item -Force $temp $Project } else { Remove-Item $temp }
+
+if ($newText -eq $text) {
+    Write-Host "$Action complete; no owned sampling changes were needed."
+    return
+}
+if (-not $PSCmdlet.ShouldProcess($Project, "$Action owned profiler sampling dependency import")) {
+    Write-Host 'Preview complete; no files were changed.'
+    return
+}
+
+$replacement = $encoding.GetBytes($newText)
+$temp = Join-Path ([IO.Path]::GetDirectoryName($Project)) ('.' + [IO.Path]::GetFileName($Project) + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
+try {
+    [IO.File]::WriteAllBytes($temp, $replacement)
+    [xml]$null = [IO.File]::ReadAllText($temp, $encoding)
+    [IO.File]::Move($temp, $Project, $true)
+} catch {
+    Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+    # Move is the sole commit point. If anything unexpectedly changed the target,
+    # restore its exact pre-transaction bytes before reporting failure.
+    if (-not [Linq.Enumerable]::SequenceEqual([byte[]]$original, [byte[]][IO.File]::ReadAllBytes($Project))) {
+        [IO.File]::WriteAllBytes($Project, $original)
+    }
+    throw
+}
 Write-Host "$Action complete. Run 'dotnet restore', rebuild, and restart Godot."

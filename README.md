@@ -14,7 +14,9 @@ dotnet build
 
 Restart Godot and enable **Godot C# Profiler** in Project Settings > Plugins. Extraction alone is compile-safe: sampling's external references are gated until setup imports `assets/GodotCSharpProfiler.Dependencies.props`. Exact dependency versions and local feed location are in `assets/dependencies.json`.
 
-For automatic instrumentation, first commit your project, then run setup with `-EnableAutomatic`. The archive supplies the exact matching `GodotCSharpProfiler.Fody` package in `assets/nuget`; Fody itself is restored at exact version 6.9.3. Configure filters, close the game, clean/build, and restart both editor and game. Rebuild/restart after every rule change. Remove owned references/weaver configuration before deleting the addon.
+`setup.ps1` owns sampling only; `-WhatIf` previews its ownership-marked import, and removal deletes only that import. It never changes `NuGet.Config`.
+
+For automatic instrumentation, first commit your project. In Godot, open the profiler's **Automatic** mode, choose **Install**, review the ProjectInstaller preview, and apply it. This is the tested transactional installer contract; `setup.ps1` intentionally does not duplicate Fody references or XML edits. The archive supplies the exact matching `GodotCSharpProfiler.Fody` package in `assets/nuget`; Fody itself is restored at exact version 6.9.3. Configure filters, close the game, clean/build, and restart both editor and game. Rebuild/restart after every rule change. Use that same UI's previewed uninstall before deleting the addon.
 
 ## Semantics and limitations
 
@@ -44,4 +46,4 @@ Stop games/capture, disable the plugin, run:
 pwsh addons/godot_csharp_profiler/assets/setup.ps1 -Action Remove
 ```
 
-Review/remove only addon-owned `NuGet.Config`, project references/imports, and `FodyWeavers.xml` element; delete this directory; clear stale `.godot/mono`, `bin`, and `obj`; restore, rebuild, and restart. Keep unrelated NuGet/Fody configuration. See `CHANGELOG.md` and `LICENSE`.
+The script removes only its addon-owned sampling import and leaves `NuGet.Config` untouched. Use Automatic mode's previewed ProjectInstaller uninstall for owned Fody references/weaver configuration; delete this directory; clear stale `.godot/mono`, `bin`, and `obj`; restore, rebuild, and restart. Keep unrelated NuGet/Fody configuration. See `CHANGELOG.md` and `LICENSE`.
