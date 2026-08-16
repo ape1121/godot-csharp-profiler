@@ -44,6 +44,7 @@ public static class InstrumentationRecorder
     private struct Aggregate { internal long Calls; internal long Ticks; }
 
     public const int MaximumMethods = 16384;
+    public const int MaximumLabelLength = 512;
     public const int MaximumSamples = MaximumMethods;
     public const int MaximumDepth = 1024;
     private static readonly object Gate = new();
@@ -120,6 +121,61 @@ public static class InstrumentationRecorder
                 samples.Add(new Sample(id, value.Calls, value.Ticks));
             }
             return new Snapshot(samples.ToArray(), _generation, _dropped, _truncated, _forcedClosed);
+        }
+    }
+}
+
+
+/// <summary>Immutable metadata emitted into an instrumented assembly by the production weaver.</summary>
+public sealed class InstrumentationManifest
+{
+    private const string ManifestTypeName = "Apeworks.GodotCSharpProfiler.Instrumentation.GodotCSharpProfilerInstrumentationManifest";
+    private readonly string[] _labels;
+
+    private InstrumentationManifest(System.Reflection.Assembly assembly, string configHash, string[] labels, int skippedCount)
+    {
+        Assembly = assembly;
+        ConfigHash = configHash;
+        _labels = labels;
+        Labels = Array.AsReadOnly(labels);
+        SkippedCount = skippedCount;
+    }
+
+    public System.Reflection.Assembly Assembly { get; }
+    public string ConfigHash { get; }
+    public IReadOnlyList<string> Labels { get; }
+    public int InstrumentedCount => _labels.Length;
+    public int SkippedCount { get; }
+    public string? ResolveLabel(int methodId) => (uint)methodId < (uint)_labels.Length ? _labels[methodId] : null;
+
+    /// <summary>Reads and validates the bounded manifest directly from the supplied loaded assembly.</summary>
+    public static bool TryRead(System.Reflection.Assembly assembly, out InstrumentationManifest? manifest)
+    {
+        if (assembly is null) throw new ArgumentNullException(nameof(assembly));
+        manifest = null;
+        var type = assembly.GetType(ManifestTypeName, false, false);
+        if (type is null) return false;
+        try
+        {
+            var hash = type.GetField("ConfigHash")?.GetRawConstantValue() as string;
+            var count = type.GetField("InstrumentedCount")?.GetRawConstantValue() as int?;
+            var skipped = type.GetField("SkippedCount")?.GetRawConstantValue() as int?;
+            var getLabel = type.GetMethod("GetLabel", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static, null, new[] { typeof(int) }, null);
+            if (hash is null || hash.Length != 16 || count is null || count < 0 || count > InstrumentationRecorder.MaximumMethods || skipped is null || skipped < 0 || getLabel is null) return false;
+            var labels = new string[count.Value];
+            for (var id = 0; id < labels.Length; id++)
+            {
+                var label = getLabel.Invoke(null, new object[] { id }) as string;
+                if (string.IsNullOrEmpty(label) || System.Text.Encoding.UTF8.GetByteCount(label) > InstrumentationRecorder.MaximumLabelLength) return false;
+                labels[id] = label;
+            }
+            if (getLabel.Invoke(null, new object[] { -1 }) is not null || getLabel.Invoke(null, new object[] { labels.Length }) is not null) return false;
+            manifest = new InstrumentationManifest(assembly, hash, labels, skipped.Value);
+            return true;
+        }
+        catch (Exception exception) when (exception is System.Reflection.TargetInvocationException || exception is InvalidOperationException || exception is ArgumentException)
+        {
+            return false;
         }
     }
 }
