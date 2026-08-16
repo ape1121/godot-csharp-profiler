@@ -1,4 +1,5 @@
 #if TOOLS
+using Apeworks.GodotCSharpProfiler;
 using Godot;
 using System;
 using System.Linq;

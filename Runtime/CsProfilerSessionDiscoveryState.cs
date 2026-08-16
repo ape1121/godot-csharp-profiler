@@ -1,6 +1,8 @@
 using Godot;
 using System;
 
+namespace Apeworks.GodotCSharpProfiler;
+
 // Pure lifecycle state shared by the editor panel and its headless regression probe. Godot debugger
 // sessions can already be active when a managed editor plugin is reloaded, so discovery is driven by
 // current session state rather than relying on one lossy Started signal or one game-side ready packet.
@@ -97,17 +99,42 @@ internal sealed class CsProfilerRuntimeIdentity
     internal string DisplayName { get; }
     internal bool Capturing { get; }
 
-    internal static CsProfilerRuntimeIdentity FromWire(Godot.Collections.Array data)
+        internal static CsProfilerRuntimeIdentity FromWire(Godot.Collections.Array data) =>
+        TryFromWire(data, out var identity) ? identity : Unknown;
+
+        internal static bool TryFromWire(
+        Godot.Collections.Array data,
+        out CsProfilerRuntimeIdentity identity)
     {
-        if (data == null || data.Count < 6)
-            return Unknown;
-        return new CsProfilerRuntimeIdentity(
-            data[0].AsString(),
-            data[1].AsInt64(),
-            data[2].AsBool(),
-            data[3].AsString(),
-            data[4].AsString(),
-            data[5].AsBool());
+        identity = Unknown;
+        if (data == null || data.Count != 6)
+            return false;
+        try
+        {
+            if (data[0].VariantType != Variant.Type.String ||
+                data[1].VariantType != Variant.Type.Int ||
+                data[2].VariantType != Variant.Type.Bool ||
+                data[3].VariantType != Variant.Type.String ||
+                data[4].VariantType != Variant.Type.String ||
+                data[5].VariantType != Variant.Type.Bool)
+            {
+                return false;
+            }
+
+            identity = new CsProfilerRuntimeIdentity(
+                data[0].AsString(),
+                data[1].AsInt64(),
+                data[2].AsBool(),
+                data[3].AsString(),
+                data[4].AsString(),
+                data[5].AsBool());
+            return true;
+        }
+        catch (Exception error) when (error is InvalidCastException or ArgumentException or OverflowException)
+        {
+            identity = Unknown;
+            return false;
+        }
     }
 
     internal static string Normalize(string value, int maximumLength, string fallback)
