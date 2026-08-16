@@ -3,9 +3,9 @@ using Godot;
 using System;
 using System.Collections.Generic;
 
-// Frame-time strip chart for the C# Profiler tab, in the spirit of Godot's profiler graph:
-// total engine frame time drawn dim behind the brighter main-thread C# time, with 60/30 fps
-// guide lines. Left-click/drag selects a frame for the call tree; the mouse wheel zooms the
+// Exact manual-span frame strip for the legacy bridge: total engine frame time is drawn dim behind
+// observed C# wall time, with 60/30 fps guide lines. Sampling estimates use a separate result
+// group and are never drawn here. Left-click/drag selects a frame; the mouse wheel zooms the
 // timeline around the cursor and middle-drag pans. While zoomed with the view pinned to the
 // newest frame, the window keeps following incoming frames.
 [Tool]
@@ -38,7 +38,7 @@ public partial class CsProfilerFrameGraph : Control
         CustomMinimumSize = new Vector2(0, 96);
         MouseDefaultCursorShape = CursorShape.PointingHand;
         ClipContents = true;
-        TooltipText = "Click/drag: select frame · Wheel: zoom timeline · Middle-drag: pan";
+        TooltipText = "Exact observed wall time · Click/drag: select frame · Wheel: zoom · Middle-drag: pan";
     }
 
     public void SetFrames(IReadOnlyList<CsProfilerPanel.ProfileFrame> frames)

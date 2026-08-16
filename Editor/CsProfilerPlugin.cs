@@ -1,5 +1,6 @@
 #if TOOLS
 using Apeworks.GodotCSharpProfiler;
+using Apeworks.GodotCSharpProfiler.Editor.Integration;
 using Godot;
 using System;
 using System.Linq;
@@ -14,9 +15,18 @@ public partial class CsProfilerPlugin : EditorPlugin
     private EditorDock _dock;
     private bool _editorAttachedProbeRunning;
     private double _editorAttachedProbeDeadline;
+    private bool _registered;
+    private ICoordinatorLifetime _coordinatorLifetime;
+
+    // Backend ownership stays outside this plugin. A composition root may inject a disposal request.
+    internal void SetCoordinatorLifetime(ICoordinatorLifetime lifetime) =>
+        _coordinatorLifetime = lifetime;
 
     public override void _EnterTree()
     {
+        if (_registered)
+            return;
+        _registered = true;
         _panel = new CsProfilerPanel { Name = "C# Profiler" };
         _dock = new EditorDock
         {
@@ -40,6 +50,9 @@ public partial class CsProfilerPlugin : EditorPlugin
 
     public override void _ExitTree()
     {
+        if (!_registered)
+            return;
+        _registered = false;
         if (_debugger != null)
         {
             _debugger.Teardown();
@@ -53,6 +66,8 @@ public partial class CsProfilerPlugin : EditorPlugin
             _dock = null;
         }
         _panel = null;
+        _coordinatorLifetime?.RequestDispose();
+        _coordinatorLifetime = null;
     }
 
     private void StartEditorAttachedProbe()
