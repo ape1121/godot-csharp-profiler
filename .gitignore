@@ -1,0 +1,22 @@
+# Godot
+.godot/
+.import/
+export.cfg
+export_presets.cfg
+
+# .NET
+**/bin/
+**/obj/
+*.user
+*.suo
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Test output
+TestResults/
+artifacts/
+.tmp/

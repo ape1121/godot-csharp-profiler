@@ -1,0 +1,6 @@
+* text=auto eol=lf
+
+# Asset Library archives retain only the distributable addon.
+/** export-ignore
+/addons !export-ignore
+/addons/** !export-ignore

@@ -1,0 +1,12 @@
+config_version=5
+
+[application]
+config/name="Godot C# Profiler Development"
+run/main_scene="res://demo/Main.tscn"
+config/features=PackedStringArray("4.7", "C#", "Forward Plus")
+
+[dotnet]
+project/assembly_name="GodotCSharpProfiler"
+
+[editor_plugins]
+enabled=PackedStringArray("res://addons/godot_csharp_profiler/plugin.cfg")
