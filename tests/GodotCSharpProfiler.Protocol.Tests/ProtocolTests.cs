@@ -13,15 +13,16 @@ public sealed class ProtocolTests
     {
         Assert.IsType<HelloMessage>(Parse(MessageKind.Hello, Token, "client", 1024L));
         Assert.IsType<CapabilitiesMessage>(Parse(MessageKind.Capabilities, Token, 7L,
-            (long)(CaptureModes.Sampling | CaptureModes.ManualScopes), 128L, 4096L, 8L));
+            (long)(CaptureModes.Sampling | CaptureModes.ManualScopes), false, 1_000_000L,
+            128L, 4096L, 8L));
         Assert.IsType<ConfigureMessage>(Parse(MessageKind.Configure, Token, 7L, Fingerprint,
-            (long)(CaptureModes.Sampling | CaptureModes.ManualScopes), 100L, 64L));
+            (long)(CaptureModes.Sampling | CaptureModes.ManualScopes), 0L, 64L));
         Assert.IsType<StartMessage>(Parse(MessageKind.Start, Token, 7L, Fingerprint));
         Assert.IsType<StateMessage>(Parse(MessageKind.State, Token, 7L, 1L, Fingerprint,
             (long)CaptureState.Capturing, (long)CaptureSource.Sampling, (long)CaptureCompleteness.InProgress,
             (long)PartialReason.None, 0L, 0L, 0L, 0L));
         Assert.IsType<BatchMessage>(Parse(MessageKind.Batch, Token, 7L, 2L, Fingerprint,
-            (long)CaptureSource.Sampling, false, true, 2L, 1L, 0L, 0L,
+            (long)CaptureSource.Sampling, false, false, 2L, 1L, 0L, 0L,
             new WireArray([new WireArray([1L, 100L, 3L]), new WireArray([2L, 200L, 1L])])));
         Assert.IsType<StopMessage>(Parse(MessageKind.Stop, Token, 7L, 3L, Fingerprint));
         Assert.IsType<ErrorMessage>(Parse(MessageKind.Error, Token, 7L, 4L, 12L, "bad request", false));
@@ -45,7 +46,7 @@ public sealed class ProtocolTests
             ("maxBatchBytes", 1024L)));
         AssertRejected(Map(("kind", "configure"), ("major", 1L), ("minor", 0L), ("runtimeToken", Token),
             ("generation", 1L), ("fingerprint", Fingerprint), ("modes", (long)(CaptureModes.Sampling | CaptureModes.AutomaticInstrumentation)),
-            ("samplingHertz", 100L), ("maxMethods", 64L)));
+            ("requestedSamplingIntervalNanoseconds", 1_000_000L), ("maxMethods", 64L)));
         AssertRejected(Map(("kind", "configure"), ("major", 1L), ("minor", 0L), ("runtimeToken", Token),
             ("generation", 1L), ("fingerprint", Fingerprint), ("modes", (long)CaptureModes.ManualScopes),
             ("samplingHertz", 100L), ("maxMethods", 64L)));
@@ -74,7 +75,7 @@ public sealed class ProtocolTests
     }
 
     [Theory]
-    [InlineData(CaptureSource.Sampling, true, true)]
+    [InlineData(CaptureSource.Sampling, false, true)]
     [InlineData(CaptureSource.AutomaticSpans, true, true)]
     [InlineData(CaptureSource.ManualSpans, true, true)]
     public void RejectsFalseSourceSemantics(CaptureSource source, bool exactCalls, bool cpuTime)
@@ -90,13 +91,50 @@ public sealed class ProtocolTests
     public void AcceptsTruthfulSourceSemantics()
     {
         Parse(MessageKind.Batch, Token, 1L, 1L, Fingerprint, (long)CaptureSource.Sampling,
-            false, true, 0L, 0L, 0L, 0L, Methods(0));
+            false, false, 0L, 0L, 0L, 0L, Methods(0));
         Parse(MessageKind.Batch, Token, 1L, 1L, Fingerprint, (long)CaptureSource.AutomaticSpans,
             true, false, 0L, 0L, 0L, 0L, Methods(0));
         Parse(MessageKind.Batch, Token, 1L, 1L, Fingerprint, (long)CaptureSource.ManualSpans,
             true, false, 0L, 0L, 0L, 0L, Methods(0));
     }
 
+    [Fact]
+    public void ParsesNanosecondIntervalSentinelsAndStrictBounds()
+    {
+        var fixedUnknown = Assert.IsType<CapabilitiesMessage>(Parse(MessageKind.Capabilities, Token, 0L,
+            (long)CaptureModes.Sampling, false, 0L, 64L, 4096L, 8L));
+        Assert.Equal(0, fixedUnknown.EffectiveSamplingIntervalNanoseconds);
+
+        var configurable = Assert.IsType<CapabilitiesMessage>(Parse(MessageKind.Capabilities, Token, 0L,
+            (long)(CaptureModes.Sampling | CaptureModes.AutomaticInstrumentation | CaptureModes.ManualScopes),
+            true, ProtocolLimits.MinSamplingIntervalNanoseconds, 64L, 4096L, 8L));
+        Assert.True(configurable.SamplingIntervalRuntimeConfigurable);
+
+        var noRequest = Assert.IsType<ConfigureMessage>(Parse(MessageKind.Configure, Token, 1L, Fingerprint,
+            (long)CaptureModes.ManualScopes, 0L, 64L));
+        Assert.Equal(0, noRequest.RequestedSamplingIntervalNanoseconds);
+        Parse(MessageKind.Configure, Token, 1L, Fingerprint, (long)CaptureModes.Sampling,
+            ProtocolLimits.MinSamplingIntervalNanoseconds, 64L);
+        Parse(MessageKind.Configure, Token, 1L, Fingerprint, (long)CaptureModes.Sampling,
+            ProtocolLimits.MaxSamplingIntervalNanoseconds, 64L);
+
+        AssertRejected(ConfigureMap(CaptureModes.Sampling, -1));
+        AssertRejected(ConfigureMap(CaptureModes.Sampling, ProtocolLimits.MinSamplingIntervalNanoseconds - 1));
+        AssertRejected(ConfigureMap(CaptureModes.Sampling, (long)ProtocolLimits.MaxSamplingIntervalNanoseconds + 1));
+        AssertRejected(ConfigureMap(CaptureModes.ManualScopes, ProtocolLimits.MinSamplingIntervalNanoseconds));
+    }
+
+    [Fact]
+    public void CapabilityIntervalFieldsRequireSamplingAndUseExactSchema()
+    {
+        Parse(MessageKind.Capabilities, Token, 0L, (long)CaptureModes.ManualScopes,
+            false, 0L, 64L, 4096L, 8L);
+        AssertRejected(CapabilitiesMap(CaptureModes.ManualScopes, true, 0));
+        AssertRejected(CapabilitiesMap(CaptureModes.ManualScopes, false,
+            ProtocolLimits.MinSamplingIntervalNanoseconds));
+        AssertRejected(CapabilitiesMap(CaptureModes.Sampling, false,
+            ProtocolLimits.MinSamplingIntervalNanoseconds - 1));
+    }
     private static ProtocolMessage Parse(MessageKind kind, params WireValue[] values)
     {
         var names = ProtocolSchema.FieldNames(kind);
@@ -120,6 +158,17 @@ public sealed class ProtocolTests
     private static WireMap Map(params (string Name, WireValue Value)[] fields) =>
         new(fields.Select(field => new KeyValuePair<string, WireValue>(field.Name, field.Value)));
 
+    private static WireMap ConfigureMap(CaptureModes modes, long interval) =>
+        Map(("kind", "configure"), ("major", 1L), ("minor", 0L), ("runtimeToken", Token),
+            ("generation", 1L), ("fingerprint", Fingerprint), ("modes", (long)modes),
+            ("requestedSamplingIntervalNanoseconds", interval), ("maxMethods", 64L));
+
+    private static WireMap CapabilitiesMap(CaptureModes modes, bool configurable, long effectiveInterval) =>
+        Map(("kind", "capabilities"), ("major", 1L), ("minor", 0L), ("runtimeToken", Token),
+            ("generation", 0L), ("modes", (long)modes),
+            ("samplingIntervalRuntimeConfigurable", configurable),
+            ("effectiveSamplingIntervalNanoseconds", effectiveInterval),
+            ("maxMethods", 64L), ("maxBatchBytes", 4096L), ("maxDepth", 8L));
     private static WireArray Methods(int count) =>
         new(Enumerable.Range(0, count).Select(i => (WireValue)new WireArray([(long)i, 1L, 1L])));
 
