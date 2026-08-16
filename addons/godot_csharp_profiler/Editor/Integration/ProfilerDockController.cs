@@ -145,6 +145,13 @@ public sealed class ProfilerDockController
     }
 
     public InstallerPreviewResult? PreviewAutomaticInstall()
+        => PreviewAutomaticOperation(() => installer!.Preview(modes.Configuration.Automatic), "Installation");
+
+    public InstallerPreviewResult? PreviewAutomaticUninstall()
+        => PreviewAutomaticOperation(() => installer!.PreviewUninstall(), "Uninstall");
+
+    private InstallerPreviewResult? PreviewAutomaticOperation(Func<InstallerPreviewResult> operation,
+        string operationName)
     {
         currentPreviewToken = null;
         installerPreviewDiff = "";
@@ -157,7 +164,7 @@ public sealed class ProfilerDockController
         }
         try
         {
-            var preview = installer.Preview(modes.Configuration.Automatic);
+            var preview = operation();
             installerGate = preview.Gate;
             installerPreviewDiff = SafeText(preview.Diff, 16_384, "");
             installerStatus = GateStatus(preview.Gate, preview.ChangeCount);
@@ -170,7 +177,7 @@ public sealed class ProfilerDockController
         catch (Exception error)
         {
             installerGate = InstallerGate.Error;
-            installerStatus = "Installation preview failed: " + SafeText(error.Message, 120, "unknown error");
+            installerStatus = operationName + " preview failed: " + SafeText(error.Message, 120, "unknown error");
             Render();
             return null;
         }

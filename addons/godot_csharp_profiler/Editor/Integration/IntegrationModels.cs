@@ -53,6 +53,7 @@ public sealed record InstallerApplyResult(InstallerGate Gate, bool Changed, bool
 public interface IAutomaticInstaller
 {
     InstallerPreviewResult Preview(AutomaticSettings settings);
+    InstallerPreviewResult PreviewUninstall();
     InstallerApplyResult Apply(string previewToken);
 }
 

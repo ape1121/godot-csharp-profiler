@@ -100,6 +100,10 @@ static void TestExtractedProject(string archive, string shell, string implicitUs
         Assert(File.ReadAllText(project) == installed, "Rejected automatic request changed the project.");
         Assert(BytesEqual(configBytes, File.ReadAllBytes(config)), "Rejected automatic request changed NuGet.Config.");
 
+        RunAutomaticLifecycle(root, project);
+        Assert(File.ReadAllText(project) == installed, "Automatic uninstall did not restore the setup-only project.");
+        Assert(!File.Exists(Path.Combine(root, "FodyWeavers.xml")), "Automatic uninstall left FodyWeavers.xml.");
+
         Run(shell, $"-NoProfile -File \"{setup}\" -Action Remove -Project \"{project}\"", root, "sampling remove");
         Assert(BytesEqual(originalProject, File.ReadAllBytes(project)), "Remove did not byte-restore the original project.");
         Assert(BytesEqual(configBytes, File.ReadAllBytes(config)), "Remove changed existing NuGet.Config.");
@@ -112,6 +116,52 @@ static void TestExtractedProject(string archive, string shell, string implicitUs
     }
     finally { Directory.Delete(root, recursive: true); }
 }
+
+static void RunAutomaticLifecycle(string root, string project)
+{
+    var harness = Path.Combine(Path.GetTempPath(), "gcsp-package-installer-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(harness);
+    try
+    {
+        var installer = Path.Combine(root, "addons", "godot_csharp_profiler", "Editor", "Installation", "ProjectInstaller.cs");
+        var models = Path.Combine(root, "addons", "godot_csharp_profiler", "Editor", "Installation", "InstallationModels.cs");
+        File.WriteAllText(Path.Combine(harness, "Harness.csproj"), $"""
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
+              <ItemGroup>
+                <Compile Include="{EscapeXml(installer)}" Link="ProjectInstaller.cs" />
+                <Compile Include="{EscapeXml(models)}" Link="InstallationModels.cs" />
+              </ItemGroup>
+            </Project>
+            """, new UTF8Encoding(false));
+        File.WriteAllText(Path.Combine(harness, "Program.cs"), """
+            using Apeworks.GodotCSharpProfiler.Editor.Installation;
+            using System.Diagnostics;
+            var root = args[0];
+            var package = Path.Combine(root, "addons", "godot_csharp_profiler", "assets", "nuget",
+                $"GodotCSharpProfiler.Fody.{ProjectInstaller.ProfilerFodyVersion}.nupkg");
+            var installer = new ProjectInstaller(root, packageSources: new PackageSourcePlan([package]));
+            installer.Apply(installer.PreviewInstall());
+            var project = ProjectInstaller.DiscoverProject(root);
+            var text = File.ReadAllText(project);
+            if (!text.Contains(ProjectInstaller.PackageSourceElementName) || !text.Contains(ProjectInstaller.RestoreSourcesElementName)) return 2;
+            var buildInfo = new ProcessStartInfo("dotnet", $"build \"{project}\" -c Release --nologo --no-cache")
+                { WorkingDirectory = root, UseShellExecute = false };
+            buildInfo.Environment["NUGET_PACKAGES"] = Path.Combine(root, ".package-acceptance", "packages");
+            using (var build = Process.Start(buildInfo))
+            { build!.WaitForExit(); if (build.ExitCode != 0) return build.ExitCode; }
+            installer.Apply(installer.PreviewUninstall());
+            text = File.ReadAllText(project);
+            return text.Contains("GodotCSharpProfiler.Fody") || text.Contains(ProjectInstaller.PackageSourceElementName) ||
+                text.Contains(ProjectInstaller.RestoreSourcesElementName) ? 3 : 0;
+            """, new UTF8Encoding(false));
+        Run("dotnet", $"run --project \"{Path.Combine(harness, "Harness.csproj")}\" -c Release -- \"{root}\"", harness,
+            "automatic install/build/uninstall from bundled package");
+    }
+    finally { Directory.Delete(harness, recursive: true); }
+}
+
+static string EscapeXml(string value) => value.Replace("&", "&amp;").Replace("\"", "&quot;").Replace("<", "&lt;").Replace(">", "&gt;");
 
 static void Run(string file, string arguments, string workingDirectory, string purpose, int expectedExitCode = 0)
 {

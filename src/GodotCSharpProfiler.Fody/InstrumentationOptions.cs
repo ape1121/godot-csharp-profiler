@@ -28,7 +28,8 @@ internal sealed class InstrumentationOptions
         if (config.Name.LocalName != "GodotCSharpProfiler")
             throw Error($"expected <GodotCSharpProfiler>, found <{config.Name.LocalName}>");
 
-        var allowed = new HashSet<string>(StringComparer.Ordinal) { "MaximumMethods", "MaximumLabelLength", "ProjectRoot", "ConfigHash" };
+        // Owner is installer lifecycle metadata; it is intentionally excluded from the instrumentation hash.
+        var allowed = new HashSet<string>(StringComparer.Ordinal) { "Owner", "MaximumMethods", "MaximumLabelLength", "ProjectRoot", "ConfigHash" };
         foreach (var attribute in config.Attributes())
             if (!allowed.Contains(attribute.Name.LocalName)) throw Error($"unknown configuration field '{attribute.Name.LocalName}'");
         foreach (var child in config.Elements())

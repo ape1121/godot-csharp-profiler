@@ -171,6 +171,23 @@ public sealed class EditorIntegrationTests
         Assert.False(controller.ApplyAutomaticInstall(preview.Token!, confirmed: true));
     }
 
+    [Fact]
+    public void Automatic_uninstall_requires_its_own_preview_and_is_reachable_from_controller()
+    {
+        var view = new FakeView();
+        var installer = new FakeInstaller();
+        var controller = new ProfilerDockController(view, new FakeTransport(), installer);
+
+        var preview = controller.PreviewAutomaticUninstall();
+
+        Assert.NotNull(preview);
+        Assert.Equal(1, installer.UninstallPreviewCalls);
+        Assert.Equal(0, installer.PreviewCalls);
+        Assert.False(controller.ApplyAutomaticInstall("wrong", confirmed: true));
+        Assert.True(controller.ApplyAutomaticInstall(preview!.Token!, confirmed: true));
+        Assert.Equal(1, installer.ApplyCalls);
+    }
+
     [Theory]
     [InlineData(InstallerGate.PackageUnavailable, "Package unavailable")]
     [InlineData(InstallerGate.NeedsBuild, "Needs build")]
@@ -285,6 +302,7 @@ public sealed class EditorIntegrationTests
     {
         public InstallerGate Gate { get; set; } = InstallerGate.Ready;
         public int PreviewCalls { get; private set; }
+        public int UninstallPreviewCalls { get; private set; }
         public int ApplyCalls { get; private set; }
         public AutomaticSettings? LastSettings { get; private set; }
         public InstallerPreviewResult Preview(AutomaticSettings settings)
@@ -299,6 +317,11 @@ public sealed class EditorIntegrationTests
         {
             ApplyCalls++;
             return new InstallerApplyResult(InstallerGate.NeedsBuild, true, true, true);
+        }
+        public InstallerPreviewResult PreviewUninstall()
+        {
+            UninstallPreviewCalls++;
+            return new InstallerPreviewResult(InstallerGate.Ready, "uninstall-token", "uninstall-diff", 2);
         }
     }
 

@@ -49,6 +49,9 @@ public sealed class InstallerTests
         AssertReference(project, "Fody", "6.9.3", owned: true);
         AssertReference(project, "GodotCSharpProfiler.Fody", "0.1.0-dev", owned: true);
         Assert.Equal(preview.InstallationId.ToString("D"), project.Root!.Elements("PropertyGroup").Elements(ProjectInstaller.OwnershipElementName).Single().Value);
+        Assert.Equal("packages", project.Descendants(ProjectInstaller.PackageSourceElementName).Single().Value);
+        Assert.Equal("$(RestoreAdditionalProjectSources);$(GodotCSharpProfilerPackageSource)",
+            project.Descendants(ProjectInstaller.RestoreSourcesElementName).Single().Value);
 
         var element = XDocument.Load(fixture.Path("FodyWeavers.xml")).Root!.Element("GodotCSharpProfiler")!;
         Assert.Equal(preview.InstallationId.ToString("D"), (string?)element.Attribute("Owner"));
@@ -138,7 +141,11 @@ public sealed class InstallerTests
     [Fact]
     public void Install_is_idempotent_and_uninstall_removes_only_owned_entries()
     {
-        using var fixture = Fixture.Create();
+        using var fixture = Fixture.Create("""
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup><ForeignRestoreSource>foreign-feed</ForeignRestoreSource></PropertyGroup>
+            </Project>
+            """);
         fixture.Write("FodyWeavers.xml", "<Weavers>\n  <!-- keep -->\n  <Costura />\n</Weavers>\n");
         var installer = fixture.Installer();
         installer.Apply(installer.PreviewInstall());
@@ -148,7 +155,25 @@ public sealed class InstallerTests
 
         installer.Apply(installer.PreviewUninstall());
         Assert.DoesNotContain("GodotCSharpProfiler", File.ReadAllText(fixture.Path("Game.csproj")));
+        Assert.Contains("<ForeignRestoreSource>foreign-feed</ForeignRestoreSource>", File.ReadAllText(fixture.Path("Game.csproj")));
+        Assert.DoesNotContain(ProjectInstaller.RestoreSourcesElementName, File.ReadAllText(fixture.Path("Game.csproj")));
         Assert.Equal("<Weavers>\n  <!-- keep -->\n  <Costura />\n</Weavers>\n", File.ReadAllText(fixture.Path("FodyWeavers.xml")));
+    }
+
+    [Fact]
+    public void Package_source_must_be_the_exact_bundled_filename_inside_project()
+    {
+        using var fixture = Fixture.Create();
+        using var outside = Fixture.Create();
+        var outsidePackage = outside.Path("GodotCSharpProfiler.Fody.0.1.0-dev.nupkg");
+        var outsideInstaller = new ProjectInstaller(fixture.Root, new FakeAvailabilityChecker(true),
+            new PackageSourcePlan([outsidePackage]));
+        Assert.Throws<InstallationRefusedException>(() => outsideInstaller.PreviewInstall());
+
+        var wrongName = fixture.Path("packages/wrong.nupkg");
+        var wrongInstaller = new ProjectInstaller(fixture.Root, new FakeAvailabilityChecker(true),
+            new PackageSourcePlan([wrongName]));
+        Assert.Throws<InstallationRefusedException>(() => wrongInstaller.PreviewInstall());
     }
 
     [Fact]
