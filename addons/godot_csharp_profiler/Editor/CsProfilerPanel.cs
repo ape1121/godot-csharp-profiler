@@ -98,6 +98,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private double _lastStartSentAtSec = double.NegativeInfinity;
     private bool _profilingRequested;
     private ProfilerDockController _controller;
+    internal ModeConfiguration ConfigurationForProtocol => _controller?.Configuration ?? ModeConfiguration.Default;
     internal string StatusTextForTests => _statsLabel?.Text ?? "";
     internal string[] DisplayedRowsForTests() => _displayedRowsForTests.ToArray();
     internal int FrameCountForTests => _frames.Count;
@@ -493,6 +494,12 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
 
     internal void ReportDebuggerPayloadError(string status) =>
         _controller?.ReportStatus(status);
+
+    internal void ApplyProtocolSnapshot(CaptureSnapshot snapshot, CsProfilerRuntimeIdentity identity) =>
+        _controller?.UpdateSnapshot(snapshot, FormatRuntimeDescription(identity));
+
+    internal void ApplyProtocolResults(ProfilerResults results) =>
+        _controller?.ReplaceResults(results);
 
     internal void OnBridgeReady(CsProfilerRuntimeIdentity identity)
     {

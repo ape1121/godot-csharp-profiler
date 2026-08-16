@@ -55,6 +55,8 @@ public partial class CsProfilerPlugin : EditorPlugin
         _registered = false;
         if (_debugger != null)
         {
+            // Teardown first: it sends the selected target's owner-correct strict stop while the
+            // debugger session is still registered. Disposal is requested only after unregister.
             _debugger.Teardown();
             RemoveDebuggerPlugin(_debugger);
             _debugger = null;

@@ -1,7 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
-    <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
@@ -13,11 +12,11 @@
     <PackageReference Include="xunit.runner.visualstudio" Version="3.0.0" PrivateAssets="all" />
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="../../addons/godot_csharp_profiler/Editor/Integration/**/*.cs" Link="Editor/Integration/%(RecursiveDir)%(Filename)%(Extension)" />
-    <Compile Include="../../addons/godot_csharp_profiler/Editor/Modes/**/*.cs" Link="Editor/Modes/%(RecursiveDir)%(Filename)%(Extension)" />
-    <Compile Include="../../addons/godot_csharp_profiler/Editor/Installation/**/*.cs" Link="Editor/Installation/%(RecursiveDir)%(Filename)%(Extension)" />
     <Compile Include="../../addons/godot_csharp_profiler/Runtime/Protocol/**/*.cs" Link="Runtime/Protocol/%(RecursiveDir)%(Filename)%(Extension)" />
     <Compile Remove="../../addons/godot_csharp_profiler/Runtime/Protocol/Adapters/GodotDebuggerTransport.cs" />
     <Compile Remove="../../addons/godot_csharp_profiler/Runtime/Protocol/Adapters/ProductionRuntimeCaptureBackend.cs" />
+    <Compile Include="../../addons/godot_csharp_profiler/Editor/Modes/**/*.cs" Link="Editor/Modes/%(RecursiveDir)%(Filename)%(Extension)" />
+    <Compile Include="../../addons/godot_csharp_profiler/Editor/Integration/IntegrationModels.cs" Link="Editor/Integration/IntegrationModels.cs" />
+    <Compile Include="../../addons/godot_csharp_profiler/Editor/Integration/ProfilerDockController.cs" Link="Editor/Integration/ProfilerDockController.cs" />
   </ItemGroup>
 </Project>
