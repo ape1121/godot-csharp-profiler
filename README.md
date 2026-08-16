@@ -38,7 +38,7 @@ Sampling is local, in-process EventPipe collection. It needs .NET diagnostics (`
 
 The release archive contains the exact `GodotCSharpProfiler.Fody` nupkg built from the matching source under `assets/nuget`; it does **not** assume that package exists on nuget.org.
 
-In Godot, open the profiler's **Automatic** mode, choose **Install**, review the ProjectInstaller preview, and apply it. `setup.ps1` is sampling-only and intentionally does not duplicate Fody references or XML edits. Then configure include/exclude rules and run:
+In Godot, open the profiler's **Automatic** mode, choose **Install**, review the ProjectInstaller preview, and apply it. `setup.ps1` owns the base addon dependency import (sampling packages plus the Debug editor API copy requirement) and intentionally does not duplicate Fody references or XML edits. Then configure include/exclude rules and run:
 
 ```powershell
 dotnet clean
@@ -75,7 +75,7 @@ There is **no telemetry**, analytics, account, or network upload. Capture data s
 ## Safe disable and uninstall
 
 1. Stop capture and running games; disable the plugin in Project Settings.
-2. Run `pwsh addons/godot_csharp_profiler/assets/setup.ps1 -Action Remove` while files still exist; this removes only its owned sampling import and never edits `NuGet.Config`.
+2. Run `pwsh addons/godot_csharp_profiler/assets/setup.ps1 -Action Remove` while files still exist; this removes only its owned base dependency import and never edits `NuGet.Config`.
 3. In Automatic mode, preview and apply ProjectInstaller uninstall to remove only its owned package references and `FodyWeavers.xml` element.
 4. Delete `addons/godot_csharp_profiler`.
 5. Delete `.godot/mono`, and project `bin`/`obj` if stale woven output remains; then `dotnet restore`, clean/build, and restart Godot.
