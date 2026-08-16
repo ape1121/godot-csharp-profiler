@@ -1,0 +1,40 @@
+name: release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Build and validate exact tag artifact
+        shell: pwsh
+        run: |
+          $version = '${{ github.ref_name }}'.TrimStart('v')
+          if ($version -notmatch '^\d+\.\d+\.\d+(?:[-.][0-9A-Za-z.-]+)?$') { throw "Invalid release tag: $version" }
+          ./scripts/build-release.ps1 -Version $version -OutputDirectory artifacts/release
+          dotnet run --project tests/GodotCSharpProfiler.Packaging.Tests/GodotCSharpProfiler.Packaging.Tests.csproj -c Release -- `
+            --archive "artifacts/release/godot-csharp-profiler-$version.zip" --version $version --powershell (Get-Command pwsh).Source
+      - name: Publish immutable GitHub release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" \
+            "artifacts/release/godot-csharp-profiler-$version.zip" \
+            artifacts/release/SHA256SUMS \
+            artifacts/release/release.json \
+            --verify-tag --title "Godot C# Profiler $version" \
+            --notes "See the packaged CHANGELOG.md and README.md for modes, compatibility, setup, and removal instructions."

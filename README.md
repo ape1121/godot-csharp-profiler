@@ -77,9 +77,10 @@ There is **no telemetry**, analytics, account, or network upload. Capture data s
 1. Stop capture and running games; disable the plugin in Project Settings.
 2. Run `pwsh addons/godot_csharp_profiler/assets/setup.ps1 -Action Remove` while files still exist; this removes only its owned base dependency import and never edits `NuGet.Config`.
 3. In Automatic mode, preview and apply ProjectInstaller uninstall to remove only its owned package references and `FodyWeavers.xml` element.
-4. Delete `addons/godot_csharp_profiler`.
-5. Delete `.godot/mono`, and project `bin`/`obj` if stale woven output remains; then `dotnet restore`, clean/build, and restart Godot.
-6. Confirm the project builds and no profiler references or woven outputs remain before committing.
+4. Remove or replace every user-authored `CsProfiler.Scope(...)` / `CsProfiler.Fn()` call and `using Apeworks.GodotCSharpProfiler;` directive; these manual API references belong to your source and cannot be removed automatically.
+5. Delete `addons/godot_csharp_profiler`.
+6. Delete `.godot/mono`, and project `bin`/`obj` if stale woven output remains; then `dotnet restore`, clean/build, and restart Godot.
+7. Confirm the project builds and no profiler references or woven outputs remain before committing.
 
 ## Releases and development
 

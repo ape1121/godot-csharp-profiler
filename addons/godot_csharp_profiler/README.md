@@ -46,4 +46,4 @@ Stop games/capture, disable the plugin, run:
 pwsh addons/godot_csharp_profiler/assets/setup.ps1 -Action Remove
 ```
 
-The script removes only its addon-owned dependency import and leaves `NuGet.Config` untouched. Use Automatic mode's previewed ProjectInstaller uninstall for owned Fody references/weaver configuration; disable the plugin so its owned bridge autoload is removed, delete this directory, clear stale `.godot/mono`, `bin`, and `obj`, restore, rebuild, and restart. Keep unrelated NuGet/Fody configuration. See `CHANGELOG.md` and `LICENSE`.
+The script removes only its addon-owned dependency import and leaves `NuGet.Config` untouched. Use Automatic mode's previewed ProjectInstaller uninstall for owned Fody references/weaver configuration; disable the plugin so its owned bridge autoload is removed. Remove user-authored `CsProfiler.Scope` / `CsProfiler.Fn` calls and profiler namespace imports before deleting this directory; those host-source references are intentionally never rewritten automatically. Clear stale `.godot/mono`, `bin`, and `obj`, restore, rebuild, and restart. Keep unrelated NuGet/Fody configuration. See `CHANGELOG.md` and `LICENSE`.
