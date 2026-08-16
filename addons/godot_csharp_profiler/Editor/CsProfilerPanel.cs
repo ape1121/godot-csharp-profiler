@@ -1,5 +1,8 @@
 #if TOOLS
 using Apeworks.GodotCSharpProfiler;
+using Apeworks.GodotCSharpProfiler.Editor.Integration;
+using Apeworks.GodotCSharpProfiler.Editor.Modes;
+using Apeworks.GodotCSharpProfiler.Protocol;
 using Godot;
 using System;
 using System.Collections.Generic;
@@ -10,7 +13,7 @@ using System.Text;
 // selected frame's call tree with Total/Self/Calls columns. Frames arrive from
 // CsProfilerBridge via CsProfilerDebuggerPlugin (see the bridge for the message layout).
 [Tool]
-public partial class CsProfilerPanel : VBoxContainer
+public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfilerCommandTransport
 {
     public sealed class ProfileFrame
     {
@@ -33,7 +36,7 @@ public partial class CsProfilerPanel : VBoxContainer
     // Live session-state probe injected by the debugger plugin. Session lifecycle signals can be
     // missed around plugin/assembly reloads, so state shown to the user is queried, not cached.
     public Func<bool> SessionActiveQuery;
-    public bool ProfilingRequested => _startButton is { ButtonPressed: true };
+    public bool ProfilingRequested => _profilingRequested;
 
     private bool SessionActive
     {
@@ -53,9 +56,18 @@ public partial class CsProfilerPanel : VBoxContainer
     private readonly List<ProfileFrame> _frames = new();
     private readonly HashSet<string> _collapsedPaths = new(StringComparer.Ordinal);
     private Button _startButton;
+    private Button _stopButton;
     private Button _copyButton;
+    private Button _exportButton;
+    private Button _samplingModeButton;
+    private Button _automaticModeButton;
+    private Button _manualModeButton;
+    private CheckButton _includeManualButton;
     private SpinBox _frameSelector;
+    private Label _targetLabel;
     private Label _statsLabel;
+    private Label _settingsLabel;
+    private Label _qualityLabel;
     private CsProfilerFrameGraph _graph;
     private Tree _tree;
     private int _selectedIndex = -1;
@@ -68,6 +80,8 @@ public partial class CsProfilerPanel : VBoxContainer
     private string _runtimeDescription = "";
     private double _lastFrameAtSec = double.NegativeInfinity;
     private double _lastStartSentAtSec = double.NegativeInfinity;
+    private bool _profilingRequested;
+    private ProfilerDockController _controller;
     internal string StatusTextForTests => _statsLabel?.Text ?? "";
     internal string[] DisplayedRowsForTests() => _displayedRowsForTests.ToArray();
     internal int FrameCountForTests => _frames.Count;
@@ -81,26 +95,53 @@ public partial class CsProfilerPanel : VBoxContainer
 
     internal void RequestCaptureForTests()
     {
-        if (_startButton != null && !_startButton.ButtonPressed)
-            _startButton.ButtonPressed = true;
+        if (_profilingRequested) return;
+        _profilingRequested = true;
+        _controller?.Start();
     }
 
     public override void _Ready()
     {
         SizeFlagsVertical = SizeFlags.ExpandFill;
+        _controller = new ProfilerDockController(this, this, null);
+
+        var targetBar = new HBoxContainer();
+        AddChild(targetBar);
+        targetBar.AddChild(new Label { Text = "Target:" });
+        _targetLabel = new Label { Text = "No target", SizeFlagsHorizontal = SizeFlags.ExpandFill };
+        targetBar.AddChild(_targetLabel);
+        _statsLabel = new Label { Text = "Disconnected" };
+        targetBar.AddChild(_statsLabel);
+
+        var modeBar = new HBoxContainer();
+        AddChild(modeBar);
+        modeBar.AddChild(new Label { Text = "Mode:" });
+        _samplingModeButton = ModeButton("Sampling", () => _controller.SelectMode(PrimaryMode.Sampling));
+        _automaticModeButton = ModeButton("Automatic", () => _controller.SelectMode(PrimaryMode.AutomaticInstrumentation));
+        _manualModeButton = ModeButton("Manual", _controller.SelectManualOnly);
+        modeBar.AddChild(_samplingModeButton);
+        modeBar.AddChild(_automaticModeButton);
+        modeBar.AddChild(_manualModeButton);
+        _includeManualButton = new CheckButton { Text = "Include Manual" };
+        _includeManualButton.Toggled += _controller.SetManualOverlay;
+        modeBar.AddChild(_includeManualButton);
 
         var toolbar = new HBoxContainer();
         AddChild(toolbar);
-
-        _startButton = new Button
+        _startButton = new Button { Text = "Start" };
+        _startButton.Pressed += () =>
         {
-            Text = "Start",
-            ToggleMode = true,
-            TooltipText = "Start/stop capturing C# scope timings from the running game.\n" +
-                          "Left pressed before launching, capturing starts with the session."
+            _profilingRequested = true;
+            _controller.Start();
         };
-        _startButton.Toggled += OnStartToggled;
         toolbar.AddChild(_startButton);
+        _stopButton = new Button { Text = "Stop" };
+        _stopButton.Pressed += () =>
+        {
+            _profilingRequested = false;
+            _controller.Stop();
+        };
+        toolbar.AddChild(_stopButton);
 
         var clearButton = new Button { Text = "Clear" };
         clearButton.Pressed += ClearHistory;
@@ -108,13 +149,15 @@ public partial class CsProfilerPanel : VBoxContainer
 
         _copyButton = new Button
         {
-            Text = "Copy Calls",
+            Text = "Copy",
             Disabled = true,
-            TooltipText = "Copy the selected call subtree (or the complete frame) with frame and " +
-                          "timing metadata. Ctrl+C works while the call tree is focused."
+            TooltipText = "Copy the selected exact call tree. Sampling results are labelled separately."
         };
         _copyButton.Pressed += CopySelectedCalls;
         toolbar.AddChild(_copyButton);
+        _exportButton = new Button { Text = "Export", Disabled = true,
+            TooltipText = "Export source-separated profiler results." };
+        toolbar.AddChild(_exportButton);
 
         toolbar.AddChild(new VSeparator());
         toolbar.AddChild(new Label { Text = "Frame:" });
@@ -125,8 +168,10 @@ public partial class CsProfilerPanel : VBoxContainer
         var spacer = new Control { SizeFlagsHorizontal = SizeFlags.ExpandFill };
         toolbar.AddChild(spacer);
 
-        _statsLabel = new Label { Text = "No data. Press Start while the game is running." };
-        toolbar.AddChild(_statsLabel);
+        _settingsLabel = new Label { Text = "Sampling settings" };
+        AddChild(_settingsLabel);
+        _qualityLabel = new Label { Text = "Complete capture · no observations" };
+        AddChild(_qualityLabel);
 
         _graph = new CsProfilerFrameGraph();
         _graph.FrameClicked += index =>
@@ -145,8 +190,8 @@ public partial class CsProfilerPanel : VBoxContainer
             SelectMode = Tree.SelectModeEnum.Row
         };
         _tree.SetColumnTitle(0, "Name");
-        _tree.SetColumnTitle(1, "Total");
-        _tree.SetColumnTitle(2, "Self");
+        _tree.SetColumnTitle(1, "Wall time");
+        _tree.SetColumnTitle(2, "Self wall time");
         _tree.SetColumnTitle(3, "Calls");
         _tree.SetColumnExpand(0, true);
         for (var column = 1; column < 4; column++)
@@ -164,6 +209,49 @@ public partial class CsProfilerPanel : VBoxContainer
             TryRequestDiscovery(NowSec());
     }
 
+    private static Button ModeButton(string text, Action pressed)
+    {
+        var button = new Button { Text = text, ToggleMode = true };
+        button.Pressed += pressed;
+        return button;
+    }
+
+    public void Render(ProfilerDockViewState state)
+    {
+        if (_targetLabel == null)
+            return;
+        _targetLabel.Text = state.Target;
+        _statsLabel.Text = state.Status;
+        ApplyMode(_samplingModeButton, state.ModeSegments.ElementAtOrDefault(0));
+        ApplyMode(_automaticModeButton, state.ModeSegments.ElementAtOrDefault(1));
+        ApplyMode(_manualModeButton, state.ModeSegments.ElementAtOrDefault(2));
+        ApplyMode(_includeManualButton, state.ManualOverlay);
+        _startButton.Disabled = !state.Commands.Start;
+        _stopButton.Disabled = !state.Commands.Stop;
+        _copyButton.Disabled = !state.Commands.Copy;
+        _exportButton.Disabled = !state.Commands.Export;
+        _settingsLabel.Text = string.IsNullOrEmpty(state.InstallerStatus)
+            ? state.SettingsStatus
+            : state.SettingsStatus + " | " + state.InstallerStatus;
+        _qualityLabel.Text = state.QualityBanner;
+    }
+
+    private static void ApplyMode(BaseButton button, ToggleViewState state)
+    {
+        if (button == null || state == null) return;
+        button.SetPressedNoSignal(state.Selected);
+        button.Disabled = !state.Enabled;
+        button.TooltipText = state.Tooltip;
+    }
+
+    public void Send(ProfilerCommand command, ModeConfiguration configuration)
+    {
+        var start = command == ProfilerCommand.Start;
+        _liveFollow = start;
+        _lastStartSentAtSec = NowSec();
+        ProfilingToggled?.Invoke(start);
+    }
+
     public void InitializeSessionState(bool active)
     {
         _sessionActive = active;
@@ -171,19 +259,6 @@ public partial class CsProfilerPanel : VBoxContainer
             _discovery.OnSessionStarted();
         else
             _discovery.OnSessionStopped();
-    }
-
-    private void OnStartToggled(bool pressed)
-    {
-        _liveFollow = pressed;
-        _lastStartSentAtSec = NowSec();
-        if (pressed)
-        {
-            _statsLabel.Text = SessionActive
-                ? RuntimeStatus("Capturing... waiting for frames.")
-                : "Waiting for a debug session — capture starts when the game launches.";
-        }
-        ProfilingToggled?.Invoke(pressed);
     }
 
     public void OnSessionStarted()
@@ -200,18 +275,27 @@ public partial class CsProfilerPanel : VBoxContainer
 
     public void OnSessionStopped()
     {
-        // Keep the captured history around for post-mortem scrubbing; the Start toggle keeps its
-        // state so relaunching the game resumes capturing.
+        // Keep completed history around for post-mortem scrubbing; disconnect never clears data.
         _sessionActive = false;
         if (!_discovery.OnSessionStopped())
             return;
         _runtimeDescription = "";
+        _controller?.Disconnected("Target disconnected — completed result preserved.");
     }
+
+    internal void ReportDebuggerPayloadError(string status) =>
+        _controller?.ReportStatus(status);
 
     internal void OnBridgeReady(CsProfilerRuntimeIdentity identity)
     {
         _sessionActive = true;
         var runtimeChanged = _discovery.AcceptReady(identity);
+        var snapshot = new CaptureSnapshot(
+            identity.Capturing ? CaptureState.Capturing : CaptureState.Ready,
+            identity.RuntimeToken, 0, 0, null, null, CaptureModes.ManualScopes,
+            CaptureSource.ManualSpans, CaptureCompleteness.InProgress, PartialReason.None,
+            QualityCounters.Zero, CaptureModes.ManualScopes, false, 0, 4096);
+        _controller?.UpdateSnapshot(snapshot, FormatRuntimeDescription(identity));
         if (runtimeChanged && _frames.Count > 0)
             ClearHistory();
         ApplyBridgeReadyUi(identity);
@@ -220,11 +304,10 @@ public partial class CsProfilerPanel : VBoxContainer
     private void ApplyBridgeReadyUi(CsProfilerRuntimeIdentity identity)
     {
         _runtimeDescription = FormatRuntimeDescription(identity);
-        if (identity.Capturing && _startButton != null && !_startButton.ButtonPressed)
+        if (identity.Capturing && !_profilingRequested)
         {
-            // A managed editor-plugin reload replaces the panel but need not stop the runtime
-            // capture. Reflect its scalar ready state without emitting a duplicate UI toggle.
-            _startButton.SetPressedNoSignal(true);
+            // A managed editor-plugin reload replaces the panel but need not stop runtime capture.
+            _profilingRequested = true;
             _liveFollow = true;
         }
         if (_frames.Count == 0 && _statsLabel != null)

@@ -1,5 +1,6 @@
 #if TOOLS
 using Apeworks.GodotCSharpProfiler;
+using Apeworks.GodotCSharpProfiler.Editor.Integration;
 using Godot;
 using System;
 using System.Collections.Generic;
@@ -148,17 +149,27 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
     public override bool _Capture(string message, Godot.Collections.Array data, int sessionId)
     {
         _sessionIds.Add(sessionId);
+        if (string.IsNullOrWhiteSpace(message) || message.Length > 128 || message.Any(char.IsControl))
+        {
+            _panel?.ReportDebuggerPayloadError("Profiler payload rejected: invalid message name.");
+            return true;
+        }
         switch (message)
         {
             case "cs_profiler:ready":
             {
-                var identity = CsProfilerRuntimeIdentity.FromWire(data);
+                if (!CsProfilerRuntimeIdentity.TryFromWire(data, out var identity))
+                {
+                    _panel?.ReportDebuggerPayloadError(
+                        "Profiler payload rejected: malformed ready message.");
+                    return true; // Known capture, rejected closed without changing routing.
+                }
                 ApplyRouteChange(_router.AcceptReady(sessionId, identity, IsSessionActive));
                 return true;
             }
             case "cs_profiler:frame":
                 if (_router.SelectedSessionId == sessionId)
-                    _panel.IngestFrame(data);
+                    _panel?.IngestFrame(data);
                 return true;
             default:
                 return false;

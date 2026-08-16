@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.0.0" PrivateAssets="all" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="../../addons/godot_csharp_profiler/Editor/Integration/**/*.cs" Link="Editor/Integration/%(RecursiveDir)%(Filename)%(Extension)" />
+    <Compile Include="../../addons/godot_csharp_profiler/Editor/Modes/**/*.cs" Link="Editor/Modes/%(RecursiveDir)%(Filename)%(Extension)" />
+    <Compile Include="../../addons/godot_csharp_profiler/Editor/Installation/**/*.cs" Link="Editor/Installation/%(RecursiveDir)%(Filename)%(Extension)" />
+    <Compile Include="../../addons/godot_csharp_profiler/Runtime/Protocol/ProtocolModel.cs" Link="Runtime/Protocol/ProtocolModel.cs" />
+    <Compile Include="../../addons/godot_csharp_profiler/Runtime/Protocol/CaptureStateMachine.cs" Link="Runtime/Protocol/CaptureStateMachine.cs" />
+  </ItemGroup>
+</Project>
