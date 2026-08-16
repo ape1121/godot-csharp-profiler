@@ -1,0 +1,95 @@
+{
+  "schemaVersion": 1,
+  "recordedUtc": "2026-08-16T00:00:00Z",
+  "targetFramework": "net8.0",
+  "dependency": {
+    "name": "Lib.Harmony",
+    "version": "2.3.6"
+  },
+  "decision": {
+    "status": "conditionally-feasible",
+    "summary": "Filtered automatic Harmony instrumentation is feasible for an explicit, bounded set of managed non-open-generic methods, with exact call accounting and inclusive timing. It is not suitable for hard-reload/collectible contexts in this version and has high per-call overhead.",
+    "productionRecommendation": "prototype-only-until-overhead-and-reload-constraints-are-accepted"
+  },
+  "scopeControls": {
+    "broadPatchAllUsed": false,
+    "discovery": "explicit SelectedTypes only",
+    "defaultMaxMethods": 128,
+    "defaultMaxNameLength": 160,
+    "defaultSkips": [
+      "compiler-generated",
+      "property/event accessors",
+      "constructors",
+      "trivial IL",
+      "profiler namespaces",
+      "abstract methods",
+      "native/extern methods",
+      "open generic methods"
+    ],
+    "ownerScopedHarmonyIds": true,
+    "ownerScopedUnpatchAll": true
+  },
+  "correctnessEvidence": {
+    "testCommand": "/tmp/dotnet8-harmony-proof/dotnet test tests/GodotCSharpProfiler.Harmony.Tests/GodotCSharpProfiler.Harmony.Tests.csproj --configuration Release --logger console;verbosity=normal",
+    "testsPassed": 10,
+    "testsFailed": 0,
+    "covered": [
+      "ordinary",
+      "overloaded",
+      "generic-classified-and-open-generic-skipped",
+      "recursive-exact-calls",
+      "throwing-exception-safe-finalizer",
+      "async-state-machine-MoveNext-opt-in",
+      "iterator-state-machine-MoveNext-opt-in",
+      "property-accessors-default-skip-and-opt-in",
+      "constructor-default-skip-and-opt-in",
+      "aggressive-inline-classification-and-observed-call",
+      "abstract-skip",
+      "native-extern-skip",
+      "repeated-patch-unpatch",
+      "owner-isolation"
+    ]
+  },
+  "metrics": {
+    "environment": {
+      "runtime": ".NET 8.0.30",
+      "sdk": "8.0.424",
+      "configuration": "Release",
+      "iterations": 250000,
+      "note": "Single-process Stopwatch micro-measurement; indicative, not BenchmarkDotNet-grade."
+    },
+    "patchStartupMilliseconds": 11.5246,
+    "patchedMethodCount": 8,
+    "baselineNanosecondsPerCall": 3.087,
+    "disabledNanosecondsPerCall": 169.422,
+    "enabledNanosecondsPerCall": 192.703,
+    "disabledOverheadNanosecondsPerCall": 166.336,
+    "enabledOverheadNanosecondsPerCall": 189.616
+  },
+  "limitations": [
+    {
+      "id": "collectible-alc-rooted",
+      "severity": "blocking-for-hard-reload",
+      "evidence": "A collectible AssemblyLoadContext remained alive after explicit owner UnpatchAll, counter-key removal, context.Unload, 20 forced GC/finalizer cycles, and 25 ms between cycles.",
+      "implication": "Do not use this Lib.Harmony 2.3.6 design where collectible assembly unload or Godot hard reload is required. Process/domain restart is the reliable cleanup boundary."
+    },
+    {
+      "id": "open-generics",
+      "severity": "unsupported",
+      "evidence": "Harmony patching an open generic definition threw NotSupportedException from MonoMod MMReflectionImporter.ImportGenericParameter on .NET 8.",
+      "implication": "Preview classifies open generics as skipped; explicit closed instantiation support would require a separate design."
+    },
+    {
+      "id": "inlining",
+      "severity": "runtime-sensitive",
+      "evidence": "AggressiveInlining methods can be patched and observed in this test, but callers compiled before patching or tiered-JIT decisions can bypass detours.",
+      "implication": "Inlining coverage cannot be guaranteed for arbitrary production methods."
+    },
+    {
+      "id": "overhead",
+      "severity": "high",
+      "evidence": "Measured disabled overhead 166.336 ns/call and enabled overhead 189.616 ns/call in the recorded run.",
+      "implication": "Keep selection narrow and avoid hot trivial methods."
+    }
+  ]
+}
