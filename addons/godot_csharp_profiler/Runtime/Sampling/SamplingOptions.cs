@@ -9,6 +9,13 @@ public sealed class SamplingOptions
     public int MaxUniqueStacks { get; init; } = 8_192;
     public int MaxStackDepth { get; init; } = 128;
     public int MaxLabelLength { get; init; } = 256;
+
+    /// <summary>
+    /// Maximum lifetime of one in-memory TraceLog epoch. The EventPipe session is renewed at this
+    /// interval so TraceEvent cannot retain an unbounded full-session index.
+    /// </summary>
+    public TimeSpan TraceRetentionDuration { get; init; } = TimeSpan.FromSeconds(30);
+
     public int CircularBufferSizeMegabytes { get; init; } = 32;
     public IReadOnlyList<string> IncludeAssemblyPrefixes { get; init; } = Array.Empty<string>();
     public IReadOnlyList<string> ExcludeAssemblyPrefixes { get; init; } = Array.Empty<string>();
@@ -25,6 +32,13 @@ public sealed class SamplingOptions
             throw new ArgumentOutOfRangeException(nameof(MaxLabelLength));
         if (CircularBufferSizeMegabytes <= 0)
             throw new ArgumentOutOfRangeException(nameof(CircularBufferSizeMegabytes));
+        if (TraceRetentionDuration < TimeSpan.FromSeconds(1) ||
+            TraceRetentionDuration > TimeSpan.FromMinutes(10))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(TraceRetentionDuration),
+                "Trace retention must be between one second and ten minutes.");
+        }
 
         return new SamplingOptions
         {
@@ -33,6 +47,7 @@ public sealed class SamplingOptions
             MaxStackDepth = MaxStackDepth,
             MaxLabelLength = MaxLabelLength,
             CircularBufferSizeMegabytes = CircularBufferSizeMegabytes,
+            TraceRetentionDuration = TraceRetentionDuration,
             IncludeAssemblyPrefixes = CopyPrefixes(IncludeAssemblyPrefixes, nameof(IncludeAssemblyPrefixes)),
             ExcludeAssemblyPrefixes = CopyPrefixes(ExcludeAssemblyPrefixes, nameof(ExcludeAssemblyPrefixes))
         };

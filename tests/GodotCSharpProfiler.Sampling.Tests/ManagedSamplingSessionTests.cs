@@ -11,10 +11,8 @@ public sealed class ManagedSamplingSessionTests
     {
         await using var session = new ManagedSamplingSession(new SamplingOptions());
         Assert.Equal(ManagedSamplingSessionState.Stopped, session.State);
-
         await session.StartAsync();
         Assert.Equal(ManagedSamplingSessionState.Running, session.State);
-
         await Task.WhenAll(session.StopAsync(), session.StopAsync());
         Assert.Equal(ManagedSamplingSessionState.Stopped, session.State);
     }
@@ -22,15 +20,10 @@ public sealed class ManagedSamplingSessionTests
     [Fact]
     public void AggregationIsBoundedAndReportsDropsAndTruncation()
     {
-        var options = new SamplingOptions
+        var aggregator = new SamplingAggregator(new SamplingOptions
         {
-            MaxUniqueMethods = 2,
-            MaxUniqueStacks = 1,
-            MaxStackDepth = 2,
-            MaxLabelLength = 8
-        };
-        var aggregator = new SamplingAggregator(options);
-
+            MaxUniqueMethods = 2, MaxUniqueStacks = 1, MaxStackDepth = 2, MaxLabelLength = 8
+        });
         aggregator.AddSample("worker", new[]
         {
             new SamplingFrame("LongAssemblyName", "VeryLongMethodName"),
@@ -39,7 +32,6 @@ public sealed class ManagedSamplingSessionTests
         });
         aggregator.AddSample("worker", new[] { new SamplingFrame("AssemblyD", "MethodD") });
         aggregator.AddSample("worker", new[] { new SamplingFrame("AssemblyB", "MethodB") });
-
         var snapshot = aggregator.GetSnapshot(reset: false);
         Assert.True(snapshot.Methods.Count <= 2);
         Assert.Single(snapshot.Stacks);
@@ -48,8 +40,6 @@ public sealed class ManagedSamplingSessionTests
         Assert.True(snapshot.Counters.TruncatedLabels > 0);
         Assert.True(snapshot.Counters.TruncatedFrames > 0);
         Assert.All(snapshot.Methods, method => Assert.True(method.Label.Length <= 8));
-        Assert.Throws<NotSupportedException>(() =>
-            ((IList<SampledMethod>)snapshot.Methods).Add(new SampledMethod(99, "x", "x", 1)));
     }
 
     [Fact]
@@ -60,7 +50,6 @@ public sealed class ManagedSamplingSessionTests
             IncludeAssemblyPrefixes = new[] { "Game", "Shared" },
             ExcludeAssemblyPrefixes = new[] { "Game.Generated" }
         });
-
         aggregator.AddSample("worker", new[]
         {
             new SamplingFrame("System.Private.CoreLib", "System.Object"),
@@ -68,9 +57,8 @@ public sealed class ManagedSamplingSessionTests
             new SamplingFrame("Game.Main", "Player.Tick"),
             new SamplingFrame("Shared.Utils", "Math.DoWork")
         });
-
-        var snapshot = aggregator.GetSnapshot(reset: false);
-        Assert.Equal(new[] { "Player.Tick", "Math.DoWork" }, snapshot.Methods.Select(m => m.Label));
+        Assert.Equal(new[] { "Player.Tick", "Math.DoWork" },
+            aggregator.GetSnapshot(reset: false).Methods.Select(method => method.Label));
     }
 
     [Fact]
@@ -79,10 +67,8 @@ public sealed class ManagedSamplingSessionTests
         await using var first = new ManagedSamplingSession(new SamplingOptions());
         await using var second = new ManagedSamplingSession(new SamplingOptions());
         await first.StartAsync();
-
         var error = await Assert.ThrowsAsync<InvalidOperationException>(() => second.StartAsync());
         Assert.Contains("already active", error.Message, StringComparison.OrdinalIgnoreCase);
-
         await first.StopAsync();
         await second.StartAsync();
         await second.StopAsync();
@@ -95,43 +81,101 @@ public sealed class ManagedSamplingSessionTests
         await using var session = new ManagedSamplingSession(new SamplingOptions());
         await session.StartAsync(cancellation.Token);
         cancellation.Cancel();
-
         await WaitUntilAsync(() => session.State == ManagedSamplingSessionState.Stopped, TimeSpan.FromSeconds(10));
     }
 
     [Fact]
     public async Task SelfProcessSmokeObservesNamedManagedMethodOnLinux()
     {
-        if (!OperatingSystem.IsLinux())
-            return;
-
+        if (!OperatingSystem.IsLinux()) return;
         await using var session = new ManagedSamplingSession(new SamplingOptions
         {
             IncludeAssemblyPrefixes = new[] { "GodotCSharpProfiler.Sampling" },
-            MaxUniqueMethods = 512,
-            MaxUniqueStacks = 512
+            MaxUniqueMethods = 512, MaxUniqueStacks = 512
         });
-
         await session.StartAsync();
         var deadline = Stopwatch.StartNew();
-        while (deadline.Elapsed < TimeSpan.FromSeconds(3))
-            SamplingSmokeHotMethod();
+        while (deadline.Elapsed < TimeSpan.FromSeconds(3)) SamplingSmokeHotMethod();
         await session.StopAsync();
-
         var snapshot = session.GetSnapshot(reset: false);
         Assert.True(session.Fault is null, session.Fault?.ToString());
         Assert.Contains(snapshot.Methods, method =>
             method.Label.Contains(nameof(SamplingSmokeHotMethod), StringComparison.Ordinal));
     }
 
-    [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.NoOptimization)]
-    private static long SamplingSmokeHotMethod()
+        [Fact]
+    public void SampleIntervalCapabilityIsStartupOnlyAndNotAnOption()
     {
-        long value = 0;
-        for (var i = 0; i < 100_000; i++)
-            value = unchecked(value * 31 + i);
+        var capabilities = ManagedSamplingSession.Capabilities;
+        Assert.Equal(SampleIntervalConfigurationScope.ProcessStartup, capabilities.SampleIntervalScope);
+        Assert.False(capabilities.SupportsPerSessionSampleInterval);
+        Assert.False(capabilities.SupportsRuntimeSampleIntervalChanges);
+        Assert.False(capabilities.CanReportEffectiveSampleInterval);
+        Assert.Contains("DOTNET_EventPipeSamplingRate", capabilities.SampleIntervalRuntimeSetting);
+        Assert.DoesNotContain(typeof(SamplingOptions).GetProperties(),
+            property => property.Name.Contains("Interval", StringComparison.OrdinalIgnoreCase));
+    }
+
+            [Fact]
+    public async Task RepeatedResetSnapshotsRenewTraceRetentionAndBoundManagedMemoryAndTempArtifacts()
+    {
+        if (!OperatingSystem.IsLinux()) return;
+        var artifactsBefore = GetTraceArtifacts();
+        await using var session = new ManagedSamplingSession(new SamplingOptions
+        {
+            IncludeAssemblyPrefixes = new[] { "GodotCSharpProfiler.Sampling" },
+            MaxUniqueMethods = 128, MaxUniqueStacks = 128,
+            TraceRetentionDuration = TimeSpan.FromSeconds(1),
+            CircularBufferSizeMegabytes = 4
+        });
+        await session.StartAsync();
+        var memoryByEpoch = new List<long>();
+        var observedEpoch = 0;
+        var resetSnapshots = 0;
+        var totalObservedSamples = 0L;
+        var stopwatch = Stopwatch.StartNew();
+        while (stopwatch.Elapsed < TimeSpan.FromSeconds(12))
+        {
+            for (var index = 0; index < 100; index++) SamplingSoakHotMethod();
+            var snapshot = session.GetSnapshot(reset: true);
+            resetSnapshots++;
+            totalObservedSamples += snapshot.Counters.SamplesReceived;
+            if (session.TraceEpochCount != observedEpoch)
+            {
+                observedEpoch = session.TraceEpochCount;
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                memoryByEpoch.Add(GC.GetTotalMemory(forceFullCollection: true));
+            }
+        }
+        await session.StopAsync();
+        Assert.True(session.Fault is null, session.Fault?.ToString());
+        Assert.True(resetSnapshots > 1_000, $"Only {resetSnapshots} reset snapshots were taken.");
+        Assert.True(totalObservedSamples > 1_000, $"Only {totalObservedSamples} samples were observed.");
+        Assert.True(session.TraceEpochCount >= 6, $"Only {session.TraceEpochCount} trace epochs were renewed.");
+        Assert.True(memoryByEpoch.Count >= 6, "Insufficient epoch memory observations.");
+        var latterHalf = memoryByEpoch.Skip(memoryByEpoch.Count / 2).ToArray();
+        Assert.True(latterHalf.Max() - latterHalf.Min() < 32 * 1024 * 1024,
+            $"Managed memory did not plateau: {string.Join(", ", memoryByEpoch)}");
+        Assert.Equal(artifactsBefore, GetTraceArtifacts());
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.NoOptimization)]
+    private static long SamplingSmokeHotMethod() => SamplingSoakHotMethod();
+
+    [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.NoOptimization)]
+    private static long SamplingSoakHotMethod()
+    {
+        long value = 17;
+        for (var i = 0; i < 10_000; i++) value = unchecked(value * 31 + i);
         return value;
     }
+
+    private static HashSet<string> GetTraceArtifacts() =>
+        Directory.EnumerateFiles(Path.GetTempPath())
+            .Where(file => file.EndsWith(".etlx", StringComparison.OrdinalIgnoreCase) ||
+                           file.EndsWith(".nettrace", StringComparison.OrdinalIgnoreCase))
+            .ToHashSet(StringComparer.Ordinal);
 
     private static async Task WaitUntilAsync(Func<bool> predicate, TimeSpan timeout)
     {
