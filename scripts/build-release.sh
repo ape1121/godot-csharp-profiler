@@ -16,7 +16,12 @@ p = addon/'Editor/Installation/ProjectInstaller.cs'; p.write_text(p.read_text().
 p = addon/'assets/dependencies.json'; data=json.loads(p.read_text()); data['bootstrapPackage']['version']=version; data['automatic']['packages']['GodotCSharpProfiler.Fody']=version; p.write_text(json.dumps(data, indent=2)+'\n')
 p = addon/'assets/setup.ps1'; p.write_text(p.read_text().replace("@('GodotCSharpProfiler.Fody','0.1.0-dev')", f"@('GodotCSharpProfiler.Fody','{version}')"))
 PY
-dotnet pack "$repo/src/GodotCSharpProfiler.Fody/GodotCSharpProfiler.Fody.csproj" -c Release -p:Version="$version" -o "$addon/assets/nuget"
+pack_targets="$stage/GodotCSharpProfiler.PackageReadme.targets"
+cat > "$pack_targets" <<EOF
+<Project><PropertyGroup><PackageReadmeFile>README.md</PackageReadmeFile></PropertyGroup><ItemGroup><None Include="$addon/README.md" Pack="true" PackagePath="/" /></ItemGroup></Project>
+EOF
+dotnet pack "$repo/src/GodotCSharpProfiler.Fody/GodotCSharpProfiler.Fody.csproj" -c Release -p:Version="$version" -p:NoWarn=NU5100%3BNU5128 -p:DirectoryBuildTargetsPath="$pack_targets" -o "$addon/assets/nuget"
+rm "$pack_targets"
 python3 - "$addon/assets/nuget/GodotCSharpProfiler.Fody.$version.nupkg" <<'PY'
 from pathlib import Path
 import sys, zipfile
@@ -41,7 +46,7 @@ python3 - "$stage" "$out" "$version" <<'PY'
 from pathlib import Path
 import hashlib, json, re, sys, zipfile
 stage,out,version=map(Path,sys.argv[1:]); out.mkdir(parents=True,exist_ok=True)
-root=stage/'addons/godot_csharp_profiler'; required=['plugin.cfg','README.md','LICENSE','icon.svg','Runtime/CsProfiler.cs','Editor/CsProfilerPlugin.cs','assets/setup.ps1','assets/dependencies.json']
+root=stage/'addons/godot_csharp_profiler'; required=['plugin.cfg','README.md','LICENSE','icon.svg','Compatibility/GlobalUsings.cs','Runtime/CsProfiler.cs','Editor/CsProfilerPlugin.cs','assets/setup.ps1','assets/dependencies.json','assets/GodotCSharpProfiler.Dependencies.props']
 for rel in required:
     if not (root/rel).is_file(): raise SystemExit(f'missing required file: {rel}')
 for p in stage.rglob('*'):

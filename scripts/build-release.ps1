@@ -23,7 +23,11 @@ $installer = Join-Path $addon 'Editor/Installation/ProjectInstaller.cs'
 $installerText = [IO.File]::ReadAllText($installer) -replace 'ProfilerFodyVersion = "0.1.0-dev"', "ProfilerFodyVersion = `"$Version`""
 [IO.File]::WriteAllText($installer, $installerText, [Text.UTF8Encoding]::new($false))
 $feed = Join-Path $addon 'assets/nuget'; New-Item -ItemType Directory -Force $feed | Out-Null
-& dotnet pack (Join-Path $repo 'src/GodotCSharpProfiler.Fody/GodotCSharpProfiler.Fody.csproj') -c Release -p:Version=$Version -o $feed
+$packTargets = Join-Path $stage 'GodotCSharpProfiler.PackageReadme.targets'
+$readmePath = (Join-Path $addon 'README.md').Replace('&','&amp;').Replace('"','&quot;')
+[IO.File]::WriteAllText($packTargets, "<Project><PropertyGroup><PackageReadmeFile>README.md</PackageReadmeFile></PropertyGroup><ItemGroup><None Include=`"$readmePath`" Pack=`"true`" PackagePath=`"/`" /></ItemGroup></Project>", [Text.UTF8Encoding]::new($false))
+& dotnet pack (Join-Path $repo 'src/GodotCSharpProfiler.Fody/GodotCSharpProfiler.Fody.csproj') -c Release -p:Version=$Version -p:NoWarn=NU5100%3BNU5128 -p:DirectoryBuildTargetsPath=$packTargets -o $feed
+Remove-Item $packTargets
 if ($LASTEXITCODE) { throw 'Fody package build failed.' }
 $nupkg = Join-Path $feed "GodotCSharpProfiler.Fody.$Version.nupkg"; $packageEntries = @()
 $inputPackage = [IO.Compression.ZipFile]::OpenRead($nupkg)
@@ -33,8 +37,10 @@ try {
     foreach ($item in $inputPackage.Entries) {
         $memory=[IO.MemoryStream]::new(); $source=$item.Open(); try {$source.CopyTo($memory)} finally {$source.Dispose()}; $bytes=$memory.ToArray(); $memory.Dispose()
         if ($item.FullName -eq '_rels/.rels') { $text=[Text.Encoding]::UTF8.GetString($bytes).Replace($oldCore,$fixedCore); $text=[Text.RegularExpressions.Regex]::Replace($text,'(Type="http://schemas.microsoft.com/packaging/2010/07/manifest"[^>]*Id=")[^"]+"','$1RMANIFEST"'); $text=[Text.RegularExpressions.Regex]::Replace($text,'(Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties"[^>]*Id=")[^"]+"','$1RMETADATA"'); $bytes=[Text.Encoding]::UTF8.GetBytes($text) }
+        # PackageReadmeFile and README.md were supplied to dotnet pack above.
         $packageEntries += [pscustomobject]@{Name=$(if($item.FullName -eq $oldCore){$fixedCore}else{$item.FullName});Bytes=$bytes}
     }
+    # Preserve the package's already-declared README entry.
 } finally {$inputPackage.Dispose()}
 Remove-Item $nupkg; $packageStream=[IO.File]::Open($nupkg,[IO.FileMode]::CreateNew)
 try {$packageArchive=[IO.Compression.ZipArchive]::new($packageStream,[IO.Compression.ZipArchiveMode]::Create,$false); try {foreach($item in $packageEntries|Sort-Object Name){$entry=$packageArchive.CreateEntry($item.Name,[IO.Compression.CompressionLevel]::Optimal);$entry.LastWriteTime=[DateTimeOffset]::new(2000,1,1,0,0,0,[TimeSpan]::Zero);$target=$entry.Open();try{$target.Write($item.Bytes)}finally{$target.Dispose()}}}finally{$packageArchive.Dispose()}}finally{$packageStream.Dispose()}
@@ -42,9 +48,7 @@ if ($LASTEXITCODE) { throw 'Fody package build failed.' }
 # Keep installer/source manifest versions exact for this archive without changing development sources.
 $manifest = Join-Path $addon 'assets/dependencies.json'; $m = [IO.File]::ReadAllText($manifest) -replace '"version": "0.1.0-dev"', "`"version`": `"$Version`"" -replace '"GodotCSharpProfiler.Fody": "0.1.0-dev"', "`"GodotCSharpProfiler.Fody`": `"$Version`""
 [IO.File]::WriteAllText($manifest, $m, [Text.UTF8Encoding]::new($false))
-$setup = Join-Path $addon 'assets/setup.ps1'; $s = [IO.File]::ReadAllText($setup) -replace "@\('GodotCSharpProfiler.Fody','0.1.0-dev'\)", "@('GodotCSharpProfiler.Fody','$Version')"
-[IO.File]::WriteAllText($setup, $s, [Text.UTF8Encoding]::new($false))
-$required = @('plugin.cfg','README.md','LICENSE','icon.svg','Runtime/CsProfiler.cs','Editor/CsProfilerPlugin.cs','assets/setup.ps1','assets/dependencies.json')
+$required = @('plugin.cfg','README.md','LICENSE','icon.svg','Compatibility/GlobalUsings.cs','Runtime/CsProfiler.cs','Editor/CsProfilerPlugin.cs','assets/setup.ps1','assets/dependencies.json','assets/GodotCSharpProfiler.Dependencies.props')
 foreach ($file in $required) { if (-not (Test-Path (Join-Path $addon $file))) { throw "Required archive file missing: $file" } }
 $forbidden = Get-ChildItem -Recurse -Force $stage | Where-Object { $_.Name -in @('bin','obj','.godot','spikes','tests') -or $_.FullName -match '[\\/](docs|src|\.git|TestResults)[\\/]' }
 if ($forbidden) { throw "Forbidden archive content: $($forbidden.FullName -join ', ')" }
