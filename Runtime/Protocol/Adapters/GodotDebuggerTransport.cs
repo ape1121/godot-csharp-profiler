@@ -28,13 +28,17 @@ internal sealed class GodotDebuggerTransport(string messageName) : IRuntimeCaptu
             case Variant.Type.Bool: result = value.AsBool(); return true;
             case Variant.Type.Array:
             {
-                var source = value.AsGodotArray(); var array = new object?[source.Count];
+                var source = value.AsGodotArray();
+                if (source.Count > ProtocolLimits.MaxMethodsPerBatch * 3 + 64) return false;
+                var array = new object?[source.Count];
                 for (var index = 0; index < array.Length; index++) if (!TryRead(source[index], depth + 1, out array[index])) return false;
                 result = array; return true;
             }
             case Variant.Type.Dictionary:
             {
-                var source = value.AsGodotDictionary(); var map = new Dictionary<string, object?>(StringComparer.Ordinal);
+                var source = value.AsGodotDictionary();
+                if (source.Count > 64) return false;
+                var map = new Dictionary<string, object?>(StringComparer.Ordinal);
                 foreach (var key in source.Keys)
                     if (key.VariantType != Variant.Type.String || !TryRead(source[key], depth + 1, out var child) || !map.TryAdd(key.AsString(), child)) return false;
                 result = map; return true;
@@ -42,6 +46,8 @@ internal sealed class GodotDebuggerTransport(string messageName) : IRuntimeCaptu
             default: return false;
         }
     }
+
+    internal static Variant ToGodotVariant(WireValue value) => ToVariant(value);
 
     private static Variant ToVariant(WireValue value) => value switch
     {
