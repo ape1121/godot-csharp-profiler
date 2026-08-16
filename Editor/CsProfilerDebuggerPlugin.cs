@@ -26,7 +26,12 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
 
     public void Initialize(CsProfilerPanel panel)
     {
-        _panel = panel ?? throw new ArgumentNullException(nameof(panel));
+        ArgumentNullException.ThrowIfNull(panel);
+        if (ReferenceEquals(_panel, panel))
+            return;
+        if (_panel != null)
+            Teardown();
+        _panel = panel;
         _panel.SessionActiveQuery = AnySessionActive;
         _panel.ProfilingToggled += SendControlMessage;
         _panel.DiscoveryRequested += SendDiscoveryMessages;

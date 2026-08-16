@@ -57,7 +57,7 @@ public sealed class DebuggerPayloadGate
         public void RenderStatus() => target.Render(new ProfilerDockViewState(
             "Unknown target", status, Array.Empty<ToggleViewState>(),
             new ToggleViewState("Include Manual", false, false, ""),
-            new CommandViewState(false, false, false, false, false), "", "", "", false,
+            new CommandViewState(false, false, false, false, false), "", "", "", "", false,
             Array.Empty<ResultGroupViewState>()));
     }
 }
