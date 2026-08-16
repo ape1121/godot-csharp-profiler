@@ -57,7 +57,7 @@ public sealed class EditorIntegrationTests
         var pending = new PendingCaptureRequest();
 
         pending.Request(ModeConfiguration.Default);
-        Assert.False(pending.TryStart(endpoint));
+        Assert.Equal(PendingStartOutcome.Waiting, pending.TryStart(endpoint));
         Assert.Empty(sent);
 
         Assert.True(endpoint.Receive(StrictWireAdapter.Serialize(new HelloMessage(
@@ -66,11 +66,75 @@ public sealed class EditorIntegrationTests
             ProtocolVersion.Major, ProtocolVersion.Minor, "runtime", 0,
             CaptureModes.Sampling | CaptureModes.ManualScopes, true, 2_000_000, 4096, 4096, 8))));
 
-        Assert.True(pending.TryStart(endpoint));
+        Assert.Equal(PendingStartOutcome.Started, pending.TryStart(endpoint));
         Assert.Equal(2, sent.Count);
         Assert.False(pending.HasRequest);
     }
+        [Fact]
+    public void ProductionControllerQueuesPreTargetStartAndStopCancelsThroughRealTransportPath()
+    {
+        var view = new FakeView();
+        var transport = new FakeTransport();
+        var controller = new ProfilerDockController(view, transport, null);
 
+        Assert.True(controller.RequestStart());
+        Assert.False(controller.RequestStart());
+        Assert.Equal("Waiting for target capabilities — capture will start automatically.", view.Last!.Status);
+        Assert.False(view.Last.Commands.Start);
+        Assert.True(view.Last.Commands.Stop);
+        Assert.True(view.Last.CapturePending);
+        Assert.Equal([ProfilerCommand.Start], transport.Commands);
+
+        Assert.True(controller.Stop());
+        Assert.Equal([ProfilerCommand.Start, ProfilerCommand.CancelPending], transport.Commands);
+        Assert.Equal("Pending capture cancelled.", view.Last.Status);
+        Assert.False(view.Last.CapturePending);
+    }
+
+        [Fact]
+    public void AcceptedBatchesPopulateBoundedSourceLabelledTimelineAndResultRows()
+    {
+        var sent = new Queue<WireMap>();
+        var editor = ReadyEditor(sent);
+        Assert.True(editor.Start(TestConfiguration));
+        sent.Clear();
+        Assert.True(editor.Receive(State(CaptureState.Capturing, 1, QualityCounters.Zero)));
+        Assert.True(editor.Receive(Batch(CaptureSource.Sampling, 2, [new(7, "Game.Tick", 4, 0)])));
+
+        var point = Assert.Single(editor.Timeline.Points);
+        Assert.Equal((CaptureSource.Sampling, 4L, 4L), (point.Source, point.Value, point.Observations));
+        var pointRow = Assert.Single(point.Rows);
+        Assert.Equal(("Game.Tick", 4L, 100.0, 0.0),
+            (pointRow.Name, pointRow.Samples, pointRow.EstimatedStackFrameShare, pointRow.ObservedWallTimeMilliseconds));
+        Assert.True(editor.Stop());
+        Assert.True(editor.Receive(State(CaptureState.Complete, 4, QualityCounters.Zero)));
+        var row = Assert.Single(editor.CompletedResults.Groups.Single().Rows);
+        Assert.Equal("Game.Tick", row.Name);
+        Assert.Equal(4, row.Samples);
+        Assert.Equal(100, row.EstimatedStackFrameShare);
+        Assert.Equal(0, row.ObservedWallTimeMilliseconds);
+    }
+
+    [Fact]
+    public void DuplicateNegotiationAndNewRuntimeTokenOnReusedSessionAreSafe()
+    {
+        var endpoint = new EditorCaptureCoordinator("owner", _ => { });
+        var hello = StrictWireAdapter.Serialize(new HelloMessage(ProtocolVersion.Major, ProtocolVersion.Minor, "one", "runtime", 4096));
+        var capabilities = StrictWireAdapter.Serialize(new CapabilitiesMessage(ProtocolVersion.Major, ProtocolVersion.Minor, "one", 0,
+            CaptureModes.Sampling, false, 2_000_000, 4096, 4096, 8));
+        Assert.True(endpoint.Receive(hello));
+        Assert.True(endpoint.Receive(capabilities));
+        Assert.True(endpoint.Receive(hello));
+        Assert.True(endpoint.Receive(capabilities));
+
+        Assert.True(endpoint.Receive(StrictWireAdapter.Serialize(new HelloMessage(
+            ProtocolVersion.Major, ProtocolVersion.Minor, "two", "runtime", 4096))));
+        Assert.Equal("two", endpoint.Snapshot.RuntimeToken);
+        Assert.Equal(CaptureModes.None, endpoint.Snapshot.SupportedModes);
+        Assert.True(endpoint.Receive(StrictWireAdapter.Serialize(new CapabilitiesMessage(
+            ProtocolVersion.Major, ProtocolVersion.Minor, "two", 0, CaptureModes.Sampling, false,
+            2_000_000, 4096, 4096, 8))));
+    }
     [Fact]
     public void Controller_projects_mode_aware_target_commands_settings_and_quality()
     {
@@ -146,7 +210,7 @@ public sealed class EditorIntegrationTests
         Assert.True(view.Last.Commands.Export);
         Assert.Equal(3, view.Last.ResultGroups.Count);
         Assert.Equal("Samples", view.Last.ResultGroups[0].Columns[1]);
-        Assert.Contains("Estimated CPU %", view.Last.ResultGroups[0].Columns);
+        Assert.Contains("Estimated stack-frame %", view.Last.ResultGroups[0].Columns);
         Assert.Contains("Calls", view.Last.ResultGroups[1].Columns);
         Assert.Contains("Wall time", view.Last.ResultGroups[1].Columns);
         Assert.DoesNotContain("Samples", view.Last.ResultGroups[1].Columns);

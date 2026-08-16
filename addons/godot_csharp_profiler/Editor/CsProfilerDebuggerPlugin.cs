@@ -60,6 +60,7 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
     public void Teardown()
     {
         if (_panel == null) return;
+        _pendingCapture.Cancel();
         StopSelectedOwner();
         _panel.ProfilingToggled -= SendControlMessage;
         _panel.DiscoveryRequested -= SendDiscoveryMessages;
@@ -100,7 +101,12 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
         ApplyRouteChange(_router.Reconcile(IsSessionActive));
         if (_router.SelectedSessionId < 0) { if (start) SendDiscoveryMessages(); return; }
         if (!_protocol.TryGetValue(_router.SelectedSessionId, out var endpoint)) return;
-        if (start) _pendingCapture.TryStart(endpoint);
+        if (start)
+        {
+            var outcome = _pendingCapture.TryStart(endpoint);
+            if (outcome == PendingStartOutcome.Rejected)
+                _panel?.ReportDebuggerPayloadError("Selected capture mode is not supported by this target.");
+        }
         else endpoint.Stop();
     }
 
@@ -153,8 +159,10 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
             return true;
         }
         var endpoint = Endpoint(sessionId);
-        endpoint.Receive(payload);
-        if (_router.SelectedSessionId == sessionId && _pendingCapture.HasRequest)
+        var accepted = endpoint.Receive(payload);
+        if (accepted && _router.SelectedSessionId == sessionId && _pendingCapture.HasRequest &&
+            _identities.TryGetValue(sessionId, out var selectedIdentity) &&
+            string.Equals(endpoint.Snapshot.RuntimeToken, selectedIdentity.RuntimeToken, StringComparison.Ordinal))
             Callable.From(() => _pendingCapture.TryStart(endpoint)).CallDeferred();
         return true;
     }
@@ -173,11 +181,15 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
         {
             if (_router.SelectedSessionId == sessionId) _panel?.ApplyProtocolResults(results);
         };
+        endpoint.TimelineChanged += timeline =>
+        {
+            if (_router.SelectedSessionId == sessionId) _panel?.ApplyProtocolTimeline(timeline);
+        };
         _protocol.Add(sessionId, endpoint);
         return endpoint;
     }
 
-    private void ApplyRouteChange(CsProfilerRouteChange change)
+        private void ApplyRouteChange(CsProfilerRouteChange change)
     {
         if (!change.Changed) return;
         if (change.PreviousSessionId >= 0 && change.PreviousSessionId != change.SelectedSessionId &&
@@ -189,7 +201,9 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
         if (_panel?.ProfilingRequested == true)
         {
             _pendingCapture.Request(_panel.ConfigurationForProtocol);
-            _pendingCapture.TryStart(Endpoint(change.SelectedSessionId));
+            if (_protocol.TryGetValue(change.SelectedSessionId, out endpoint) &&
+                string.Equals(endpoint.Snapshot.RuntimeToken, change.Identity.RuntimeToken, StringComparison.Ordinal))
+                _pendingCapture.TryStart(endpoint);
         }
     }
 }

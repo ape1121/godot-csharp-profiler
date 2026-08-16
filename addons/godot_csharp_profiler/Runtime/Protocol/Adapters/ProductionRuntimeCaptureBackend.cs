@@ -91,12 +91,22 @@ public sealed class ProductionRuntimeCaptureBackend : IRuntimeCaptureBackend
         }
     }
 
-    public IReadOnlyList<RuntimeSourceBatch> Drain()
+        public IReadOnlyList<RuntimeSourceBatch> Drain()
     {
         if (!IsActive) return Array.Empty<RuntimeSourceBatch>();
         var result = new List<RuntimeSourceBatch>(2);
-        if (_sampler is not null) result.Add(SamplingBatch(_sampler.Snapshot(reset: true)));
-        if (_manualLease?.IsActive == true) result.Add(ManualBatch(_manualLease.FlushFrame()));
+        if (_sampler is not null)
+        {
+            var sampling = SamplingBatch(_sampler.Snapshot(reset: true));
+            if (sampling.Methods.Count > 0 || sampling.Quality != QualityCounters.Zero)
+                result.Add(sampling);
+        }
+        if (_manualLease?.IsActive == true)
+        {
+            var manual = ManualBatch(_manualLease.FlushFrame());
+            if (manual.Methods.Count > 0 || manual.Quality != QualityCounters.Zero)
+                result.Add(manual);
+        }
         return result;
     }
 

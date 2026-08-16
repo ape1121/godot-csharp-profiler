@@ -141,7 +141,7 @@ public sealed class ModePresentationTests
     {
         var sampling = ModePresenter.ColumnsFor([CaptureSource.Sampling]);
         Assert.Contains(ResultColumn.Samples, sampling);
-        Assert.Contains(ResultColumn.EstimatedCpuPercentage, sampling);
+        Assert.Contains(ResultColumn.EstimatedStackFrameShare, sampling);
         Assert.DoesNotContain(ResultColumn.Calls, sampling);
         Assert.DoesNotContain(ResultColumn.AverageWallTime, sampling);
         Assert.DoesNotContain(ResultColumn.MaximumWallTime, sampling);
@@ -203,18 +203,23 @@ public sealed class ModePresentationTests
         Assert.Equal(123, input.CapabilityMaxMethods);
     }
 
-    [Theory]
-    [InlineData("", "Sampling include assemblies is required.")]
-    [InlineData("Game", "Sampling interval must be between 100000 and 1000000000 nanoseconds.")]
-    public void Hostile_or_invalid_sampling_config_disables_start_with_exact_reason(string includes, string expected)
+    [Fact]
+    public void Empty_sampling_include_means_all_managed_assemblies()
+    {
+        var vm = ModePresenter.Present(Input() with { Configuration = ModeConfiguration.Default });
+        Assert.True(vm.Commands.Start.Enabled);
+    }
+
+    [Fact]
+    public void Invalid_sampling_interval_disables_start_with_exact_reason()
     {
         var config = ModeConfiguration.Default with
         {
-            Sampling = new SamplingSettings(includes, "System", includes.Length == 0 ? 2_000_000 : -1)
+            Sampling = new SamplingSettings("Game", "System", -1)
         };
         var vm = ModePresenter.Present(Input() with { Configuration = config });
         Assert.False(vm.Commands.Start.Enabled);
-        Assert.Equal(expected, vm.Commands.Start.Reason);
+        Assert.Equal("Sampling interval must be between 100000 and 1000000000 nanoseconds.", vm.Commands.Start.Reason);
     }
 
     [Fact]

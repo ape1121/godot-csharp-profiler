@@ -49,7 +49,7 @@ public static class ModePresenter
         if (sources.Count != 1)
             return [ResultColumn.Name];
         return sources.Single() == CaptureSource.Sampling
-            ? [ResultColumn.Name, ResultColumn.Samples, ResultColumn.EstimatedCpuPercentage]
+            ? [ResultColumn.Name, ResultColumn.Samples, ResultColumn.EstimatedStackFrameShare]
             : [ResultColumn.Name, ResultColumn.ObservedWallTime, ResultColumn.Calls,
                 ResultColumn.AverageWallTime, ResultColumn.MaximumWallTime];
     }
@@ -92,14 +92,12 @@ public static class ModePresenter
         return $"{nanoseconds} ns";
     }
 
-    private static string? Validate(ModeConfiguration config, ModePresentationInput input)
+        private static string? Validate(ModeConfiguration config, ModePresentationInput input)
     {
         if (config.Modes == CaptureModes.None) return "At least one capture mode is required.";
         if ((config.Modes & ~input.SupportedModes) != 0) return "Selected mode is not supported by the target.";
         if (config.Primary == PrimaryMode.Sampling)
         {
-            if (string.IsNullOrWhiteSpace(config.Sampling.IncludeAssemblies))
-                return "Sampling include assemblies is required.";
             var hostile = ControlCharacterReason(config.Sampling.IncludeAssemblies, "Sampling include assemblies")
                 ?? ControlCharacterReason(config.Sampling.ExcludeAssemblies, "Sampling exclude assemblies");
             if (hostile is not null) return hostile;

@@ -1,5 +1,6 @@
 #nullable enable
 using Apeworks.GodotCSharpProfiler.Editor.Modes;
+using Apeworks.GodotCSharpProfiler.Protocol;
 
 namespace Apeworks.GodotCSharpProfiler.Editor.Integration;
 
@@ -27,6 +28,8 @@ public static class ProfilerDockLayoutPolicy
     }
 }
 
+public enum PendingStartOutcome { None, Waiting, Started, Rejected }
+
 /// <summary>One pending user intent, replayed exactly once after strict capabilities are available.</summary>
 public sealed class PendingCaptureRequest
 {
@@ -38,11 +41,19 @@ public sealed class PendingCaptureRequest
 
     public void Cancel() => configuration = null;
 
-    public bool TryStart(EditorCaptureCoordinator endpoint)
+    public PendingStartOutcome TryStart(EditorCaptureCoordinator endpoint)
     {
         ArgumentNullException.ThrowIfNull(endpoint);
-        if (configuration is null || !endpoint.Start(configuration)) return false;
+        if (configuration is null) return PendingStartOutcome.None;
+        if (endpoint.Snapshot.State is CaptureState.Disconnected or CaptureState.Negotiating ||
+            endpoint.Snapshot.RuntimeToken is null || endpoint.Snapshot.SupportedModes == CaptureModes.None)
+            return PendingStartOutcome.Waiting;
+        if (endpoint.Start(configuration))
+        {
+            configuration = null;
+            return PendingStartOutcome.Started;
+        }
         configuration = null;
-        return true;
+        return PendingStartOutcome.Rejected;
     }
 }

@@ -5,11 +5,11 @@ using Apeworks.GodotCSharpProfiler.Runtime.Protocol.Adapters;
 
 namespace Apeworks.GodotCSharpProfiler.Editor.Integration;
 
-public enum ProfilerCommand { Start, Stop }
+public enum ProfilerCommand { Start, Stop, CancelPending }
 public enum ExportFormat { LosslessJson, VisibleCsv, ChromeTrace }
 public enum InstallerGate { Ready, PackageUnavailable, NeedsBuild, NeedsRestart, Stale, NoMatches, Error }
 
-public sealed record ResultRow(string Name, long Samples, double EstimatedCpuPercentage, long Calls,
+public sealed record ResultRow(string Name, long Samples, double EstimatedStackFrameShare, long Calls,
     double ObservedWallTimeMilliseconds, double AverageWallTimeMilliseconds,
     double MaximumWallTimeMilliseconds);
 public sealed record SourceResultGroup(CaptureSource Source, IReadOnlyList<ResultRow> Rows);
@@ -17,6 +17,19 @@ public sealed record ProfilerResults(IReadOnlyList<SourceResultGroup> Groups, lo
 {
     public static ProfilerResults Empty { get; } = new(Array.Empty<SourceResultGroup>(), 0);
     public bool HasResults => Groups.Any(group => group.Rows.Count != 0);
+}
+
+/// <summary>A bounded recent-batch timeline. Values are samples for sampling and nanoseconds for exact spans.</summary>
+public sealed record CaptureTimelinePoint(
+    long Sequence,
+    CaptureSource Source,
+    long Value,
+    long Observations,
+    IReadOnlyList<ResultRow> Rows);
+public sealed record CaptureTimeline(IReadOnlyList<CaptureTimelinePoint> Points)
+{
+    public const int MaximumPoints = 120;
+    public static CaptureTimeline Empty { get; } = new(Array.Empty<CaptureTimelinePoint>());
 }
 
 public sealed record ToggleViewState(string Label, bool Selected, bool Enabled, string Tooltip);
@@ -34,7 +47,9 @@ public sealed record ProfilerDockViewState(
     string InstallerPreviewDiff,
     string QualityBanner,
     bool ResultsVisible,
-    IReadOnlyList<ResultGroupViewState> ResultGroups);
+    IReadOnlyList<ResultGroupViewState> ResultGroups,
+    CaptureTimeline Timeline,
+    bool CapturePending);
 
 public interface IProfilerDockView { void Render(ProfilerDockViewState state); }
 public interface IProfilerCommandTransport
@@ -72,6 +87,8 @@ public sealed class EditorCaptureCoordinator
     private readonly Action<WireMap> send;
     private readonly CaptureProtocolParser parser = new();
     private readonly Dictionary<CaptureSource, Dictionary<long, Aggregate>> pending = new();
+    private readonly List<CaptureTimelinePoint> timeline = new();
+    private int configuredMaxMethods = ProtocolLimits.MaxMethodsPerBatch;
     private CaptureSnapshot snapshot = new(CaptureState.Negotiating, null, 0, 0, null, null,
         CaptureModes.None, CaptureSource.Sampling, CaptureCompleteness.InProgress, PartialReason.None,
         QualityCounters.Zero, CaptureModes.None, false, 0, 0);
@@ -85,8 +102,10 @@ public sealed class EditorCaptureCoordinator
 
     public CaptureSnapshot Snapshot => snapshot;
     public ProfilerResults CompletedResults { get; private set; } = ProfilerResults.Empty;
+    public CaptureTimeline Timeline => new(timeline.ToArray());
     public event Action<CaptureSnapshot>? SnapshotChanged;
     public event Action<ProfilerResults>? CompletedResultsChanged;
+    public event Action<CaptureTimeline>? TimelineChanged;
     public event Action<string>? Rejected;
 
     public bool Receive(object? payload)
@@ -136,6 +155,9 @@ public sealed class EditorCaptureCoordinator
             LeaseOwner = owner, Modes = normalized.Modes, State = CaptureState.Starting,
             Completeness = CaptureCompleteness.InProgress, PartialReason = PartialReason.None, Quality = QualityCounters.Zero };
         pending.Clear();
+        timeline.Clear();
+        configuredMaxMethods = maxMethods;
+        TimelineChanged?.Invoke(CaptureTimeline.Empty);
         send(StrictWireAdapter.Serialize(new ConfigureMessage(ProtocolVersion.Major, ProtocolVersion.Minor,
             snapshot.RuntimeToken, generation, normalized.Fingerprint, normalized.Modes, interval, maxMethods,
             normalized.Sampling.IncludeAssemblies, normalized.Sampling.ExcludeAssemblies,
@@ -168,16 +190,30 @@ public sealed class EditorCaptureCoordinator
         SnapshotChanged?.Invoke(snapshot);
     }
 
-    private bool AcceptHello(HelloMessage message)
+        private bool AcceptHello(HelloMessage message)
     {
-        if (snapshot.State != CaptureState.Negotiating || message.Major != ProtocolVersion.Major) return false;
-        snapshot = snapshot with { State = CaptureState.Ready, RuntimeToken = message.RuntimeToken };
+        if (message.Major != ProtocolVersion.Major) return false;
+        if (string.Equals(snapshot.RuntimeToken, message.RuntimeToken, StringComparison.Ordinal))
+            return snapshot.State is not (CaptureState.Disconnected or CaptureState.Negotiating);
+
+        // Debugger session ids may be reused across game reruns. A new token starts a fresh negotiation.
+        // Completed editor-owned results and timeline remain visible until the next capture starts.
+        snapshot = snapshot with { State = CaptureState.Ready, RuntimeToken = message.RuntimeToken,
+            Generation = 0, Sequence = 0, Fingerprint = null, LeaseOwner = null, Modes = CaptureModes.None,
+            SupportedModes = CaptureModes.None, SamplingIntervalRuntimeConfigurable = false,
+            EffectiveSamplingIntervalNanoseconds = 0, CapabilityMaxMethods = 0 };
+        pending.Clear();
         return true;
     }
 
-    private bool AcceptCapabilities(CapabilitiesMessage message)
+        private bool AcceptCapabilities(CapabilitiesMessage message)
     {
-        if (snapshot.State != CaptureState.Ready || !MatchesRuntime(message) || message.Generation != 0) return false;
+        if (!MatchesRuntime(message) || message.Generation != 0) return false;
+        if (snapshot.State != CaptureState.Ready)
+            return message.Modes == snapshot.SupportedModes &&
+                   message.SamplingIntervalRuntimeConfigurable == snapshot.SamplingIntervalRuntimeConfigurable &&
+                   message.EffectiveSamplingIntervalNanoseconds == snapshot.EffectiveSamplingIntervalNanoseconds &&
+                   message.MaxMethods == snapshot.CapabilityMaxMethods;
         snapshot = snapshot with { SupportedModes = message.Modes,
             SamplingIntervalRuntimeConfigurable = message.SamplingIntervalRuntimeConfigurable,
             EffectiveSamplingIntervalNanoseconds = message.EffectiveSamplingIntervalNanoseconds,
@@ -185,7 +221,7 @@ public sealed class EditorCaptureCoordinator
         return true;
     }
 
-    private bool AcceptBatch(BatchMessage message)
+        private bool AcceptBatch(BatchMessage message)
     {
         if (snapshot.State is not (CaptureState.Capturing or CaptureState.Stopping) || !MatchesCapture(message) ||
             message.Sequence != snapshot.Sequence + 1 || (snapshot.Modes & ModeFor(message.Source)) == 0) return false;
@@ -200,6 +236,7 @@ public sealed class EditorCaptureCoordinator
         {
             foreach (var sample in message.Methods)
             {
+                if (!methods.ContainsKey(sample.MethodId) && methods.Count >= configuredMaxMethods) return false;
                 methods.TryGetValue(sample.MethodId, out var current);
                 if (current.Label is not null && !string.Equals(current.Label, sample.Label, StringComparison.Ordinal))
                     return false;
@@ -209,8 +246,23 @@ public sealed class EditorCaptureCoordinator
             }
         }
         catch (OverflowException) { return false; }
+        long batchValue;
+        long observations;
+        try
+        {
+            batchValue = message.Methods.Aggregate(0L, (sum, item) => checked(sum + item.Value));
+            observations = message.Source == CaptureSource.Sampling
+                ? batchValue
+                : message.Methods.Aggregate(0L, (sum, item) => checked(sum + item.Calls));
+        }
+        catch (OverflowException) { return false; }
         pending[message.Source] = methods;
+        timeline.Add(new CaptureTimelinePoint(message.Sequence, message.Source, batchValue, observations,
+            BuildRows(message.Source, message.Methods)));
+        if (timeline.Count > CaptureTimeline.MaximumPoints)
+            timeline.RemoveRange(0, timeline.Count - CaptureTimeline.MaximumPoints);
         snapshot = snapshot with { Sequence = message.Sequence, Source = message.Source, Quality = quality };
+        TimelineChanged?.Invoke(Timeline);
         return true;
     }
 
@@ -261,6 +313,18 @@ public sealed class EditorCaptureCoordinator
 
     private static bool ValidConfigurationText(string value, int maximum) => value is not null &&
         value.Length <= maximum && !value.Any(char.IsControl);
+
+        private static IReadOnlyList<ResultRow> BuildRows(CaptureSource source, IReadOnlyList<MethodSample> methods)
+    {
+        var total = source == CaptureSource.Sampling ? methods.Sum(value => value.Value) : 0;
+        return methods.OrderByDescending(value => value.Value).ThenBy(value => value.MethodId).Select(value =>
+            source == CaptureSource.Sampling
+                ? new ResultRow(value.Label, value.Value, total == 0 ? 0 : value.Value * 100.0 / total,
+                    0, 0, 0, 0)
+                : new ResultRow(value.Label, 0, 0, value.Calls, value.Value / 1_000_000.0,
+                    value.Calls == 0 ? 0 : value.Value / 1_000_000.0 / value.Calls,
+                    value.Calls == 0 ? 0 : value.Value / 1_000_000.0 / value.Calls)).ToArray();
+    }
 
     private void CommitResults()
     {

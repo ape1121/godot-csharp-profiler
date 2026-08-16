@@ -14,12 +14,14 @@ public sealed class ProfilerDockController
     private readonly ModeUiController modes = new();
     private CaptureSnapshot snapshot = DisconnectedSnapshot();
     private ProfilerResults results = ProfilerResults.Empty;
+    private CaptureTimeline timeline = CaptureTimeline.Empty;
     private string target = "No target";
     private string? statusOverride;
     private string installerStatus = "Automatic installation: not previewed";
     private string installerPreviewDiff = "";
     private string? currentPreviewToken;
     private InstallerGate installerGate = InstallerGate.Ready;
+    private bool waitingForTarget;
 
     public ProfilerDockController(IProfilerDockView view, IProfilerCommandTransport transport,
         IAutomaticInstaller? installer, IProfilerOutput? output = null)
@@ -37,7 +39,9 @@ public sealed class ProfilerDockController
     {
         snapshot = value;
         target = SafeText(targetDescription, 160, "Unknown target");
-        statusOverride = null;
+        if (value.State is CaptureState.Starting or CaptureState.Capturing)
+            waitingForTarget = false;
+        statusOverride = waitingForTarget ? "Waiting for target capabilities — capture will start automatically." : null;
         Render();
     }
 
@@ -105,32 +109,68 @@ public sealed class ProfilerDockController
         installerStatus = "Preview required after automatic settings changed";
     }
 
-    public bool Start()
+        /// <summary>The production button path: records one normalized intent even before a target exists.</summary>
+    public bool RequestStart()
     {
+        if (waitingForTarget) return false;
         var presentation = Presentation();
-        if (!presentation.Commands.Start.Enabled) return false;
-        transport.Send(ProfilerCommand.Start, modes.Configuration);
-        return true;
+        if (presentation.Commands.Start.Enabled)
+        {
+            transport.Send(ProfilerCommand.Start, modes.Configuration.Normalize());
+            return true;
+        }
+        if (snapshot.State is CaptureState.Disconnected or CaptureState.Negotiating)
+        {
+            waitingForTarget = true;
+            statusOverride = "Waiting for target capabilities — capture will start automatically.";
+            transport.Send(ProfilerCommand.Start, modes.Configuration.Normalize());
+            Render();
+            return true;
+        }
+        statusOverride = presentation.Commands.Start.Reason ?? "Selected mode cannot start.";
+        Render();
+        return false;
     }
+
+    public bool Start() => RequestStart();
 
     public bool Stop()
     {
+        if (waitingForTarget)
+        {
+            waitingForTarget = false;
+            transport.Send(ProfilerCommand.CancelPending, modes.Configuration.Normalize());
+            statusOverride = "Pending capture cancelled.";
+            Render();
+            return true;
+        }
         if (!Presentation().Commands.Stop.Enabled) return false;
-        transport.Send(ProfilerCommand.Stop, modes.Configuration);
+        transport.Send(ProfilerCommand.Stop, modes.Configuration.Normalize());
         return true;
     }
 
-    public void Clear()
+        public void Clear()
     {
-        if (!Presentation().Commands.Clear.Enabled)
-            return;
+        if (waitingForTarget)
+        {
+            waitingForTarget = false;
+            transport.Send(ProfilerCommand.CancelPending, modes.Configuration.Normalize());
+            statusOverride = "Pending capture cancelled.";
+        }
         results = ProfilerResults.Empty;
+        timeline = CaptureTimeline.Empty;
         Render();
     }
 
     public void ReplaceResults(ProfilerResults value)
     {
         results = value ?? ProfilerResults.Empty;
+        Render();
+    }
+
+    public void UpdateTimeline(CaptureTimeline value)
+    {
+        timeline = value ?? CaptureTimeline.Empty;
         Render();
     }
 
@@ -245,7 +285,7 @@ public sealed class ProfilerDockController
         return new AutomaticFacts(status, 0, 0, 0);
     }
 
-    private void Render()
+        private void Render()
     {
         var presentation = Presentation();
         var config = modes.Configuration;
@@ -260,7 +300,8 @@ public sealed class ProfilerDockController
                 Segment("Manual", config.Primary == PrimaryMode.None, presentation.Modes.Manual)
             ],
             Segment("Include Manual", config.IncludeManual, presentation.Modes.Manual),
-            new CommandViewState(presentation.Commands.Start.Enabled, presentation.Commands.Stop.Enabled,
+            new CommandViewState(waitingForTarget ? false : presentation.Commands.Start.Enabled,
+                waitingForTarget || presentation.Commands.Stop.Enabled,
                 presentation.Commands.Clear.Enabled, presentation.Commands.Copy.Enabled,
                 presentation.Commands.Export.Enabled),
             $"{presentation.Overhead} overhead · Sampling interval: {presentation.Sampling.Interval.Display}",
@@ -268,7 +309,9 @@ public sealed class ProfilerDockController
             installerPreviewDiff,
             presentation.Quality.Banner,
             presentation.ResultsVisible,
-            groups));
+            groups,
+            timeline,
+            waitingForTarget));
     }
 
     private static ToggleViewState Segment(string label, bool selected, Availability availability) =>
@@ -278,7 +321,7 @@ public sealed class ProfilerDockController
 
     private static IReadOnlyList<string> Columns(CaptureSource source) => source switch
     {
-        CaptureSource.Sampling => ["Name", "Samples", "Estimated CPU %"],
+        CaptureSource.Sampling => ["Name", "Samples", "Estimated stack-frame %"],
         CaptureSource.AutomaticSpans or CaptureSource.ManualSpans =>
             ["Name", "Wall time", "Calls", "Average wall time", "Maximum wall time"],
         _ => ["Name"]

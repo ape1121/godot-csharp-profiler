@@ -79,7 +79,7 @@ public sealed class EndToEndTests
             snapshot.Sequence + 2, snapshot.Fingerprint!, CaptureState.Complete, CaptureSource.Sampling,
             CaptureCompleteness.Complete, PartialReason.None, QualityCounters.Zero));
         Assert.False(loop.Editor.Receive(gap));
-        Assert.False(loop.Editor.Receive(StrictWireAdapter.Serialize(new HelloMessage(ProtocolVersion.Major, ProtocolVersion.Minor, Token, "runtime", 100))));
+        Assert.True(loop.Editor.Receive(StrictWireAdapter.Serialize(new HelloMessage(ProtocolVersion.Major, ProtocolVersion.Minor, Token, "runtime", 100))));
         Assert.Same(completed, loop.Editor.CompletedResults);
         Assert.Equal(snapshot, loop.Editor.Snapshot);
     }

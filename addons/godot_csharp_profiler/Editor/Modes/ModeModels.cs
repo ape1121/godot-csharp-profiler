@@ -9,7 +9,7 @@ namespace Apeworks.GodotCSharpProfiler.Editor.Modes;
 public enum PrimaryMode { Sampling, AutomaticInstrumentation, None }
 public enum AutomaticBuildStatus { Ready, NeedsBuild, NeedsRestart, NoMatches, StaleBuild }
 public enum OverheadLevel { Low, Moderate, High }
-public enum ResultColumn { Name, Samples, EstimatedCpuPercentage, ObservedWallTime, Calls, AverageWallTime, MaximumWallTime, CpuTime }
+public enum ResultColumn { Name, Samples, EstimatedStackFrameShare, ObservedWallTime, Calls, AverageWallTime, MaximumWallTime, CpuTime }
 
 public sealed record SamplingSettings(string IncludeAssemblies, string ExcludeAssemblies, long RequestedIntervalNanoseconds)
 {
@@ -42,7 +42,7 @@ public sealed record ModeConfiguration(
     public static ModeConfiguration Default { get; } = new(
         PrimaryMode.Sampling,
         false,
-        new SamplingSettings("Game", string.Empty, 2_000_000),
+        new SamplingSettings(string.Empty, string.Empty, 2_000_000),
         new AutomaticSettings("Game", string.Empty, 4_096),
         new ManualSettings(string.Empty));
 
