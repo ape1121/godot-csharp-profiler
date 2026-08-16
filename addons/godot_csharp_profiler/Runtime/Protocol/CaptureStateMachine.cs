@@ -4,7 +4,8 @@ namespace Apeworks.GodotCSharpProfiler.Protocol;
 public readonly record struct CaptureSnapshot(CaptureState State, string? RuntimeToken, long Generation,
     long Sequence, string? Fingerprint, string? LeaseOwner, CaptureModes Modes,
     CaptureSource Source, CaptureCompleteness Completeness, PartialReason PartialReason,
-    QualityCounters Quality);
+    QualityCounters Quality, CaptureModes SupportedModes, bool SamplingIntervalRuntimeConfigurable,
+    long EffectiveSamplingIntervalNanoseconds, int CapabilityMaxMethods);
 
 /// <summary>Deterministic capture lifecycle. Rejected input leaves its snapshot unchanged.</summary>
 public sealed class CaptureStateMachine
@@ -20,9 +21,14 @@ public sealed class CaptureStateMachine
     public CaptureCompleteness Completeness { get; private set; }
     public PartialReason PartialReason { get; private set; }
     public QualityCounters Quality { get; private set; }
+    public CaptureModes SupportedModes { get; private set; }
+    public bool SamplingIntervalRuntimeConfigurable { get; private set; }
+    public long EffectiveSamplingIntervalNanoseconds { get; private set; }
+    public int CapabilityMaxMethods { get; private set; }
 
     public CaptureSnapshot Snapshot => new(State, RuntimeToken, Generation, Sequence, Fingerprint,
-        LeaseOwner, Modes, Source, Completeness, PartialReason, Quality);
+        LeaseOwner, Modes, Source, Completeness, PartialReason, Quality, SupportedModes,
+        SamplingIntervalRuntimeConfigurable, EffectiveSamplingIntervalNanoseconds, CapabilityMaxMethods);
 
     public bool Connect()
     {
@@ -44,6 +50,10 @@ public sealed class CaptureStateMachine
         Completeness = default;
         PartialReason = default;
         Quality = default;
+        SupportedModes = CaptureModes.None;
+        SamplingIntervalRuntimeConfigurable = false;
+        EffectiveSamplingIntervalNanoseconds = 0;
+        CapabilityMaxMethods = 0;
     }
 
     public bool AcceptHello(HelloMessage message)
@@ -55,11 +65,25 @@ public sealed class CaptureStateMachine
         return true;
     }
 
+    public bool AcceptCapabilities(CapabilitiesMessage message)
+    {
+        if (State != CaptureState.Ready || !MatchesRuntime(message) || message.Generation != 0 ||
+            !ValidAvailableModes(message.Modes) || message.MaxMethods < 1 ||
+            !ValidCapabilityInterval(message)) return false;
+        SupportedModes = message.Modes;
+        SamplingIntervalRuntimeConfigurable = message.SamplingIntervalRuntimeConfigurable;
+        EffectiveSamplingIntervalNanoseconds = message.EffectiveSamplingIntervalNanoseconds;
+        CapabilityMaxMethods = message.MaxMethods;
+        return true;
+    }
+
     public bool Configure(ConfigureMessage message)
     {
         if (State is not (CaptureState.Ready or CaptureState.Complete or CaptureState.Partial) ||
-            !MatchesRuntime(message) || message.Generation <= Generation ||
-            !ValidModes(message.Modes) || !ValidFingerprint(message.Fingerprint)) return false;
+            !MatchesRuntime(message) || message.Generation <= Generation || SupportedModes == CaptureModes.None ||
+            !ValidModes(message.Modes) || (message.Modes & ~SupportedModes) != 0 ||
+            message.MaxMethods < 1 || message.MaxMethods > CapabilityMaxMethods ||
+            !ValidRequestedInterval(message) || !ValidFingerprint(message.Fingerprint)) return false;
         Generation = message.Generation;
         Sequence = 0;
         Fingerprint = message.Fingerprint;
@@ -154,17 +178,39 @@ public sealed class CaptureStateMachine
     private static bool Compatible(ProtocolMessage message) => message.Major == ProtocolVersion.Major &&
         message.Minor >= 0 && message.Minor <= ProtocolVersion.Minor;
 
+    private static bool ValidAvailableModes(CaptureModes modes) =>
+        modes != CaptureModes.None && (modes & ~((CaptureModes)7)) == 0;
+
     private static bool ValidModes(CaptureModes modes) =>
-        (modes & (CaptureModes.Sampling | CaptureModes.AutomaticInstrumentation)) != 0 &&
-        !((modes & CaptureModes.Sampling) != 0 && (modes & CaptureModes.AutomaticInstrumentation) != 0) &&
-        (modes & ~((CaptureModes)7)) == 0;
+        ValidAvailableModes(modes) &&
+        !((modes & CaptureModes.Sampling) != 0 && (modes & CaptureModes.AutomaticInstrumentation) != 0);
 
     private static bool ValidFingerprint(string value) => value is not null &&
         value.Length == ProtocolLimits.FingerprintCharacters && value.All(Uri.IsHexDigit);
 
+    private static bool ValidCapabilityInterval(CapabilitiesMessage message)
+    {
+        var sampling = (message.Modes & CaptureModes.Sampling) != 0;
+        var interval = message.EffectiveSamplingIntervalNanoseconds;
+        return sampling
+            ? interval == 0 || interval is >= ProtocolLimits.MinSamplingIntervalNanoseconds
+                and <= ProtocolLimits.MaxSamplingIntervalNanoseconds
+            : !message.SamplingIntervalRuntimeConfigurable && interval == 0;
+    }
+
+    private bool ValidRequestedInterval(ConfigureMessage message)
+    {
+        var interval = message.RequestedSamplingIntervalNanoseconds;
+        if ((message.Modes & CaptureModes.Sampling) == 0) return interval == 0;
+        if (interval == 0) return true;
+        return SamplingIntervalRuntimeConfigurable &&
+            interval is >= ProtocolLimits.MinSamplingIntervalNanoseconds
+                and <= ProtocolLimits.MaxSamplingIntervalNanoseconds;
+    }
+
     private static bool ValidSource(CaptureSource source, bool exactCalls, bool cpuTime) => source switch
     {
-        CaptureSource.Sampling => !exactCalls,
+        CaptureSource.Sampling => !exactCalls && !cpuTime,
         CaptureSource.AutomaticSpans or CaptureSource.ManualSpans => exactCalls && !cpuTime,
         _ => false
     };

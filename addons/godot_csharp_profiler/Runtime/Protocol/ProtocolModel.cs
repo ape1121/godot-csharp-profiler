@@ -17,7 +17,9 @@ public static class ProtocolLimits
     public const int MaxErrorCharacters = 512;
     public const int MaxMethodsPerBatch = 4096;
     public const int MaxDepth = 8;
-    public const int MaxSamplingHertz = 10_000;
+    /// <summary>Sampling interval bounds: 100 microseconds (10 kHz) through 1 second (1 Hz).</summary>
+    public const long MinSamplingIntervalNanoseconds = 100_000;
+    public const long MaxSamplingIntervalNanoseconds = 1_000_000_000;
     public const int MaxConfiguredMethods = 1_000_000;
 }
 
@@ -51,10 +53,11 @@ public abstract record ProtocolMessage(int Major, int Minor, string RuntimeToken
 public sealed record HelloMessage(int Major, int Minor, string RuntimeToken, string Role, int MaxBatchBytes)
     : ProtocolMessage(Major, Minor, RuntimeToken);
 public sealed record CapabilitiesMessage(int Major, int Minor, string RuntimeToken, long Generation,
-    CaptureModes Modes, int MaxMethods, int MaxBatchBytes, int MaxDepth)
+    CaptureModes Modes, bool SamplingIntervalRuntimeConfigurable, long EffectiveSamplingIntervalNanoseconds,
+    int MaxMethods, int MaxBatchBytes, int MaxDepth)
     : ProtocolMessage(Major, Minor, RuntimeToken);
 public sealed record ConfigureMessage(int Major, int Minor, string RuntimeToken, long Generation,
-    string Fingerprint, CaptureModes Modes, int SamplingHertz, int MaxMethods)
+    string Fingerprint, CaptureModes Modes, long RequestedSamplingIntervalNanoseconds, int MaxMethods)
     : ProtocolMessage(Major, Minor, RuntimeToken);
 public sealed record StartMessage(int Major, int Minor, string RuntimeToken, long Generation, string Fingerprint)
     : ProtocolMessage(Major, Minor, RuntimeToken);
@@ -88,8 +91,8 @@ public static class ProtocolSchema
         new Dictionary<MessageKind, IReadOnlyList<string>>
         {
             [MessageKind.Hello] = ["kind", "major", "minor", "runtimeToken", "role", "maxBatchBytes"],
-            [MessageKind.Capabilities] = ["kind", "major", "minor", "runtimeToken", "generation", "modes", "maxMethods", "maxBatchBytes", "maxDepth"],
-            [MessageKind.Configure] = ["kind", "major", "minor", "runtimeToken", "generation", "fingerprint", "modes", "samplingHertz", "maxMethods"],
+            [MessageKind.Capabilities] = ["kind", "major", "minor", "runtimeToken", "generation", "modes", "samplingIntervalRuntimeConfigurable", "effectiveSamplingIntervalNanoseconds", "maxMethods", "maxBatchBytes", "maxDepth"],
+            [MessageKind.Configure] = ["kind", "major", "minor", "runtimeToken", "generation", "fingerprint", "modes", "requestedSamplingIntervalNanoseconds", "maxMethods"],
             [MessageKind.Start] = ["kind", "major", "minor", "runtimeToken", "generation", "fingerprint"],
             [MessageKind.State] = ["kind", "major", "minor", "runtimeToken", "generation", "sequence", "fingerprint", "state", "source", "completeness", "partialReason", "observed", "dropped", "overflowed", "invalid"],
             [MessageKind.Batch] = ["kind", "major", "minor", "runtimeToken", "generation", "sequence", "fingerprint", "source", "exactCalls", "cpuTime", "observed", "dropped", "overflowed", "invalid", "methods"],

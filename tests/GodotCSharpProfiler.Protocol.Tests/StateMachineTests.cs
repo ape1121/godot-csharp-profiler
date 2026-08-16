@@ -17,8 +17,10 @@ public sealed class StateMachineTests
         Assert.Equal(CaptureState.Negotiating, machine.State);
         Assert.True(machine.AcceptHello(new HelloMessage(1, 0, Token, "client", 4096)));
         Assert.Equal(CaptureState.Ready, machine.State);
+        Assert.True(machine.AcceptCapabilities(Capabilities(CaptureModes.Sampling | CaptureModes.ManualScopes,
+            configurable: true, effectiveInterval: 1_000_000)));
         Assert.True(machine.Configure(new ConfigureMessage(1, 0, Token, 1, Fingerprint,
-            CaptureModes.Sampling | CaptureModes.ManualScopes, 100, 64)));
+            CaptureModes.Sampling | CaptureModes.ManualScopes, 1_000_000, 64)));
         Assert.True(machine.Start(new StartMessage(1, 0, Token, 1, Fingerprint), "editor-A"));
         Assert.Equal(CaptureState.Starting, machine.State);
         Assert.True(machine.AcceptState(State(1, CaptureState.Capturing, 1)));
@@ -114,15 +116,62 @@ public sealed class StateMachineTests
         Assert.Equal(0, machine.Sequence);
     }
 
+    [Fact]
+    public void CapabilitiesRejectUnsupportedModesAndIntervalsWithoutMutation()
+    {
+        var machine = ReadyWithCapabilities(CaptureModes.AutomaticInstrumentation | CaptureModes.ManualScopes,
+            configurable: false, effectiveInterval: 0);
+        var snapshot = machine.Snapshot;
+
+        Assert.False(machine.Configure(new ConfigureMessage(1, 0, Token, 1, Fingerprint,
+            CaptureModes.Sampling, 0, 64)));
+        Assert.Equal(snapshot, machine.Snapshot);
+        Assert.False(machine.Configure(new ConfigureMessage(1, 0, Token, 1, Fingerprint,
+            CaptureModes.AutomaticInstrumentation, 1_000_000, 64)));
+        Assert.Equal(snapshot, machine.Snapshot);
+        Assert.True(machine.Configure(new ConfigureMessage(1, 0, Token, 1, Fingerprint,
+            CaptureModes.ManualScopes, 0, 64)));
+    }
+
+    [Fact]
+    public void FixedAndConfigurableSamplingIntervalsAreCapabilityAware()
+    {
+        var fixedMachine = ReadyWithCapabilities(CaptureModes.Sampling, false, 2_000_000);
+        Assert.True(fixedMachine.Configure(new ConfigureMessage(1, 0, Token, 1, Fingerprint,
+            CaptureModes.Sampling, 0, 64)));
+
+        var fixedRejecting = ReadyWithCapabilities(CaptureModes.Sampling, false, 2_000_000);
+        var before = fixedRejecting.Snapshot;
+        Assert.False(fixedRejecting.Configure(new ConfigureMessage(1, 0, Token, 1, Fingerprint,
+            CaptureModes.Sampling, 1_000_000, 64)));
+        Assert.Equal(before, fixedRejecting.Snapshot);
+
+        var configurable = ReadyWithCapabilities(CaptureModes.Sampling, true, 2_000_000);
+        Assert.True(configurable.Configure(new ConfigureMessage(1, 0, Token, 1, Fingerprint,
+            CaptureModes.Sampling, 1_000_000, 64)));
+    }
+
     private static CaptureStateMachine ReadyConfigured()
+    {
+        var machine = ReadyWithCapabilities(CaptureModes.Sampling, true, 1_000_000);
+        machine.Configure(new ConfigureMessage(1, 0, Token, 1, Fingerprint,
+            CaptureModes.Sampling, 1_000_000, 64));
+        return machine;
+    }
+
+    private static CaptureStateMachine ReadyWithCapabilities(CaptureModes modes, bool configurable,
+        long effectiveInterval)
     {
         var machine = new CaptureStateMachine();
         machine.Connect();
         machine.AcceptHello(new HelloMessage(1, 0, Token, "client", 4096));
-        machine.Configure(new ConfigureMessage(1, 0, Token, 1, Fingerprint,
-            CaptureModes.Sampling, 100, 64));
+        Assert.True(machine.AcceptCapabilities(Capabilities(modes, configurable, effectiveInterval)));
         return machine;
     }
+
+    private static CapabilitiesMessage Capabilities(CaptureModes modes, bool configurable,
+        long effectiveInterval) => new(1, 0, Token, 0, modes, configurable, effectiveInterval,
+            128, 4096, 8);
 
     private static StateMessage State(long generation, CaptureState state, long sequence,
         CaptureCompleteness completeness = CaptureCompleteness.InProgress,
@@ -132,7 +181,7 @@ public sealed class StateMachineTests
 
     private static BatchMessage Batch(long generation, long sequence, string fingerprint = Fingerprint,
         long observed = 0, long dropped = 0, long overflowed = 0, long invalid = 0) =>
-        new(1, 0, Token, generation, sequence, fingerprint, CaptureSource.Sampling, false, true,
+        new(1, 0, Token, generation, sequence, fingerprint, CaptureSource.Sampling, false, false,
             new QualityCounters(observed, dropped, overflowed, invalid), []);
 }
 #endif
