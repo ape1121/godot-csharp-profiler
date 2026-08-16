@@ -34,6 +34,7 @@ public sealed class ManagedSamplingSession : IAsyncDisposable
     private Task? _processingTask;
     private CancellationTokenRegistration _cancellationRegistration;
     private int _state = (int)ManagedSamplingSessionState.Stopped;
+    private int _traceEpochCount;
     private bool _hasStarted;
     private Exception? _fault;
 
@@ -43,11 +44,19 @@ public sealed class ManagedSamplingSession : IAsyncDisposable
         _aggregator = new SamplingAggregator(_options);
     }
 
+    public static SamplingCapabilities Capabilities { get; } = SamplingCapabilities.Detect();
+
     public ManagedSamplingSessionState State =>
         (ManagedSamplingSessionState)Volatile.Read(ref _state);
 
     /// <summary>The failure that caused <see cref="ManagedSamplingSessionState.Faulted"/>.</summary>
     public Exception? Fault => Volatile.Read(ref _fault);
+
+    /// <summary>
+    /// Number of bounded-lifetime in-memory TraceLog epochs created by this session.
+    /// Exposed so hosts can monitor retention renewal.
+    /// </summary>
+    public int TraceEpochCount => Volatile.Read(ref _traceEpochCount);
 
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
@@ -65,28 +74,15 @@ public sealed class ManagedSamplingSession : IAsyncDisposable
 
             try
             {
-                var providers = new List<EventPipeProvider>
-                {
-                    new(
-                        "Microsoft-Windows-DotNETRuntime",
-                        EventLevel.Verbose,
-                        (long)(ClrTraceEventParser.Keywords.Jit | ClrTraceEventParser.Keywords.Loader)),
-                    new("Microsoft-DotNETCore-SampleProfiler", EventLevel.Informational)
-                };
-                var client = new DiagnosticsClient(Environment.ProcessId);
-                _eventPipeSession = client.StartEventPipeSession(
-                    providers, requestRundown: false, _options.CircularBufferSizeMegabytes);
-                _eventSource = Microsoft.Diagnostics.Tracing.Etlx.TraceLog.CreateFromEventPipeSession(
-                    _eventPipeSession,
-                    Microsoft.Diagnostics.Tracing.Etlx.TraceLog.EventPipeRundownConfiguration.Enable(client));
-                _eventSource.AllEvents += OnAnyEvent;
-                _processingTask = Task.Run(ProcessEvents);
+                CreateTraceEpoch();
+                Volatile.Write(ref _state, (int)ManagedSamplingSessionState.Running);
+                _processingTask = Task.Run(ProcessTraceEpochs);
                 _cancellationRegistration = cancellationToken.Register(
                     static state => _ = ((ManagedSamplingSession)state!).StopAsync(), this);
-                Volatile.Write(ref _state, (int)ManagedSamplingSessionState.Running);
             }
             catch (Exception exception)
             {
+                DisposeTraceEpoch();
                 ReleaseGlobalOwnership();
                 var wrapped = CreateStartFailure(exception);
                 Volatile.Write(ref _fault, wrapped);
@@ -122,22 +118,11 @@ public sealed class ManagedSamplingSession : IAsyncDisposable
 
             Volatile.Write(ref _state, (int)ManagedSamplingSessionState.Stopping);
             _cancellationRegistration.Dispose();
-            try
-            {
-                _eventPipeSession?.Stop();
-            }
-            catch (ServerNotAvailableException)
-            {
-                // The runtime may have already closed the stream during process shutdown.
-            }
-
+            StopCurrentTraceEpoch();
             if (_processingTask is not null)
                 await _processingTask.ConfigureAwait(false);
 
-            _eventSource?.Dispose();
-            _eventPipeSession?.Dispose();
-            _eventSource = null;
-            _eventPipeSession = null;
+            DisposeTraceEpoch();
             _processingTask = null;
             ReleaseGlobalOwnership();
             if (State != ManagedSamplingSessionState.Faulted)
@@ -147,6 +132,7 @@ public sealed class ManagedSamplingSession : IAsyncDisposable
         {
             Volatile.Write(ref _fault, exception);
             Volatile.Write(ref _state, (int)ManagedSamplingSessionState.Faulted);
+            DisposeTraceEpoch();
             ReleaseGlobalOwnership();
             throw;
         }
@@ -164,23 +150,84 @@ public sealed class ManagedSamplingSession : IAsyncDisposable
         _lifecycle.Dispose();
     }
 
-    private void ProcessEvents()
+    private void ProcessTraceEpochs()
     {
         try
         {
-            _eventSource!.Process();
+            while (State == ManagedSamplingSessionState.Running)
+            {
+                using var epochTimer = new Timer(
+                    static state => ((ManagedSamplingSession)state!).StopCurrentTraceEpoch(),
+                    this,
+                    _options.TraceRetentionDuration,
+                    Timeout.InfiniteTimeSpan);
+                _eventSource!.Process();
+                DisposeTraceEpoch();
+
+                if (State == ManagedSamplingSessionState.Running)
+                    CreateTraceEpoch();
+            }
         }
         catch (Exception exception) when (State is ManagedSamplingSessionState.Stopping or ManagedSamplingSessionState.Stopped)
         {
-            // Stopping the EventPipe session terminates the processing stream.
+            // Stopping an EventPipe epoch terminates its processing stream.
             _ = exception;
         }
         catch (Exception exception)
         {
             Volatile.Write(ref _fault, exception);
             Volatile.Write(ref _state, (int)ManagedSamplingSessionState.Faulted);
+            DisposeTraceEpoch();
             ReleaseGlobalOwnership();
         }
+    }
+
+    private void CreateTraceEpoch()
+    {
+        var providers = new List<EventPipeProvider>
+        {
+            new(
+                "Microsoft-Windows-DotNETRuntime",
+                EventLevel.Verbose,
+                (long)(ClrTraceEventParser.Keywords.Jit | ClrTraceEventParser.Keywords.Loader)),
+            new("Microsoft-DotNETCore-SampleProfiler", EventLevel.Informational)
+        };
+        var client = new DiagnosticsClient(Environment.ProcessId);
+        _eventPipeSession = client.StartEventPipeSession(
+            providers, requestRundown: false, _options.CircularBufferSizeMegabytes);
+        try
+        {
+            _eventSource = Microsoft.Diagnostics.Tracing.Etlx.TraceLog.CreateFromEventPipeSession(
+                _eventPipeSession,
+                Microsoft.Diagnostics.Tracing.Etlx.TraceLog.EventPipeRundownConfiguration.Enable(client));
+            _eventSource.AllEvents += OnAnyEvent;
+            Interlocked.Increment(ref _traceEpochCount);
+        }
+        catch
+        {
+            DisposeTraceEpoch();
+            throw;
+        }
+    }
+
+    private void StopCurrentTraceEpoch()
+    {
+        try
+        {
+            _eventPipeSession?.Stop();
+        }
+        catch (ServerNotAvailableException)
+        {
+            // The runtime may have already closed the stream during process shutdown.
+        }
+    }
+
+    private void DisposeTraceEpoch()
+    {
+        _eventSource?.Dispose();
+        _eventPipeSession?.Dispose();
+        _eventSource = null;
+        _eventPipeSession = null;
     }
 
     private void OnAnyEvent(TraceEvent traceEvent)
