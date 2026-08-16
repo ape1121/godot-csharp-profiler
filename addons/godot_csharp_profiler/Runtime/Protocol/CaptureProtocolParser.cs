@@ -84,9 +84,13 @@ public sealed class CaptureProtocolParser
         var modes = RequiredModes(f);
         var interval = RequiredInterval(f, "requestedSamplingIntervalNanoseconds", allowUnknown: true);
         if ((modes & CaptureModes.Sampling) == 0 && interval != 0) throw new InvalidWireException(true);
+        var include = RequiredOptionalString(f, "samplingIncludeAssemblies", ProtocolLimits.MaxConfigurationListCharacters);
+        var exclude = RequiredOptionalString(f, "samplingExcludeAssemblies", ProtocolLimits.MaxConfigurationListCharacters);
+        var manualPrefix = RequiredOptionalString(f, "manualLabelPrefix", ProtocolLimits.MaxManualLabelPrefixCharacters);
+        if (!ValidConfigurationList(include) || !ValidConfigurationList(exclude)) throw new InvalidWireException(true);
         return new(major, minor, token, RequiredLong(f, "generation", 1, long.MaxValue),
             RequiredFingerprint(f), modes, interval,
-            RequiredInt(f, "maxMethods", 1, ProtocolLimits.MaxConfiguredMethods));
+            RequiredInt(f, "maxMethods", 1, ProtocolLimits.MaxConfiguredMethods), include, exclude, manualPrefix);
     }
 
     private static StartMessage ParseStart(Dictionary<string, WireValue> f, int major, int minor, string token) =>
@@ -129,12 +133,13 @@ public sealed class CaptureProtocolParser
         var methods = new MethodSample[array.Items.Count];
         for (var index = 0; index < methods.Length; index++)
         {
-            if (array.Items[index] is not WireArray row || row.Items.Count != 3 ||
+            if (array.Items[index] is not WireArray row || row.Items.Count != 4 ||
                 row.Items[0] is not WireInteger method || method.Value < 0 ||
-                row.Items[1] is not WireInteger value || value.Value < 0 ||
-                row.Items[2] is not WireInteger calls || calls.Value < 0)
+                row.Items[1] is not WireString label || !ValidLabel(label.Value) ||
+                row.Items[2] is not WireInteger value || value.Value < 0 ||
+                row.Items[3] is not WireInteger calls || calls.Value < 0)
                 throw new InvalidWireException();
-            methods[index] = new MethodSample(method.Value, value.Value, calls.Value);
+            methods[index] = new MethodSample(method.Value, label.Value, value.Value, calls.Value);
         }
         return new(major, minor, token, RequiredLong(f, "generation", 1, long.MaxValue),
             RequiredLong(f, "sequence", 1, long.MaxValue), RequiredFingerprint(f), source,
@@ -185,6 +190,19 @@ public sealed class CaptureProtocolParser
             throw new InvalidWireException();
         return value;
     }
+
+    private static string RequiredOptionalString(Dictionary<string, WireValue> f, string name, int max)
+    {
+        if (!TryString(f, name, max, out var value) || value.Any(char.IsControl))
+            throw new InvalidWireException();
+        return value;
+    }
+
+    private static bool ValidConfigurationList(string value) => value.Length == 0 ||
+        value.Split(';').All(part => part.Length > 0 && part == part.Trim());
+
+    private static bool ValidLabel(string? value) => !string.IsNullOrEmpty(value) &&
+        value.Length <= ProtocolLimits.MaxMethodLabelCharacters && !value.Any(char.IsControl);
 
     private static bool RequiredBool(Dictionary<string, WireValue> f, string name)
     {

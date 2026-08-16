@@ -23,7 +23,16 @@ public sealed record RuntimeCaptureConfiguration(
     string Fingerprint,
     CaptureModes Modes,
     long RequestedSamplingIntervalNanoseconds,
-    int MaxMethods);
+    int MaxMethods,
+    string SamplingIncludeAssemblies,
+    string SamplingExcludeAssemblies,
+    string ManualLabelPrefix)
+{
+    public RuntimeCaptureConfiguration(long generation, string fingerprint, CaptureModes modes,
+        long requestedSamplingIntervalNanoseconds, int maxMethods)
+        : this(generation, fingerprint, modes, requestedSamplingIntervalNanoseconds, maxMethods,
+            string.Empty, string.Empty, string.Empty) { }
+}
 
 /// <summary>A source-specific batch. Sources are deliberately never combined.</summary>
 public sealed record RuntimeSourceBatch(

@@ -3,6 +3,7 @@
     <TargetFramework>net8.0</TargetFramework>
     <IsTestProject>true</IsTestProject>
     <Nullable>enable</Nullable>
+    <NoWarn>$(NoWarn);CS8600;CS8601;CS8618;CS8625</NoWarn>
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>
@@ -14,6 +15,9 @@
   </ItemGroup>
   <ItemGroup>
     <Compile Remove="../../addons/godot_csharp_profiler/Runtime/Protocol/Adapters/GodotDebuggerTransport.cs" />
-    <Compile Remove="../../addons/godot_csharp_profiler/Runtime/Protocol/Adapters/ProductionRuntimeCaptureBackend.cs" />
+    <Compile Include="../../addons/godot_csharp_profiler/Runtime/CsProfiler.cs" Link="Runtime/CsProfiler.cs" />
+    <Compile Include="../../addons/godot_csharp_profiler/Runtime/Instrumentation/InstrumentationRecorder.cs" Link="Runtime/Instrumentation/InstrumentationRecorder.cs" />
+    <Compile Include="../../addons/godot_csharp_profiler/Runtime/Sampling/SamplingOptions.cs" Link="Runtime/Sampling/SamplingOptions.cs" />
+    <Compile Include="../../addons/godot_csharp_profiler/Runtime/Sampling/SamplingSnapshot.cs" Link="Runtime/Sampling/SamplingSnapshot.cs" />
   </ItemGroup>
 </Project>

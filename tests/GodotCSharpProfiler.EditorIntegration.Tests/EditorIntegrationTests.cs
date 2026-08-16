@@ -2,6 +2,7 @@ using Apeworks.GodotCSharpProfiler.Editor.Installation;
 using Apeworks.GodotCSharpProfiler.Editor.Integration;
 using Apeworks.GodotCSharpProfiler.Editor.Modes;
 using Apeworks.GodotCSharpProfiler.Protocol;
+using Apeworks.GodotCSharpProfiler.Runtime.Protocol.Adapters;
 
 namespace GodotCSharpProfiler.EditorIntegration.Tests;
 
@@ -262,6 +263,87 @@ public sealed class EditorIntegrationTests
         Assert.False(sink.TryAccept(new string('m', 20_000), Array.Empty<object?>(), out _));
         Assert.InRange(view.Last.Status.Length, 1, 80);
     }
+
+    [Fact]
+    public void EditorRendersBoundedLabelsAndKeepsSameNumericIdsSeparateBySource()
+    {
+        var sent = new Queue<WireMap>();
+        var editor = ReadyEditor(sent);
+        Assert.True(editor.Start(TestConfiguration));
+        sent.Clear();
+        Assert.True(editor.Receive(State(CaptureState.Capturing, 1, QualityCounters.Zero)));
+        Assert.True(editor.Receive(Batch(CaptureSource.Sampling, 2, [new(1, "Game.Tick", 3, 0)])));
+        Assert.True(editor.Receive(Batch(CaptureSource.ManualSpans, 3, [new(1, "Gameplay/Tick", 2_000_000, 1)])));
+        Assert.True(editor.Stop());
+        Assert.True(editor.Receive(State(CaptureState.Complete, 5, new QualityCounters(2, 0, 0, 0))));
+
+        Assert.Equal("Game.Tick", editor.CompletedResults.Groups.Single(x => x.Source == CaptureSource.Sampling).Rows.Single().Name);
+        Assert.Equal("Gameplay/Tick", editor.CompletedResults.Groups.Single(x => x.Source == CaptureSource.ManualSpans).Rows.Single().Name);
+    }
+
+    [Fact]
+    public void LateRowOverflowAndIdentityConflictRejectWithoutAnyVisibleOrPendingMutation()
+    {
+        var sent = new Queue<WireMap>();
+        var editor = ReadyEditor(sent);
+        Assert.True(editor.Start(TestConfiguration));
+        sent.Clear();
+        Assert.True(editor.Receive(State(CaptureState.Capturing, 1, QualityCounters.Zero)));
+        Assert.True(editor.Receive(Batch(CaptureSource.Sampling, 2, [new(1, "Game.Tick", long.MaxValue, 0)])));
+        var before = editor.Snapshot;
+
+        Assert.False(editor.Receive(Batch(CaptureSource.Sampling, 3,
+            [new(2, "Game.Render", 7, 0), new(1, "Game.Tick", 1, 0)], new QualityCounters(8, 1, 1, 1))));
+        Assert.Equal(before, editor.Snapshot);
+        Assert.False(editor.Receive(Batch(CaptureSource.Sampling, 3,
+            [new(1, "Different.Method", 0, 0)])));
+        Assert.Equal(before, editor.Snapshot);
+
+        Assert.True(editor.Stop());
+        Assert.True(editor.Receive(State(CaptureState.Complete, 4, before.Quality)));
+        var rows = editor.CompletedResults.Groups.Single().Rows;
+        Assert.Single(rows);
+        Assert.Equal("Game.Tick", rows[0].Name);
+        Assert.Equal(long.MaxValue, rows[0].Samples);
+    }
+
+    [Fact]
+    public void TerminalZeroQualityCannotEraseAccumulatedBatchCounters()
+    {
+        var sent = new Queue<WireMap>();
+        var editor = ReadyEditor(sent);
+        Assert.True(editor.Start(TestConfiguration));
+        sent.Clear();
+        Assert.True(editor.Receive(State(CaptureState.Capturing, 1, QualityCounters.Zero)));
+        var quality = new QualityCounters(10, 2, 3, 4);
+        Assert.True(editor.Receive(Batch(CaptureSource.Sampling, 2, [new(1, "Game.Tick", 5, 0)], quality)));
+        Assert.True(editor.Stop());
+        Assert.True(editor.Receive(State(CaptureState.Complete, 4, QualityCounters.Zero)));
+        Assert.Equal(quality, editor.Snapshot.Quality);
+        Assert.Equal(5, editor.CompletedResults.Truncated);
+    }
+
+    private static ModeConfiguration TestConfiguration => ModeConfiguration.Default with { IncludeManual = true };
+
+    private static EditorCaptureCoordinator ReadyEditor(Queue<WireMap> sent)
+    {
+        var editor = new EditorCaptureCoordinator("owner", sent.Enqueue);
+        Assert.True(editor.Receive(StrictWireAdapter.Serialize(new HelloMessage(ProtocolVersion.Major, ProtocolVersion.Minor, "runtime", "runtime", 4096))));
+        Assert.True(editor.Receive(StrictWireAdapter.Serialize(new CapabilitiesMessage(ProtocolVersion.Major, ProtocolVersion.Minor, "runtime", 0,
+            CaptureModes.Sampling | CaptureModes.ManualScopes, true, 2_000_000, 4096, 4096, 8))));
+        return editor;
+    }
+
+    private static WireMap State(CaptureState state, long sequence, QualityCounters quality) =>
+        StrictWireAdapter.Serialize(new StateMessage(ProtocolVersion.Major, ProtocolVersion.Minor, "runtime", 1, sequence, TestConfiguration.Fingerprint,
+            state, CaptureSource.Sampling,
+            state == CaptureState.Complete ? CaptureCompleteness.Complete : CaptureCompleteness.InProgress,
+            PartialReason.None, quality));
+
+    private static WireMap Batch(CaptureSource source, long sequence, IReadOnlyList<MethodSample> methods,
+        QualityCounters? quality = null) => StrictWireAdapter.Serialize(new BatchMessage(ProtocolVersion.Major, ProtocolVersion.Minor, "runtime", 1,
+            sequence, TestConfiguration.Fingerprint, source, source != CaptureSource.Sampling, false,
+            quality ?? QualityCounters.Zero, methods));
 
     private static CaptureSnapshot Snapshot(CaptureState state) => new(
         state, "runtime", 1, 1, ModeConfiguration.Default.Fingerprint, null,

@@ -14,11 +14,14 @@ public sealed class ProductionRuntimeCaptureBackend : IRuntimeCaptureBackend
     private static ProductionRuntimeCaptureBackend? s_automaticOwner;
     private readonly Func<SamplingOptions, IManagedSamplingLease>? _samplingFactory;
     private readonly Dictionary<string, long> _manualIds = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, long> _samplingIds = new(StringComparer.Ordinal);
     private IManagedSamplingLease? _sampler;
     private CsProfiler.CaptureLease? _manualLease;
     private CaptureModes _modes;
     private int _maxMethods;
     private long _nextManualId = 1;
+    private long _nextSamplingId = 1;
+    private string _manualLabelPrefix = string.Empty;
     private InstrumentationManifest? _manifest;
     private bool _automatic;
     private bool _disposed;
@@ -49,11 +52,20 @@ public sealed class ProductionRuntimeCaptureBackend : IRuntimeCaptureBackend
         if ((configuration.Modes & ~Capabilities.Modes) != 0) { error = "Requested backend is unavailable."; return false; }
         _modes = configuration.Modes;
         _maxMethods = configuration.MaxMethods;
+        _manualIds.Clear();
+        _samplingIds.Clear();
+        _nextManualId = _nextSamplingId = 1;
+        _manualLabelPrefix = configuration.ManualLabelPrefix;
         try
         {
             if ((_modes & CaptureModes.Sampling) != 0)
             {
-                _sampler = _samplingFactory!(new SamplingOptions { MaxUniqueMethods = _maxMethods });
+                _sampler = _samplingFactory!(new SamplingOptions
+                {
+                    MaxUniqueMethods = _maxMethods,
+                    IncludeAssemblyPrefixes = SplitList(configuration.SamplingIncludeAssemblies),
+                    ExcludeAssemblyPrefixes = SplitList(configuration.SamplingExcludeAssemblies)
+                });
                 _sampler.Start();
             }
             if ((_modes & CaptureModes.AutomaticInstrumentation) != 0)
@@ -125,10 +137,25 @@ public sealed class ProductionRuntimeCaptureBackend : IRuntimeCaptureBackend
         _disposed = true;
     }
 
-    private RuntimeSourceBatch SamplingBatch(SamplingSnapshot snapshot) => new(CaptureSource.Sampling, false, false,
-        new QualityCounters(snapshot.Counters.SamplesAccepted, snapshot.Counters.DroppedSamples,
-            snapshot.Counters.DroppedMethods + snapshot.Counters.DroppedStacks, snapshot.Counters.IgnoredThreadSamples),
-        snapshot.Methods.Take(_maxMethods).Select(method => new MethodSample(method.Id, method.SampleCount, 0)).ToArray());
+    private RuntimeSourceBatch SamplingBatch(SamplingSnapshot snapshot)
+    {
+        var methods = new List<MethodSample>();
+        var overflowed = checked(snapshot.Counters.DroppedMethods + snapshot.Counters.DroppedStacks);
+        foreach (var method in snapshot.Methods.Take(_maxMethods))
+        {
+            var label = BoundLabel(method.Label);
+            var key = method.AssemblyName + "\0" + label;
+            if (!_samplingIds.TryGetValue(key, out var id))
+            {
+                if (_samplingIds.Count >= _maxMethods) { overflowed++; continue; }
+                _samplingIds[key] = id = _nextSamplingId++;
+            }
+            methods.Add(new MethodSample(id, label, method.SampleCount, 0));
+        }
+        return new(CaptureSource.Sampling, false, false,
+            new QualityCounters(snapshot.Counters.SamplesAccepted, snapshot.Counters.DroppedSamples,
+                overflowed, snapshot.Counters.IgnoredThreadSamples), methods);
+    }
 
     private RuntimeSourceBatch AutomaticBatch(InstrumentationRecorder.Snapshot snapshot)
     {
@@ -137,8 +164,9 @@ public sealed class ProductionRuntimeCaptureBackend : IRuntimeCaptureBackend
         foreach (var sample in snapshot.Samples)
         {
             // Resolve every recorder ID through the loaded manifest. Unknown IDs fail closed.
-            if (_manifest?.ResolveLabel(sample.MethodId) is null) { invalid++; continue; }
-            methods.Add(new MethodSample(sample.MethodId, TicksToNanoseconds(sample.TotalTicks), sample.Calls));
+            var label = _manifest?.ResolveLabel(sample.MethodId);
+            if (label is null) { invalid++; continue; }
+            methods.Add(new MethodSample(sample.MethodId, BoundLabel(label), TicksToNanoseconds(sample.TotalTicks), sample.Calls));
             if (methods.Count == _maxMethods) break;
         }
         return new(CaptureSource.AutomaticSpans, true, false,
@@ -148,17 +176,32 @@ public sealed class ProductionRuntimeCaptureBackend : IRuntimeCaptureBackend
     private RuntimeSourceBatch ManualBatch(CsProfiler.FrameSnapshot snapshot)
     {
         var methods = new List<MethodSample>();
+        var overflowed = snapshot.TruncatedLabels;
         for (var index = 0; index < snapshot.Names.Length && methods.Count < _maxMethods; index++)
         {
-            var label = snapshot.Names[index];
-            if (!_manualIds.TryGetValue(label, out var id)) _manualIds[label] = id = _nextManualId++;
-            methods.Add(new MethodSample(id, checked(snapshot.TotalUsec[index] * 1_000), snapshot.Calls[index]));
+            var label = BoundLabel(_manualLabelPrefix + snapshot.Names[index]);
+            if (!_manualIds.TryGetValue(label, out var id))
+            {
+                if (_manualIds.Count >= _maxMethods) { overflowed++; continue; }
+                _manualIds[label] = id = _nextManualId++;
+            }
+            methods.Add(new MethodSample(id, label, checked(snapshot.TotalUsec[index] * 1_000), snapshot.Calls[index]));
         }
         return new(CaptureSource.ManualSpans, true, false,
-            new QualityCounters(methods.Sum(method => method.Calls), snapshot.DroppedScopes, snapshot.TruncatedLabels, 0), methods);
+            new QualityCounters(methods.Sum(method => method.Calls), snapshot.DroppedScopes, overflowed, 0), methods);
     }
 
     private static long TicksToNanoseconds(long ticks) => checked((long)(ticks * (1_000_000_000.0 / Stopwatch.Frequency)));
+
+    private static string[] SplitList(string value) => string.IsNullOrEmpty(value)
+        ? Array.Empty<string>() : value.Split(';', StringSplitOptions.RemoveEmptyEntries);
+
+    private static string BoundLabel(string value)
+    {
+        value = new string((value ?? string.Empty).Where(character => !char.IsControl(character)).ToArray());
+        if (value.Length == 0) value = "(unknown method)";
+        return value[..Math.Min(value.Length, ProtocolLimits.MaxMethodLabelCharacters)];
+    }
 
     private static InstrumentationManifest? FindManifest()
     {

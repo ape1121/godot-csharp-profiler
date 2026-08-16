@@ -48,8 +48,10 @@ public sealed class RuntimeCaptureCoordinatorTests
     public void MixedSourcesRemainSeparateAndNeverSumSemantics()
     {
         var (runtime, transport, backend) = Runtime(CaptureModes.AutomaticInstrumentation | CaptureModes.ManualScopes);
-        backend.Pending.Add(new(CaptureSource.AutomaticSpans, true, false, QualityCounters.Zero, [new(7, 50, 2)]));
-        backend.Pending.Add(new(CaptureSource.ManualSpans, true, false, QualityCounters.Zero, [new(7, 90, 1)]));
+        backend.Pending.Add(new(CaptureSource.AutomaticSpans, true, false, QualityCounters.Zero,
+            [new(7, "Game.Run", 50, 2)]));
+        backend.Pending.Add(new(CaptureSource.ManualSpans, true, false, QualityCounters.Zero,
+            [new(7, "Gameplay/Run", 90, 1)]));
         runtime.Connect();
         Assert.True(runtime.Receive(Configure(1, CaptureModes.AutomaticInstrumentation | CaptureModes.ManualScopes), "owner"));
         Assert.True(runtime.Receive(Start(1), "owner"));
@@ -65,7 +67,8 @@ public sealed class RuntimeCaptureCoordinatorTests
     {
         var (runtime, transport, backend) = Runtime();
         backend.Pending.Add(new(CaptureSource.ManualSpans, true, false, QualityCounters.Zero,
-            Enumerable.Range(0, 25).Select(i => new MethodSample(i, i, 1)).ToArray()));
+            Enumerable.Range(0, 25).Select(i => new MethodSample(i,
+                new string((char)('a' + i % 26), ProtocolLimits.MaxMethodLabelCharacters), i, 1)).ToArray()));
         runtime.Connect();
         Assert.True(runtime.Receive(Configure(1, CaptureModes.ManualScopes, maxMethods: 4), "owner"));
         Assert.True(runtime.Receive(Start(1), "owner"));
@@ -74,6 +77,39 @@ public sealed class RuntimeCaptureCoordinatorTests
         Assert.Equal(7, batches.Length);
         Assert.All(batches, batch => Assert.InRange(batch.Methods.Count, 1, 4));
         Assert.All(transport.Messages, message => Assert.True(StrictWireAdapter.MeasureBytes(message) <= ProtocolLimits.MaxPayloadBytes));
+    }
+
+    [Fact]
+    public void ConfigureTransportsSamplingFiltersAndManualPrefixToBackend()
+    {
+        var (runtime, _, backend) = Runtime();
+        runtime.Connect();
+        Assert.True(runtime.Receive(Configure(1, CaptureModes.Sampling | CaptureModes.ManualScopes,
+            include: "Game;Core", exclude: "System", manualPrefix: "Gameplay/"), "owner"));
+        Assert.True(runtime.Receive(Start(1), "owner"));
+        Assert.Equal("Game;Core", backend.LastConfiguration!.SamplingIncludeAssemblies);
+        Assert.Equal("System", backend.LastConfiguration.SamplingExcludeAssemblies);
+        Assert.Equal("Gameplay/", backend.LastConfiguration.ManualLabelPrefix);
+    }
+
+    [Fact]
+    public void SplitBatchEmitsQualityOnceAndTerminalPreservesAccumulatedCounters()
+    {
+        var (runtime, transport, backend) = Runtime();
+        var quality = new QualityCounters(9, 2, 3, 4);
+        backend.Pending.Add(new(CaptureSource.ManualSpans, true, false, quality,
+            Enumerable.Range(0, 9).Select(i => new MethodSample(i,
+                new string('x', ProtocolLimits.MaxMethodLabelCharacters), 1, 1)).ToArray()));
+        runtime.Connect();
+        Assert.True(runtime.Receive(Configure(1, CaptureModes.ManualScopes, maxMethods: 2), "owner"));
+        Assert.True(runtime.Receive(Start(1), "owner"));
+        runtime.Flush();
+        Assert.True(runtime.Receive(Stop(1, runtime.Sequence + 1), "owner"));
+
+        var batches = transport.Parsed.OfType<BatchMessage>().ToArray();
+        Assert.Equal(quality, batches.Select(batch => batch.Quality)
+            .Aggregate(QualityCounters.Zero, (sum, delta) => sum.Add(delta)));
+        Assert.Equal(quality, transport.Parsed.OfType<StateMessage>().Last().Quality);
     }
 
     [Fact]
@@ -123,11 +159,13 @@ public sealed class RuntimeCaptureCoordinatorTests
         return (new RuntimeCaptureCoordinator(Token, transport, backend), transport, backend);
     }
 
-    private static WireMap Configure(long generation, CaptureModes modes, int maxMethods = 64) =>
-        StrictWireAdapter.Serialize(new ConfigureMessage(1, 0, Token, generation, Fingerprint, modes, 0, maxMethods));
-    private static WireMap Start(long generation) => StrictWireAdapter.Serialize(new StartMessage(1, 0, Token, generation, Fingerprint));
+    private static WireMap Configure(long generation, CaptureModes modes, int maxMethods = 64,
+        string include = "", string exclude = "", string manualPrefix = "") =>
+        StrictWireAdapter.Serialize(new ConfigureMessage(ProtocolVersion.Major, ProtocolVersion.Minor, Token, generation, Fingerprint, modes, 0,
+            maxMethods, include, exclude, manualPrefix));
+    private static WireMap Start(long generation) => StrictWireAdapter.Serialize(new StartMessage(ProtocolVersion.Major, ProtocolVersion.Minor, Token, generation, Fingerprint));
     private static WireMap Stop(long generation, long sequence, string fingerprint = Fingerprint) =>
-        StrictWireAdapter.Serialize(new StopMessage(1, 0, Token, generation, sequence, fingerprint));
+        StrictWireAdapter.Serialize(new StopMessage(ProtocolVersion.Major, ProtocolVersion.Minor, Token, generation, sequence, fingerprint));
 
     private sealed class FakeTransport : IRuntimeCaptureTransport
     {
@@ -147,8 +185,9 @@ public sealed class RuntimeCaptureCoordinatorTests
         public int Starts { get; private set; }
         public int Stops { get; private set; }
         public List<RuntimeSourceBatch> Pending { get; } = [];
+        public RuntimeCaptureConfiguration? LastConfiguration { get; private set; }
         public bool TryStart(RuntimeCaptureConfiguration configuration, string owner, out string? error)
-        { _ = configuration; _ = owner; error = null; Starts++; IsActive = true; return true; }
+        { LastConfiguration = configuration; _ = owner; error = null; Starts++; IsActive = true; return true; }
         public IReadOnlyList<RuntimeSourceBatch> Drain() { var value = Pending.ToArray(); Pending.Clear(); return value; }
         public IReadOnlyList<RuntimeSourceBatch> Stop() { if (!IsActive) return []; Stops++; IsActive = false; return Drain(); }
         public void Dispose() { if (IsActive) Stop(); }

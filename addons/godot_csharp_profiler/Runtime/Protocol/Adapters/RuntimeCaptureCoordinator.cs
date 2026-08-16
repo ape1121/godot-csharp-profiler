@@ -14,6 +14,7 @@ public sealed class RuntimeCaptureCoordinator : IDisposable
     private string? _owner;
     private long _generation;
     private long _sequence;
+    private QualityCounters _quality;
     private bool _connected;
     private bool _disposed;
 
@@ -38,9 +39,9 @@ public sealed class RuntimeCaptureCoordinator : IDisposable
         ThrowIfDisposed();
         if (_connected) return;
         _connected = true;
-        Send(new HelloMessage(1, 0, _runtimeToken, "runtime", ProtocolLimits.MaxBatchBytes));
+        Send(new HelloMessage(ProtocolVersion.Major, ProtocolVersion.Minor, _runtimeToken, "runtime", ProtocolLimits.MaxBatchBytes));
         var c = _backend.Capabilities;
-        Send(new CapabilitiesMessage(1, 0, _runtimeToken, 0, c.Modes,
+        Send(new CapabilitiesMessage(ProtocolVersion.Major, ProtocolVersion.Minor, _runtimeToken, 0, c.Modes,
             c.SamplingIntervalRuntimeConfigurable, c.EffectiveSamplingIntervalNanoseconds,
             c.MaxMethods, ProtocolLimits.MaxBatchBytes, ProtocolLimits.MaxDepth));
     }
@@ -92,9 +93,11 @@ public sealed class RuntimeCaptureCoordinator : IDisposable
             (message.Modes & ~_backend.Capabilities.Modes) != 0 || !ValidModes(message.Modes) ||
             message.MaxMethods > _backend.Capabilities.MaxMethods || !ValidInterval(message)) return false;
         _configuration = new RuntimeCaptureConfiguration(message.Generation, message.Fingerprint,
-            message.Modes, message.RequestedSamplingIntervalNanoseconds, message.MaxMethods);
+            message.Modes, message.RequestedSamplingIntervalNanoseconds, message.MaxMethods,
+            message.SamplingIncludeAssemblies, message.SamplingExcludeAssemblies, message.ManualLabelPrefix);
         _generation = message.Generation;
         _sequence = 0;
+        _quality = QualityCounters.Zero;
         return true;
     }
 
@@ -139,7 +142,7 @@ public sealed class RuntimeCaptureCoordinator : IDisposable
             EmitBatches(final);
             var completeness = reason == PartialReason.None ? CaptureCompleteness.Complete : CaptureCompleteness.Partial;
             var state = reason == PartialReason.None ? CaptureState.Complete : CaptureState.Partial;
-            SendState(state, completeness, reason, SourceForState(), QualityCounters.Zero);
+            SendState(state, completeness, reason, SourceForState(), _quality);
         }
         _owner = null;
     }
@@ -150,7 +153,11 @@ public sealed class RuntimeCaptureCoordinator : IDisposable
         foreach (var batch in batches)
         {
             if (!ValidBatch(batch)) continue;
+            QualityCounters nextQuality;
+            try { nextQuality = _quality.Add(batch.Quality); }
+            catch (OverflowException) { continue; }
             var offset = 0;
+            var firstChunk = true;
             do
             {
                 var remaining = batch.Methods.Count - offset;
@@ -159,20 +166,22 @@ public sealed class RuntimeCaptureCoordinator : IDisposable
                 while (count > 0 && !Fits(batch, offset, count)) count /= 2;
                 if (remaining > 0 && count == 0) break;
                 var methods = batch.Methods.Skip(offset).Take(count).ToArray();
-                Send(new BatchMessage(1, 0, _runtimeToken, _generation, ++_sequence,
+                Send(new BatchMessage(ProtocolVersion.Major, ProtocolVersion.Minor, _runtimeToken, _generation, ++_sequence,
                     _configuration.Fingerprint, batch.Source, batch.ExactCalls, batch.CpuTime,
-                    batch.Quality, methods));
+                    firstChunk ? batch.Quality : QualityCounters.Zero, methods));
+                firstChunk = false;
                 offset += count;
                 if (remaining == 0) break;
             } while (offset < batch.Methods.Count);
+            if (!firstChunk) _quality = nextQuality;
         }
     }
 
     private bool Fits(RuntimeSourceBatch batch, int offset, int count)
     {
-        var message = new BatchMessage(1, 0, _runtimeToken, _generation, _sequence + 1,
+        var message = new BatchMessage(ProtocolVersion.Major, ProtocolVersion.Minor, _runtimeToken, _generation, _sequence + 1,
             _configuration!.Fingerprint, batch.Source, batch.ExactCalls, batch.CpuTime,
-            batch.Quality, batch.Methods.Skip(offset).Take(count).ToArray());
+            QualityCounters.Zero, batch.Methods.Skip(offset).Take(count).ToArray());
         return StrictWireAdapter.MeasureBytes(StrictWireAdapter.Serialize(message)) <= ProtocolLimits.MaxBatchBytes;
     }
 
@@ -183,14 +192,16 @@ public sealed class RuntimeCaptureCoordinator : IDisposable
             return false;
         if (batch.Source == CaptureSource.Sampling ? batch.ExactCalls || batch.CpuTime : !batch.ExactCalls || batch.CpuTime)
             return false;
-        return batch.Methods.All(method => method.MethodId >= 0 && method.Value >= 0 && method.Calls >= 0);
+        return batch.Methods.All(method => method.MethodId >= 0 && method.Value >= 0 && method.Calls >= 0 &&
+            !string.IsNullOrEmpty(method.Label) && method.Label.Length <= ProtocolLimits.MaxMethodLabelCharacters &&
+            !method.Label.Any(char.IsControl));
     }
 
     private void SendState(CaptureState state, CaptureCompleteness completeness, PartialReason reason,
-        CaptureSource source, QualityCounters quality) => Send(new StateMessage(1, 0, _runtimeToken,
+        CaptureSource source, QualityCounters quality) => Send(new StateMessage(ProtocolVersion.Major, ProtocolVersion.Minor, _runtimeToken,
         _generation, ++_sequence, _configuration!.Fingerprint, state, source, completeness, reason, quality));
 
-    private void SendError(int code, string message, bool fatal) => Send(new ErrorMessage(1, 0, _runtimeToken,
+    private void SendError(int code, string message, bool fatal) => Send(new ErrorMessage(ProtocolVersion.Major, ProtocolVersion.Minor, _runtimeToken,
         _generation, ++_sequence, code, BoundError(message), fatal));
 
     private void Send(ProtocolMessage message) => _transport.Send(StrictWireAdapter.Serialize(message));

@@ -33,7 +33,10 @@ public static class StrictWireAdapter
             case ConfigureMessage value:
                 fields.Add(Field("generation", value.Generation)); fields.Add(Field("fingerprint", value.Fingerprint));
                 fields.Add(Field("modes", (long)value.Modes)); fields.Add(Field("requestedSamplingIntervalNanoseconds", value.RequestedSamplingIntervalNanoseconds));
-                fields.Add(Field("maxMethods", value.MaxMethods)); break;
+                fields.Add(Field("maxMethods", value.MaxMethods));
+                fields.Add(Field("samplingIncludeAssemblies", value.SamplingIncludeAssemblies));
+                fields.Add(Field("samplingExcludeAssemblies", value.SamplingExcludeAssemblies));
+                fields.Add(Field("manualLabelPrefix", value.ManualLabelPrefix)); break;
             case StartMessage value:
                 fields.Add(Field("generation", value.Generation)); fields.Add(Field("fingerprint", value.Fingerprint)); break;
             case StopMessage value:
@@ -50,7 +53,7 @@ public static class StrictWireAdapter
                 fields.Add(Field("generation", value.Generation)); fields.Add(Field("sequence", value.Sequence)); fields.Add(Field("fingerprint", value.Fingerprint));
                 fields.Add(Field("source", (long)value.Source)); fields.Add(Field("exactCalls", value.ExactCalls)); fields.Add(Field("cpuTime", value.CpuTime));
                 AddQuality(fields, value.Quality);
-                fields.Add(Field("methods", new WireArray(value.Methods.Select(method => (WireValue)new WireArray([method.MethodId, method.Value, method.Calls])))));
+                fields.Add(Field("methods", new WireArray(value.Methods.Select(method => (WireValue)new WireArray([method.MethodId, method.Label, method.Value, method.Calls])))));
                 break;
             default: throw new ArgumentOutOfRangeException(nameof(message));
         }
