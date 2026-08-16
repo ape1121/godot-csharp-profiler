@@ -29,12 +29,20 @@ jobs:
       - name: Test
         shell: pwsh
         run: ./scripts/test-all.ps1
+      - name: Release cleanup regression
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: POWERSHELL_EXE="$(command -v pwsh)" ./scripts/test-release-cleanup.sh
       - name: Build and validate package
         shell: pwsh
-        run: ./scripts/build-release.ps1 -Version 0.1.0-ci -SkipTests
+        run: |
+          $pwsh = (Get-Process -Id $PID).Path
+          ./scripts/build-release.ps1 -Version 0.1.0-ci -PowerShellExecutable $pwsh
       - name: Packaging tests
         shell: pwsh
-        run: dotnet run --project tests/GodotCSharpProfiler.Packaging.Tests/GodotCSharpProfiler.Packaging.Tests.csproj -c Release -- --archive artifacts/release/godot-csharp-profiler-0.1.0-ci.zip
+        run: |
+          $pwsh = (Get-Process -Id $PID).Path
+          dotnet run --project tests/GodotCSharpProfiler.Packaging.Tests/GodotCSharpProfiler.Packaging.Tests.csproj -c Release -- --archive artifacts/release/godot-csharp-profiler-0.1.0-ci.zip --powershell $pwsh
       - uses: actions/upload-artifact@v4
         if: matrix.os == 'ubuntu-latest'
         with:

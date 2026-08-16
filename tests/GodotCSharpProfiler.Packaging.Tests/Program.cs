@@ -5,9 +5,18 @@ using System.Text;
 using System.Text.RegularExpressions;
 
 var archiveArg = Array.IndexOf(args, "--archive");
-if (archiveArg < 0 || archiveArg + 1 == args.Length) throw new ArgumentException("Use --archive <zip>.");
+if (archiveArg < 0 || archiveArg + 1 == args.Length) throw new ArgumentException("Use --archive <zip> [--powershell <path>].");
 var path = Path.GetFullPath(args[archiveArg + 1]);
 if (!File.Exists(path)) throw new FileNotFoundException(path);
+
+var powershellArg = Array.IndexOf(args, "--powershell");
+if (powershellArg >= 0 && powershellArg + 1 == args.Length)
+    throw new ArgumentException("Use --powershell <path>.");
+var requestedPowerShell = powershellArg >= 0
+    ? args[powershellArg + 1]
+    : Environment.GetEnvironmentVariable("POWERSHELL_EXE");
+var shell = ResolveExecutable(requestedPowerShell, OperatingSystem.IsWindows() ? "pwsh.exe" : "pwsh")
+    ?? throw new InvalidOperationException("PowerShell prerequisite missing: install pwsh, set POWERSHELL_EXE, or pass --powershell <path>.");
 
 using (var zip = ZipFile.OpenRead(path))
 {
@@ -36,8 +45,6 @@ using (var zip = ZipFile.OpenRead(path))
     Assert(new FileInfo(path).Length < 25 * 1024 * 1024, "Archive exceeds 25 MiB safety budget.");
 }
 
-var shell = FindOnPath(OperatingSystem.IsWindows() ? "pwsh.exe" : "pwsh")
-    ?? throw new InvalidOperationException("pwsh is required for package install/remove roundtrip tests.");
 foreach (var implicitUsings in new[] { "enable", "disable" })
     TestExtractedProject(path, shell, implicitUsings);
 Console.WriteLine($"Validated archive and clean-project matrix (ImplicitUsings enable/disable), {new FileInfo(path).Length} bytes: {path}");
@@ -113,12 +120,26 @@ static void Run(string file, string arguments, string workingDirectory, string p
         throw new InvalidOperationException($"{purpose} exited {process.ExitCode}, expected {expectedExitCode}.\n{stdout.Result}\n{stderr.Result}");
 }
 
+static string? ResolveExecutable(string? requested, string defaultName)
+{
+    if (!string.IsNullOrWhiteSpace(requested))
+    {
+        if (requested.Contains(Path.DirectorySeparatorChar) || requested.Contains(Path.AltDirectorySeparatorChar))
+        {
+            var fullPath = Path.GetFullPath(requested);
+            return File.Exists(fullPath) ? fullPath : null;
+        }
+        return FindOnPath(requested);
+    }
+    return FindOnPath(defaultName);
+}
+
 static string? FindOnPath(string name)
 {
-    foreach (var directory in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator))
+    foreach (var directory in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
     {
         var candidate = Path.Combine(directory, name);
-        if (File.Exists(candidate)) return candidate;
+        if (File.Exists(candidate)) return Path.GetFullPath(candidate);
     }
     return null;
 }
