@@ -12,6 +12,8 @@ public sealed class ProjectInstaller
     public const string ProfilerFodyVersion = "0.1.0-dev";
     public const string OwnershipElementName = "GodotCSharpProfilerInstallation";
     public const string ReferenceOwnershipElementName = "GodotCSharpProfilerOwned";
+    public const string PackageSourceElementName = "GodotCSharpProfilerPackageSource";
+    public const string RestoreSourcesElementName = "RestoreAdditionalProjectSources";
 
     private const string WeaversPath = "FodyWeavers.xml";
     private readonly string root;
@@ -73,7 +75,7 @@ public sealed class ProjectInstaller
 
         EnsureCompatiblePackageReference(project, "Fody", FodyVersion, id);
         EnsureCompatiblePackageReference(project, "GodotCSharpProfiler.Fody", ProfilerFodyVersion, id);
-        EnsureProjectOwnershipMarker(project, id);
+        EnsureProjectOwnershipMarker(project, id, LocalFeedProjectPath());
         AddChange(changes, Relative(projectPath), projectBytes, SaveXml(project, projectBytes));
 
         var weaversPath = SafePath(WeaversPath);
@@ -106,7 +108,12 @@ public sealed class ProjectInstaller
             if (owned) reference.Remove();
         }
         foreach (var marker in project.Descendants().Where(e => e.Name.LocalName == OwnershipElementName &&
-                     string.Equals(e.Value, id.Value.ToString("D"), StringComparison.OrdinalIgnoreCase)).ToArray()) marker.Remove();
+                     string.Equals(e.Value, id.Value.ToString("D"), StringComparison.OrdinalIgnoreCase)).ToArray())
+        {
+            var group = marker.Parent;
+            group?.Elements().Where(e => e.Name.LocalName is PackageSourceElementName or RestoreSourcesElementName).Remove();
+            marker.Remove();
+        }
         RemoveEmptyGroups(project);
         AddChange(changes, Relative(projectPath), projectBytes, SaveXml(project, projectBytes));
 
@@ -187,11 +194,46 @@ public sealed class ProjectInstaller
                 new XElement(ns + ReferenceOwnershipElementName, id.ToString("D")))));
     }
 
-    private static void EnsureProjectOwnershipMarker(XDocument project, Guid id)
+    private static void EnsureProjectOwnershipMarker(XDocument project, Guid id, string localFeed)
     {
-        if (ReadOwnedInstallationId(project) is not null) return;
         var ns = project.Root!.Name.Namespace;
-        project.Root.Add(new XElement(ns + "PropertyGroup", new XElement(ns + OwnershipElementName, id.ToString("D"))));
+        var marker = project.Descendants().SingleOrDefault(e => e.Name.LocalName == OwnershipElementName);
+        XElement group;
+        if (marker is null)
+        {
+            group = new XElement(ns + "PropertyGroup", new XElement(ns + OwnershipElementName, id.ToString("D")));
+            project.Root.Add(group);
+        }
+        else
+        {
+            group = marker.Parent ?? throw new InstallationRefusedException("The installation marker has no property group.");
+        }
+        SetOwnedProperty(group, ns + PackageSourceElementName, localFeed);
+        SetOwnedProperty(group, ns + RestoreSourcesElementName,
+            $"$(RestoreAdditionalProjectSources);$({PackageSourceElementName})");
+    }
+
+    private static void SetOwnedProperty(XElement group, XName name, string value)
+    {
+        var elements = group.Elements().Where(e => e.Name.LocalName == name.LocalName).ToArray();
+        if (elements.Length > 1) throw new InstallationRefusedException($"Multiple owned {name.LocalName} properties are ambiguous.");
+        if (elements.Length == 0) group.Add(new XElement(name, value));
+        else elements[0].Value = value;
+    }
+
+    private string LocalFeedProjectPath()
+    {
+        if (packageSources.LocalPackagePaths.Count != 1)
+            throw new InstallationRefusedException("Exactly one bundled profiler package path is required.");
+        var package = Path.GetFullPath(packageSources.LocalPackagePaths[0]);
+        var expected = $"GodotCSharpProfiler.Fody.{ProfilerFodyVersion}.nupkg";
+        if (!string.Equals(Path.GetFileName(package), expected, StringComparison.OrdinalIgnoreCase))
+            throw new InstallationRefusedException("The bundled profiler package filename does not match the required version.");
+        var feed = Path.GetDirectoryName(package) ?? throw new InstallationRefusedException("The bundled package has no source directory.");
+        var relative = Path.GetRelativePath(root, feed).Replace('\\', '/');
+        if (relative is "." or "" || relative == ".." || relative.StartsWith("../", StringComparison.Ordinal))
+            throw new InstallationRefusedException("The bundled package source must be inside the project root.");
+        return relative;
     }
 
     private static Guid? ReadOwnedInstallationId(XDocument project)

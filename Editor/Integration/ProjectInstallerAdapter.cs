@@ -10,6 +10,7 @@ namespace Apeworks.GodotCSharpProfiler.Editor.Integration;
 public sealed class ProjectInstallerAdapter : IAutomaticInstaller
 {
     private readonly string projectRoot;
+    private readonly PackageSourcePlan packageSources;
     private readonly Func<ProjectInstaller, InstallationPreview> previewFactory;
     private readonly Func<ProjectInstaller, InstallationPreview, InstallationResult> applyFactory;
     private readonly Func<bool> packageAvailable;
@@ -18,41 +19,51 @@ public sealed class ProjectInstallerAdapter : IAutomaticInstaller
     private string? token;
 
     public ProjectInstallerAdapter(ProjectInstaller installer, Func<bool>? packageAvailable = null)
-        : this("", _ => installer.PreviewInstall(), (_, value) => installer.Apply(value),
+        : this("", PackageSourcePlan.Empty, _ => installer.PreviewInstall(), (_, value) => installer.Apply(value),
             packageAvailable)
     {
         applyingInstaller = installer ?? throw new ArgumentNullException(nameof(installer));
     }
 
-    public ProjectInstallerAdapter(string projectRoot, Func<bool>? packageAvailable = null)
-        : this(projectRoot, installer => installer.PreviewInstall(),
+    public ProjectInstallerAdapter(string projectRoot, string profilerPackagePath,
+        Func<bool>? packageAvailable = null)
+        : this(projectRoot, new PackageSourcePlan([Path.GetFullPath(profilerPackagePath)]),
+            installer => installer.PreviewInstall(),
             (installer, value) => installer.Apply(value), packageAvailable)
     {
     }
 
-    private ProjectInstallerAdapter(string projectRoot,
+    private ProjectInstallerAdapter(string projectRoot, PackageSourcePlan packageSources,
         Func<ProjectInstaller, InstallationPreview> previewFactory,
         Func<ProjectInstaller, InstallationPreview, InstallationResult> applyFactory,
         Func<bool>? packageAvailable)
     {
         this.projectRoot = projectRoot;
+        this.packageSources = packageSources;
         this.previewFactory = previewFactory;
         this.applyFactory = applyFactory;
         this.packageAvailable = packageAvailable ?? (() => true);
     }
 
     public InstallerPreviewResult Preview(AutomaticSettings automatic)
+        => PreviewCore(automatic, uninstall: false);
+
+    public InstallerPreviewResult PreviewUninstall()
+        => PreviewCore(null, uninstall: true);
+
+    private InstallerPreviewResult PreviewCore(AutomaticSettings? automatic, bool uninstall)
     {
         preview = null;
         token = null;
-        if (!packageAvailable())
+        if (!uninstall && !packageAvailable())
             return new InstallerPreviewResult(InstallerGate.PackageUnavailable, null, "", 0);
         try
         {
             var installer = string.IsNullOrEmpty(projectRoot)
                 ? applyingInstaller!
-                : new ProjectInstaller(projectRoot, settings: SettingsFor(automatic));
-            var candidate = previewFactory(installer);
+                : new ProjectInstaller(projectRoot, packageSources: packageSources,
+                    settings: automatic is null ? null : SettingsFor(automatic));
+            var candidate = uninstall ? installer.PreviewUninstall() : previewFactory(installer);
             var candidateToken = Token(candidate);
             applyingInstaller = installer;
             preview = candidate;

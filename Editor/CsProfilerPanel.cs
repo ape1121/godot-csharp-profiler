@@ -81,6 +81,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private VBoxContainer _automaticSettings;
     private VBoxContainer _manualSettings;
     private Button _previewInstallButton;
+    private Button _previewUninstallButton;
     private Button _applyInstallButton;
     private TextEdit _previewDiff;
     private TabContainer _resultTabs;
@@ -241,7 +242,9 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         {
             var projectRoot = ProjectSettings.GlobalizePath("res://");
             _ = ProjectInstaller.DiscoverProject(projectRoot);
-            return new ProjectInstallerAdapter(projectRoot);
+            var package = ProjectSettings.GlobalizePath(
+                $"res://addons/godot_csharp_profiler/assets/nuget/GodotCSharpProfiler.Fody.{ProjectInstaller.ProfilerFodyVersion}.nupkg");
+            return new ProjectInstallerAdapter(projectRoot, package, () => File.Exists(package));
         }
         catch (Exception error) when (error is InstallationRefusedException or
                                       ArgumentException or IOException or UnauthorizedAccessException)
@@ -275,6 +278,9 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _previewInstallButton = new Button { Text = "Preview Install" };
         _previewInstallButton.Pressed += PreviewAutomaticInstall;
         installCommands.AddChild(_previewInstallButton);
+        _previewUninstallButton = new Button { Text = "Preview Uninstall" };
+        _previewUninstallButton.Pressed += PreviewAutomaticUninstall;
+        installCommands.AddChild(_previewUninstallButton);
         _applyInstallButton = new Button { Text = "Apply Confirmed", Disabled = true,
             TooltipText = "Review the diff, then click to explicitly confirm Apply." };
         _applyInstallButton.Pressed += ApplyAutomaticInstall;
@@ -329,6 +335,13 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             _applyInstallButton.TooltipText = "Reviewed " + preview.ChangeCount +
                 " change(s). Click to explicitly confirm Apply.";
         }
+    }
+
+    private void PreviewAutomaticUninstall()
+    {
+        var preview = _controller.PreviewAutomaticUninstall();
+        _pendingPreviewToken = preview?.Token;
+        _applyInstallButton.Disabled = string.IsNullOrEmpty(_pendingPreviewToken);
     }
 
     private void ApplyAutomaticInstall()
