@@ -1,3 +1,4 @@
+#nullable enable
 namespace Apeworks.GodotCSharpProfiler.Editor.Installation;
 
 public sealed class InstallationRefusedException : InvalidOperationException
