@@ -1,13 +1,13 @@
 #if TOOLS
 using Apeworks.GodotCSharpProfiler;
 using Apeworks.GodotCSharpProfiler.Editor.Integration;
+using Apeworks.GodotCSharpProfiler.Protocol;
 using Apeworks.GodotCSharpProfiler.Runtime.Protocol.Adapters;
 using Godot;
 using System;
 using System.Collections.Generic;
 using System.Linq;
 
-[Tool]
 public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
 {
     private CsProfilerPanel _panel;
@@ -209,4 +209,6 @@ internal sealed class CsProfilerSessionRouterState
     public void Clear() { _identities.Clear(); SelectedSessionId = -1; }
     public void Forget(int sessionId) => _identities.Remove(sessionId);
 }
+#else
+public partial class CsProfilerDebuggerPlugin : Godot.Node { }
 #endif

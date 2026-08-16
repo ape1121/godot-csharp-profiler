@@ -211,4 +211,6 @@ public partial class CsProfilerFrameGraph : Control
         }
     }
 }
+#else
+public partial class CsProfilerFrameGraph : Godot.Control { }
 #endif
