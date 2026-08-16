@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <PackageId>GodotCSharpProfiler.Fody</PackageId>
+    <Description>Build-only Fody automatic instrumentation for GodotCSharpProfiler.</Description>
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+    <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
+    <NoWarn>$(NoWarn);NU5100;NU5128</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- FodyHelpers 6.9.3 carries Fody's signed Mono.Cecil 0.11.6 build. -->
+    <PackageReference Include="FodyHelpers" Version="6.9.3" PrivateAssets="all" />
+    <None Include="$(TargetPath)" Pack="true" PackagePath="weaver/" Visible="false" />
+    <None Include="build/GodotCSharpProfiler.Fody.props" Pack="true" PackagePath="build/GodotCSharpProfiler.Fody.props" />
+    <None Include="$(NuGetPackageRoot)fodyhelpers/6.9.3/lib/netstandard2.0/FodyHelpers.dll" Pack="true" PackagePath="weaver/" Visible="false" />
+    <None Include="$(NuGetPackageRoot)fodyhelpers/6.9.3/lib/netstandard2.0/Mono.Cecil.dll" Pack="true" PackagePath="weaver/" Visible="false" />
+    <None Include="$(NuGetPackageRoot)fodyhelpers/6.9.3/lib/netstandard2.0/Mono.Cecil.Pdb.dll" Pack="true" PackagePath="weaver/" Visible="false" />
+    <None Include="$(NuGetPackageRoot)fodyhelpers/6.9.3/lib/netstandard2.0/Mono.Cecil.Rocks.dll" Pack="true" PackagePath="weaver/" Visible="false" />
+  </ItemGroup>
+</Project>

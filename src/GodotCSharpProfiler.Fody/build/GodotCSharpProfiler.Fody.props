@@ -1,0 +1,5 @@
+<Project>
+  <ItemGroup>
+    <WeaverFiles Include="$(MSBuildThisFileDirectory)..\weaver\GodotCSharpProfiler.Fody.dll" />
+  </ItemGroup>
+</Project>
