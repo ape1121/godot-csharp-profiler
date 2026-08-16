@@ -67,9 +67,14 @@ public sealed class CaptureProtocolParser
 
     private static CapabilitiesMessage ParseCapabilities(Dictionary<string, WireValue> f, int major, int minor, string token)
     {
-        var modes = RequiredModes(f);
+        var modes = RequiredAvailableModes(f);
+        var configurable = RequiredBool(f, "samplingIntervalRuntimeConfigurable");
+        var effective = RequiredInterval(f, "effectiveSamplingIntervalNanoseconds", allowUnknown: true);
+        var hasSampling = (modes & CaptureModes.Sampling) != 0;
+        if ((!hasSampling && (configurable || effective != 0)) || (configurable && !hasSampling))
+            throw new InvalidWireException(true);
         return new(major, minor, token, RequiredLong(f, "generation", 0, long.MaxValue), modes,
-            RequiredInt(f, "maxMethods", 1, ProtocolLimits.MaxConfiguredMethods),
+            configurable, effective, RequiredInt(f, "maxMethods", 1, ProtocolLimits.MaxConfiguredMethods),
             RequiredInt(f, "maxBatchBytes", 1, ProtocolLimits.MaxBatchBytes),
             RequiredInt(f, "maxDepth", 1, ProtocolLimits.MaxDepth));
     }
@@ -77,10 +82,10 @@ public sealed class CaptureProtocolParser
     private static ConfigureMessage ParseConfigure(Dictionary<string, WireValue> f, int major, int minor, string token)
     {
         var modes = RequiredModes(f);
-        if ((modes & (CaptureModes.Sampling | CaptureModes.AutomaticInstrumentation)) == 0)
-            throw new InvalidWireException(true);
+        var interval = RequiredInterval(f, "requestedSamplingIntervalNanoseconds", allowUnknown: true);
+        if ((modes & CaptureModes.Sampling) == 0 && interval != 0) throw new InvalidWireException(true);
         return new(major, minor, token, RequiredLong(f, "generation", 1, long.MaxValue),
-            RequiredFingerprint(f), modes, RequiredInt(f, "samplingHertz", 1, ProtocolLimits.MaxSamplingHertz),
+            RequiredFingerprint(f), modes, interval,
             RequiredInt(f, "maxMethods", 1, ProtocolLimits.MaxConfiguredMethods));
     }
 
@@ -115,7 +120,7 @@ public sealed class CaptureProtocolParser
         var source = RequiredEnum<CaptureSource>(f, "source");
         var exactCalls = RequiredBool(f, "exactCalls");
         var cpuTime = RequiredBool(f, "cpuTime");
-        if ((source == CaptureSource.Sampling && exactCalls) ||
+        if ((source == CaptureSource.Sampling && (exactCalls || cpuTime)) ||
             (source != CaptureSource.Sampling && cpuTime) ||
             (source != CaptureSource.Sampling && !exactCalls))
             throw new InvalidWireException(true);
@@ -140,12 +145,23 @@ public sealed class CaptureProtocolParser
         RequiredLong(f, "observed", 0, long.MaxValue), RequiredLong(f, "dropped", 0, long.MaxValue),
         RequiredLong(f, "overflowed", 0, long.MaxValue), RequiredLong(f, "invalid", 0, long.MaxValue));
 
+    private static CaptureModes RequiredAvailableModes(Dictionary<string, WireValue> f) =>
+        (CaptureModes)RequiredLong(f, "modes", 1, 7);
+
     private static CaptureModes RequiredModes(Dictionary<string, WireValue> f)
     {
-        var modes = (CaptureModes)RequiredLong(f, "modes", 1, 7);
+        var modes = RequiredAvailableModes(f);
         if ((modes & CaptureModes.Sampling) != 0 && (modes & CaptureModes.AutomaticInstrumentation) != 0)
             throw new InvalidWireException(true);
         return modes;
+    }
+
+    private static long RequiredInterval(Dictionary<string, WireValue> f, string name, bool allowUnknown)
+    {
+        var value = RequiredLong(f, name, 0, ProtocolLimits.MaxSamplingIntervalNanoseconds);
+        if (value == 0 && allowUnknown) return 0;
+        if (value < ProtocolLimits.MinSamplingIntervalNanoseconds) throw new InvalidWireException(true);
+        return value;
     }
 
     private static T RequiredEnum<T>(Dictionary<string, WireValue> f, string name) where T : struct, Enum
