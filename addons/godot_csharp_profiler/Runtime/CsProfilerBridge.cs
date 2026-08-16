@@ -1,6 +1,8 @@
 using Godot;
 using System;
 
+namespace Apeworks.GodotCSharpProfiler;
+
 // Autoload transport between CsProfiler and the "C# Profiler" editor debugger tab. Dormant unless
 // the game was launched from the editor with the debugger attached; then it listens for
 // start/stop from the tab and, while profiling, flushes CsProfiler once per rendered frame over

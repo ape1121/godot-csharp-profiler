@@ -2,14 +2,21 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading;
 
+namespace Apeworks.GodotCSharpProfiler;
+
 public static class CsProfiler
 {
-    private const int MaxSnapshotNodes = 4096;
-    private const int MaxSnapshotDepth = 32;
+    public const int MaximumRetainedNodes = 4096;
+    public const int MaximumLabelLength = 128;
+    public const string WorkerThreadsRootName = "Worker Threads";
+
+    private const int MaximumSnapshotDepth = 32;
+    private const int MaximumFunctionNames = 4096;
 
     public sealed class SampleNode
     {
@@ -18,13 +25,22 @@ public static class CsProfiler
         public readonly Dictionary<string, SampleNode> Children = new(StringComparer.Ordinal);
         public long Calls;
         public long TotalTicks;
-        internal long StartTimestamp;
     }
 
     private sealed class WorkerSample
     {
         public long Calls;
         public long Ticks;
+    }
+
+    internal sealed class ScopeState
+    {
+        internal long Generation;
+        internal long StartTimestamp;
+        internal SampleNode Node;
+        internal ScopeState Parent;
+        internal string WorkerName;
+        internal int Disposed;
     }
 
     public sealed class FrameSnapshot
@@ -43,9 +59,9 @@ public static class CsProfiler
         public int[] Depths;
         public long[] Calls;
         public long[] TotalUsec;
-        // Main-thread scoped time only; worker samples are visible in the tree but excluded so
-        // the frame graph compares like with like against the engine's frame time.
         public long CsTotalUsec;
+        public long DroppedScopes;
+        public long TruncatedLabels;
     }
 
     public sealed class CaptureLease : IDisposable
@@ -60,19 +76,10 @@ public static class CsProfiler
 
         public string Owner { get; }
         public bool IsActive => OwnsCapture(_token);
-
         public FrameSnapshot FlushFrame() => TryFlushFrame(_token);
-
-        public bool Stop()
-        {
-            var stopped = TryStopCapture(_token);
-            return stopped;
-        }
-
+        public bool Stop() => TryStopCapture(_token);
         public void Dispose() => Stop();
     }
-
-    public const string WorkerThreadsRootName = "Worker Threads";
 
     private static readonly object CaptureLock = new();
     private static volatile bool _active;
@@ -81,13 +88,17 @@ public static class CsProfiler
     private static long _captureToken;
     private static string _captureOwner = "";
     private static SampleNode _root = new() { Name = "Frame" };
-    private static SampleNode _current;
+    private static ScopeState _currentScope;
     private static ConcurrentDictionary<string, WorkerSample> _workerSamples =
         new(StringComparer.Ordinal);
-    private static readonly ConcurrentDictionary<(string File, string Member), string> _functionNames =
+    private static readonly ConcurrentDictionary<(string File, string Member), string> FunctionNames =
         new();
+    private static int _retainedNodeCount;
+    private static long _droppedScopes;
+    private static long _truncatedLabels;
 
     public static bool Active => _active;
+
     public static string CaptureOwner
     {
         get
@@ -97,9 +108,15 @@ public static class CsProfiler
         }
     }
 
-    // Capture mutation is lease-scoped: only the successful starter may flush or stop it. A
-    // competing sampler/editor start fails closed and receives no handle that could consume or
-    // reset another owner's frame data.
+    public static int RetainedNodeCount
+    {
+        get
+        {
+            lock (CaptureLock)
+                return _retainedNodeCount;
+        }
+    }
+
     public static bool TryStartCapture(string owner, out CaptureLease lease)
     {
         lease = null;
@@ -109,8 +126,8 @@ public static class CsProfiler
         {
             if (_active)
                 return false;
-            _mainThreadId = System.Environment.CurrentManagedThreadId;
             Reset();
+            _mainThreadId = Environment.CurrentManagedThreadId;
             _captureOwner = owner.Trim();
             _captureToken = Interlocked.Increment(ref _nextCaptureToken);
             _active = true;
@@ -134,6 +151,7 @@ public static class CsProfiler
             _active = false;
             _captureToken = 0;
             _captureOwner = "";
+            _mainThreadId = -1;
             Reset();
             return true;
         }
@@ -142,84 +160,141 @@ public static class CsProfiler
     private static void Reset()
     {
         _root = new SampleNode { Name = "Frame" };
-        _current = _root;
+        _currentScope = null;
         _workerSamples = new ConcurrentDictionary<string, WorkerSample>(StringComparer.Ordinal);
+        _retainedNodeCount = 0;
+        _droppedScopes = 0;
+        _truncatedLabels = 0;
     }
 
     public static ProfileScope Scope(string name)
     {
         if (!_active)
             return default;
-        return BeginScope(name ?? "(null)");
+        return BeginScope(NormalizeLabel(name ?? "(null)"));
     }
 
-    // Auto-named scope: "NpcActor.Internals._PhysicsProcess" becomes "NpcActor.Internals._PhysicsProcess"
-    // from the file name plus member, which stays correct across partial classes. The composed
-    // string is cached per call site so the hot path does not allocate.
     public static ProfileScope Fn(
         [CallerFilePath] string filePath = "",
         [CallerMemberName] string memberName = "")
     {
         if (!_active)
             return default;
-        var name = _functionNames.GetOrAdd((filePath, memberName),
-            static key => ResolveFunctionName(key.File, key.Member));
+
+        var key = (filePath ?? "", memberName ?? "");
+        string name;
+        if (!FunctionNames.TryGetValue(key, out name))
+        {
+            name = NormalizeLabel($"{Path.GetFileNameWithoutExtension(key.Item1)}.{key.Item2}");
+            if (FunctionNames.Count < MaximumFunctionNames)
+                FunctionNames.TryAdd(key, name);
+        }
         return BeginScope(name);
     }
 
-    private static string ResolveFunctionName(string filePath, string memberName) =>
-        $"{System.IO.Path.GetFileNameWithoutExtension(filePath)}.{memberName}";
+    private static string NormalizeLabel(string name)
+    {
+        if (name.Length <= MaximumLabelLength)
+            return name;
+        Interlocked.Increment(ref _truncatedLabels);
+        return name[..MaximumLabelLength];
+    }
 
     private static ProfileScope BeginScope(string name)
     {
-        var threadId = System.Environment.CurrentManagedThreadId;
-        if (threadId != _mainThreadId)
-            return new ProfileScope(name, Stopwatch.GetTimestamp(), threadId);
-
-        var parent = _current ?? _root;
-        if (!parent.Children.TryGetValue(name, out var node))
+        lock (CaptureLock)
         {
-            node = new SampleNode { Name = name, Parent = parent };
-            parent.Children[name] = node;
+            if (!_active)
+                return default;
+
+            var threadId = Environment.CurrentManagedThreadId;
+            var state = new ScopeState
+            {
+                Generation = _captureToken,
+                StartTimestamp = Stopwatch.GetTimestamp()
+            };
+
+            if (threadId != _mainThreadId)
+            {
+                state.WorkerName = name;
+                return new ProfileScope(state);
+            }
+
+            var parent = _currentScope?.Node ?? _root;
+            if (!parent.Children.TryGetValue(name, out var node))
+            {
+                if (_retainedNodeCount >= MaximumRetainedNodes)
+                {
+                    _droppedScopes++;
+                    return default;
+                }
+                node = new SampleNode { Name = name, Parent = parent };
+                parent.Children.Add(name, node);
+                _retainedNodeCount++;
+            }
+
+            state.Node = node;
+            state.Parent = _currentScope;
+            _currentScope = state;
+            return new ProfileScope(state);
         }
-        node.Calls++;
-        node.StartTimestamp = Stopwatch.GetTimestamp();
-        _current = node;
-        return new ProfileScope(node, threadId);
     }
 
-    internal static void EndMainThreadScope(SampleNode node)
+    private static void EndScope(ScopeState state)
     {
-        if (!_active || node == null ||
-            System.Environment.CurrentManagedThreadId != _mainThreadId)
+        if (state == null || Interlocked.Exchange(ref state.Disposed, 1) != 0)
             return;
-        var current = _current;
-        while (current != null && current != node)
-            current = current.Parent;
-        if (current == null)
-            return;
-        node.TotalTicks += Stopwatch.GetTimestamp() - node.StartTimestamp;
-        _current = node.Parent ?? _root;
+
+        var endTimestamp = Stopwatch.GetTimestamp();
+        lock (CaptureLock)
+        {
+            // A scope is capture-generation owned. Reset/stop makes all outstanding handles inert.
+            if (!_active || state.Generation == 0 || state.Generation != _captureToken)
+                return;
+
+            var elapsed = Math.Max(0, endTimestamp - state.StartTimestamp);
+            if (state.WorkerName != null)
+            {
+                if (!_workerSamples.TryGetValue(state.WorkerName, out var sample))
+                {
+                    if (_retainedNodeCount >= MaximumRetainedNodes)
+                    {
+                        _droppedScopes++;
+                        return;
+                    }
+                    sample = new WorkerSample();
+                    if (_workerSamples.TryAdd(state.WorkerName, sample))
+                        _retainedNodeCount++;
+                    else
+                        sample = _workerSamples[state.WorkerName];
+                }
+                sample.Calls++;
+                sample.Ticks += elapsed;
+                return;
+            }
+
+            if (state.Node == null)
+                return;
+            state.Node.Calls++;
+            state.Node.TotalTicks += elapsed;
+
+            // Disposal may resume on another thread or occur out of order. The capture lock makes
+            // closure safe; only unwind states that are actually complete, preserving live children.
+            if (ReferenceEquals(_currentScope, state))
+            {
+                _currentScope = state.Parent;
+                while (_currentScope is { Disposed: not 0 })
+                    _currentScope = _currentScope.Parent;
+            }
+        }
     }
 
-    internal static void EndWorkerScope(string name, long startTimestamp)
-    {
-        if (!_active || startTimestamp <= 0)
-            return;
-        var elapsed = Stopwatch.GetTimestamp() - startTimestamp;
-        var sample = _workerSamples.GetOrAdd(name, static _ => new WorkerSample());
-        Interlocked.Increment(ref sample.Calls);
-        Interlocked.Add(ref sample.Ticks, elapsed);
-    }
-
-    // Only the capture lease can call this destructive operation. It emits every node touched this
-    // frame and zeroes its counters in place; the tree persists to avoid steady-state churn.
     private static FrameSnapshot TryFlushFrame(long token)
     {
         lock (CaptureLock)
         {
             if (!_active || token == 0 || token != _captureToken ||
-                System.Environment.CurrentManagedThreadId != _mainThreadId)
+                Environment.CurrentManagedThreadId != _mainThreadId)
                 return FrameSnapshot.Empty;
 
             var names = new List<string>();
@@ -228,23 +303,35 @@ public static class CsProfiler
             var totalUsec = new List<long>();
             long csTotalTicks = 0;
 
+            // A path containing an open invocation is deferred intact. This prevents a frame flush
+            // from publishing/resetting half a scope and preserves its eventual duration exactly.
+            var activeNodes = new HashSet<SampleNode>();
+            for (var scope = _currentScope; scope != null; scope = scope.Parent)
+            {
+                if (scope.Disposed == 0 && scope.Node != null)
+                    activeNodes.Add(scope.Node);
+            }
+
             var stack = new Stack<(SampleNode Node, int Depth)>();
             foreach (var child in _root.Children.Values)
                 stack.Push((child, 0));
-            while (stack.Count > 0 && names.Count < MaxSnapshotNodes)
+            while (stack.Count > 0 && names.Count < MaximumRetainedNodes)
             {
                 var (node, depth) = stack.Pop();
-                if (node.Calls == 0)
+                if (activeNodes.Contains(node))
                     continue;
-                names.Add(node.Name);
-                depths.Add(depth);
-                calls.Add(node.Calls);
-                totalUsec.Add(TicksToUsec(node.TotalTicks));
-                if (depth == 0)
-                    csTotalTicks += node.TotalTicks;
-                node.Calls = 0;
-                node.TotalTicks = 0;
-                if (depth + 1 < MaxSnapshotDepth)
+                if (node.Calls > 0)
+                {
+                    names.Add(node.Name);
+                    depths.Add(depth);
+                    calls.Add(node.Calls);
+                    totalUsec.Add(TicksToUsec(node.TotalTicks));
+                    if (depth == 0)
+                        csTotalTicks += node.TotalTicks;
+                    node.Calls = 0;
+                    node.TotalTicks = 0;
+                }
+                if (depth + 1 < MaximumSnapshotDepth)
                 {
                     foreach (var child in node.Children.Values)
                         stack.Push((child, depth + 1));
@@ -252,6 +339,10 @@ public static class CsProfiler
             }
 
             AppendWorkerSamples(names, depths, calls, totalUsec);
+            var dropped = _droppedScopes;
+            var truncated = _truncatedLabels;
+            _droppedScopes = 0;
+            _truncatedLabels = 0;
 
             return new FrameSnapshot
             {
@@ -259,7 +350,9 @@ public static class CsProfiler
                 Depths = depths.ToArray(),
                 Calls = calls.ToArray(),
                 TotalUsec = totalUsec.ToArray(),
-                CsTotalUsec = TicksToUsec(csTotalTicks)
+                CsTotalUsec = TicksToUsec(csTotalTicks),
+                DroppedScopes = dropped,
+                TruncatedLabels = truncated
             };
         }
     }
@@ -273,12 +366,14 @@ public static class CsProfiler
         var workerRows = new List<(string Name, long Calls, long Ticks)>();
         foreach (var pair in _workerSamples)
         {
-            var sampleCalls = Interlocked.Exchange(ref pair.Value.Calls, 0);
-            var sampleTicks = Interlocked.Exchange(ref pair.Value.Ticks, 0);
+            var sampleCalls = pair.Value.Calls;
+            var sampleTicks = pair.Value.Ticks;
+            pair.Value.Calls = 0;
+            pair.Value.Ticks = 0;
             if (sampleCalls > 0)
                 workerRows.Add((pair.Key, sampleCalls, sampleTicks));
         }
-        if (workerRows.Count == 0 || names.Count >= MaxSnapshotNodes)
+        if (workerRows.Count == 0 || names.Count >= MaximumRetainedNodes)
             return;
 
         names.Add(WorkerThreadsRootName);
@@ -287,7 +382,7 @@ public static class CsProfiler
         totalUsec.Add(workerRows.Sum(row => TicksToUsec(row.Ticks)));
         foreach (var row in workerRows.OrderBy(row => row.Name, StringComparer.Ordinal))
         {
-            if (names.Count >= MaxSnapshotNodes)
+            if (names.Count >= MaximumRetainedNodes)
                 break;
             names.Add(row.Name);
             depths.Add(1);
@@ -301,35 +396,10 @@ public static class CsProfiler
 
     public readonly struct ProfileScope : IDisposable
     {
-        private readonly SampleNode _node;
-        private readonly string _workerName;
-        private readonly long _workerStart;
-        private readonly int _threadId;
+        private readonly ScopeState _state;
 
-        internal ProfileScope(SampleNode node, int threadId)
-        {
-            _node = node;
-            _workerName = null;
-            _workerStart = 0;
-            _threadId = threadId;
-        }
+        internal ProfileScope(ScopeState state) => _state = state;
 
-        internal ProfileScope(string workerName, long workerStart, int threadId)
-        {
-            _node = null;
-            _workerName = workerName;
-            _workerStart = workerStart;
-            _threadId = threadId;
-        }
-
-        public void Dispose()
-        {
-            if (_threadId == 0 || _threadId != System.Environment.CurrentManagedThreadId)
-                return;
-            if (_node != null)
-                EndMainThreadScope(_node);
-            else if (_workerName != null)
-                EndWorkerScope(_workerName, _workerStart);
-        }
+        public void Dispose() => EndScope(_state);
     }
 }
