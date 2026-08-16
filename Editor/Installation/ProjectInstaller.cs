@@ -16,6 +16,7 @@ public sealed class ProjectInstaller
     public const string RestoreSourcesElementName = "RestoreAdditionalProjectSources";
 
     private const string WeaversPath = "FodyWeavers.xml";
+    private const string BundledFeedPath = "addons/godot_csharp_profiler/assets/nuget";
     private readonly string root;
     private readonly string projectPath;
     private readonly IPackageAvailabilityChecker packageAvailability;
@@ -231,9 +232,9 @@ public sealed class ProjectInstaller
             throw new InstallationRefusedException("The bundled profiler package filename does not match the required version.");
         var feed = Path.GetDirectoryName(package) ?? throw new InstallationRefusedException("The bundled package has no source directory.");
         var relative = Path.GetRelativePath(root, feed).Replace('\\', '/');
-        if (relative is "." or "" || relative == ".." || relative.StartsWith("../", StringComparison.Ordinal))
-            throw new InstallationRefusedException("The bundled package source must be inside the project root.");
-        return relative;
+        if (!string.Equals(relative, BundledFeedPath, StringComparison.Ordinal))
+            throw new InstallationRefusedException($"The bundled package source must be {BundledFeedPath}.");
+        return BundledFeedPath;
     }
 
     private static Guid? ReadOwnedInstallationId(XDocument project)
