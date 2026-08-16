@@ -17,7 +17,9 @@ public sealed class ProfilerDockController
     private string target = "No target";
     private string? statusOverride;
     private string installerStatus = "Automatic installation: not previewed";
+    private string installerPreviewDiff = "";
     private string? currentPreviewToken;
+    private InstallerGate installerGate = InstallerGate.Ready;
 
     public ProfilerDockController(IProfilerDockView view, IProfilerCommandTransport transport,
         IAutomaticInstaller? installer, IProfilerOutput? output = null)
@@ -76,6 +78,33 @@ public sealed class ProfilerDockController
         Render();
     }
 
+    public void UpdateSampling(SamplingSettings settings)
+    {
+        modes.UpdateSampling(settings);
+        Render();
+    }
+
+    public void UpdateAutomatic(AutomaticSettings settings)
+    {
+        modes.UpdateAutomatic(settings);
+        InvalidatePreview();
+        Render();
+    }
+
+    public void UpdateManual(ManualSettings settings)
+    {
+        modes.UpdateManual(settings);
+        Render();
+    }
+
+    private void InvalidatePreview()
+    {
+        currentPreviewToken = null;
+        installerPreviewDiff = "";
+        installerGate = InstallerGate.Ready;
+        installerStatus = "Preview required after automatic settings changed";
+    }
+
     public void Start()
     {
         var presentation = Presentation();
@@ -118,15 +147,19 @@ public sealed class ProfilerDockController
     public InstallerPreviewResult? PreviewAutomaticInstall()
     {
         currentPreviewToken = null;
+        installerPreviewDiff = "";
         if (installer is null)
         {
+            installerGate = InstallerGate.PackageUnavailable;
             installerStatus = "Package unavailable: installer is not configured";
             Render();
             return null;
         }
         try
         {
-            var preview = installer.Preview();
+            var preview = installer.Preview(modes.Configuration.Automatic);
+            installerGate = preview.Gate;
+            installerPreviewDiff = SafeText(preview.Diff, 16_384, "");
             installerStatus = GateStatus(preview.Gate, preview.ChangeCount);
             if (preview.Gate != InstallerGate.PackageUnavailable &&
                 !string.IsNullOrWhiteSpace(preview.Token))
@@ -136,6 +169,7 @@ public sealed class ProfilerDockController
         }
         catch (Exception error)
         {
+            installerGate = InstallerGate.Error;
             installerStatus = "Installation preview failed: " + SafeText(error.Message, 120, "unknown error");
             Render();
             return null;
@@ -151,12 +185,15 @@ public sealed class ProfilerDockController
         try
         {
             var result = installer.Apply(previewToken);
+            installerGate = result.Gate;
+            installerPreviewDiff = "";
             installerStatus = GateStatus(result.Gate, result.Changed ? 1 : 0);
             Render();
             return result.Changed;
         }
         catch (Exception error)
         {
+            installerGate = InstallerGate.Error;
             installerStatus = "Installation apply failed: " + SafeText(error.Message, 120, "unknown error");
             Render();
             return false;
@@ -188,15 +225,14 @@ public sealed class ProfilerDockController
 
     private AutomaticFacts InstallerAutomaticFacts()
     {
-        var status = installerStatus.Contains("Needs build", StringComparison.OrdinalIgnoreCase)
-            ? AutomaticBuildStatus.NeedsBuild
-            : installerStatus.Contains("Needs restart", StringComparison.OrdinalIgnoreCase)
-                ? AutomaticBuildStatus.NeedsRestart
-                : installerStatus.Contains("Stale", StringComparison.OrdinalIgnoreCase)
-                    ? AutomaticBuildStatus.StaleBuild
-                    : installerStatus.Contains("No matches", StringComparison.OrdinalIgnoreCase)
-                        ? AutomaticBuildStatus.NoMatches
-                        : AutomaticBuildStatus.Ready;
+        var status = installerGate switch
+        {
+            InstallerGate.NeedsBuild => AutomaticBuildStatus.NeedsBuild,
+            InstallerGate.NeedsRestart => AutomaticBuildStatus.NeedsRestart,
+            InstallerGate.Stale => AutomaticBuildStatus.StaleBuild,
+            InstallerGate.NoMatches => AutomaticBuildStatus.NoMatches,
+            _ => AutomaticBuildStatus.Ready
+        };
         return new AutomaticFacts(status, 0, 0, 0);
     }
 
@@ -220,6 +256,7 @@ public sealed class ProfilerDockController
                 presentation.Commands.Export.Enabled),
             $"{presentation.Overhead} overhead · Sampling interval: {presentation.Sampling.Interval.Display}",
             installerStatus,
+            installerPreviewDiff,
             presentation.Quality.Banner,
             presentation.ResultsVisible,
             groups));

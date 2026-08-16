@@ -9,7 +9,8 @@ public enum ExportFormat { LosslessJson, VisibleCsv, ChromeTrace }
 public enum InstallerGate { Ready, PackageUnavailable, NeedsBuild, NeedsRestart, Stale, NoMatches, Error }
 
 public sealed record ResultRow(string Name, long Samples, double EstimatedCpuPercentage, long Calls,
-    double ObservedWallTimeMilliseconds);
+    double ObservedWallTimeMilliseconds, double AverageWallTimeMilliseconds,
+    double MaximumWallTimeMilliseconds);
 public sealed record SourceResultGroup(CaptureSource Source, IReadOnlyList<ResultRow> Rows);
 public sealed record ProfilerResults(IReadOnlyList<SourceResultGroup> Groups, long Truncated)
 {
@@ -29,6 +30,7 @@ public sealed record ProfilerDockViewState(
     CommandViewState Commands,
     string SettingsStatus,
     string InstallerStatus,
+    string InstallerPreviewDiff,
     string QualityBanner,
     bool ResultsVisible,
     IReadOnlyList<ResultGroupViewState> ResultGroups);
@@ -49,7 +51,7 @@ public sealed record InstallerApplyResult(InstallerGate Gate, bool Changed, bool
     bool RestartRequired);
 public interface IAutomaticInstaller
 {
-    InstallerPreviewResult Preview();
+    InstallerPreviewResult Preview(AutomaticSettings settings);
     InstallerApplyResult Apply(string previewToken);
 }
 

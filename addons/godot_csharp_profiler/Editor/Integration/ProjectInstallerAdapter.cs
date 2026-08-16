@@ -1,5 +1,6 @@
 #nullable enable
 using Apeworks.GodotCSharpProfiler.Editor.Installation;
+using Apeworks.GodotCSharpProfiler.Editor.Modes;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -8,18 +9,39 @@ namespace Apeworks.GodotCSharpProfiler.Editor.Integration;
 /// <summary>UI-safe preview/apply adapter. Only previews produced by this instance can be applied.</summary>
 public sealed class ProjectInstallerAdapter : IAutomaticInstaller
 {
-    private readonly ProjectInstaller installer;
+    private readonly string projectRoot;
+    private readonly Func<ProjectInstaller, InstallationPreview> previewFactory;
+    private readonly Func<ProjectInstaller, InstallationPreview, InstallationResult> applyFactory;
     private readonly Func<bool> packageAvailable;
+    private ProjectInstaller? applyingInstaller;
     private InstallationPreview? preview;
     private string? token;
 
     public ProjectInstallerAdapter(ProjectInstaller installer, Func<bool>? packageAvailable = null)
+        : this("", _ => installer.PreviewInstall(), (_, value) => installer.Apply(value),
+            packageAvailable)
     {
-        this.installer = installer ?? throw new ArgumentNullException(nameof(installer));
+        applyingInstaller = installer ?? throw new ArgumentNullException(nameof(installer));
+    }
+
+    public ProjectInstallerAdapter(string projectRoot, Func<bool>? packageAvailable = null)
+        : this(projectRoot, installer => installer.PreviewInstall(),
+            (installer, value) => installer.Apply(value), packageAvailable)
+    {
+    }
+
+    private ProjectInstallerAdapter(string projectRoot,
+        Func<ProjectInstaller, InstallationPreview> previewFactory,
+        Func<ProjectInstaller, InstallationPreview, InstallationResult> applyFactory,
+        Func<bool>? packageAvailable)
+    {
+        this.projectRoot = projectRoot;
+        this.previewFactory = previewFactory;
+        this.applyFactory = applyFactory;
         this.packageAvailable = packageAvailable ?? (() => true);
     }
 
-    public InstallerPreviewResult Preview()
+    public InstallerPreviewResult Preview(AutomaticSettings automatic)
     {
         preview = null;
         token = null;
@@ -27,8 +49,12 @@ public sealed class ProjectInstallerAdapter : IAutomaticInstaller
             return new InstallerPreviewResult(InstallerGate.PackageUnavailable, null, "", 0);
         try
         {
-            var candidate = installer.PreviewInstall();
+            var installer = string.IsNullOrEmpty(projectRoot)
+                ? applyingInstaller!
+                : new ProjectInstaller(projectRoot, settings: SettingsFor(automatic));
+            var candidate = previewFactory(installer);
             var candidateToken = Token(candidate);
+            applyingInstaller = installer;
             preview = candidate;
             token = candidateToken;
             return new InstallerPreviewResult(InstallerGate.Ready, candidateToken,
@@ -44,16 +70,34 @@ public sealed class ProjectInstallerAdapter : IAutomaticInstaller
 
     public InstallerApplyResult Apply(string previewToken)
     {
-        if (preview is null || token is null ||
+        if (preview is null || token is null || applyingInstaller is null ||
             !string.Equals(token, previewToken, StringComparison.Ordinal))
             throw new InstallationRefusedException("A current matching preview is required before Apply.");
         var applying = preview;
         preview = null;
         token = null;
-        var result = installer.Apply(applying);
-        return new InstallerApplyResult(result.Changed ? InstallerGate.NeedsBuild : InstallerGate.Ready,
+        var result = applyFactory(applyingInstaller, applying);
+        applyingInstaller = null;
+        return new InstallerApplyResult(GateFor(result.RebuildRequired, result.RestartRequired),
             result.Changed, result.RebuildRequired, result.RestartRequired);
     }
+
+    public static InstallerGate GateFor(bool rebuildRequired, bool restartRequired) =>
+        restartRequired ? InstallerGate.NeedsRestart
+        : rebuildRequired ? InstallerGate.NeedsBuild
+        : InstallerGate.Ready;
+
+    private static InstrumentationSettings SettingsFor(AutomaticSettings automatic) => new(
+        MaximumMethods: automatic.MaxMethods,
+        Rules:
+        [
+            .. Rules("include", automatic.IncludePatterns),
+            .. Rules("exclude", automatic.ExcludePatterns)
+        ]);
+
+    private static IEnumerable<InstrumentationRule> Rules(string action, string patterns) =>
+        (patterns ?? "").Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+            .Select(pattern => new InstrumentationRule(action, "all", pattern));
 
     private static string Token(InstallationPreview value)
     {

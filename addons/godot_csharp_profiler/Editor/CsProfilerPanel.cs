@@ -1,19 +1,21 @@
 #if TOOLS
 using Apeworks.GodotCSharpProfiler;
 using Apeworks.GodotCSharpProfiler.Editor.Integration;
+using Apeworks.GodotCSharpProfiler.Editor.Installation;
 using Apeworks.GodotCSharpProfiler.Editor.Modes;
 using Apeworks.GodotCSharpProfiler.Protocol;
 using Godot;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.IO;
 using System.Text;
 
 // The single "C# Profiler" bottom panel: Start/Stop toolbar, clickable frame-time graph, and the
 // selected frame's call tree with Total/Self/Calls columns. Frames arrive from
 // CsProfilerBridge via CsProfilerDebuggerPlugin (see the bridge for the message layout).
 [Tool]
-public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfilerCommandTransport
+public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfilerCommandTransport, IProfilerOutput
 {
     public sealed class ProfileFrame
     {
@@ -68,6 +70,20 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private Label _statsLabel;
     private Label _settingsLabel;
     private Label _qualityLabel;
+    private LineEdit _samplingIncludes;
+    private LineEdit _samplingExcludes;
+    private SpinBox _samplingInterval;
+    private LineEdit _automaticIncludes;
+    private LineEdit _automaticExcludes;
+    private SpinBox _automaticMaximum;
+    private LineEdit _manualPrefix;
+    private VBoxContainer _samplingSettings;
+    private VBoxContainer _automaticSettings;
+    private VBoxContainer _manualSettings;
+    private Button _previewInstallButton;
+    private Button _applyInstallButton;
+    private TextEdit _previewDiff;
+    private TabContainer _resultTabs;
     private CsProfilerFrameGraph _graph;
     private Tree _tree;
     private int _selectedIndex = -1;
@@ -103,7 +119,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     public override void _Ready()
     {
         SizeFlagsVertical = SizeFlags.ExpandFill;
-        _controller = new ProfilerDockController(this, this, null);
+        _controller = new ProfilerDockController(this, this, CreateInstallerSafely(), this);
 
         var targetBar = new HBoxContainer();
         AddChild(targetBar);
@@ -144,7 +160,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         toolbar.AddChild(_stopButton);
 
         var clearButton = new Button { Text = "Clear" };
-        clearButton.Pressed += ClearHistory;
+        clearButton.Pressed += ClearAllResults;
         toolbar.AddChild(clearButton);
 
         _copyButton = new Button
@@ -153,10 +169,11 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             Disabled = true,
             TooltipText = "Copy the selected exact call tree. Sampling results are labelled separately."
         };
-        _copyButton.Pressed += CopySelectedCalls;
+        _copyButton.Pressed += () => _controller.Copy(ExportFormat.VisibleCsv);
         toolbar.AddChild(_copyButton);
-        _exportButton = new Button { Text = "Export", Disabled = true,
-            TooltipText = "Export source-separated profiler results." };
+        _exportButton = new Button { Text = "Export JSON", Disabled = true,
+            TooltipText = "Export lossless source-separated JSON." };
+        _exportButton.Pressed += () => _controller.Export(ExportFormat.LosslessJson);
         toolbar.AddChild(_exportButton);
 
         toolbar.AddChild(new VSeparator());
@@ -170,8 +187,11 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
 
         _settingsLabel = new Label { Text = "Sampling settings" };
         AddChild(_settingsLabel);
+        BuildSettingsUi();
         _qualityLabel = new Label { Text = "Complete capture · no observations" };
         AddChild(_qualityLabel);
+        _resultTabs = new TabContainer { SizeFlagsVertical = SizeFlags.ExpandFill };
+        AddChild(_resultTabs);
 
         _graph = new CsProfilerFrameGraph();
         _graph.FrameClicked += index =>
@@ -209,6 +229,110 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             TryRequestDiscovery(NowSec());
     }
 
+    private IAutomaticInstaller CreateInstallerSafely()
+    {
+        try
+        {
+            var projectRoot = ProjectSettings.GlobalizePath("res://");
+            _ = ProjectInstaller.DiscoverProject(projectRoot);
+            return new ProjectInstallerAdapter(projectRoot);
+        }
+        catch (Exception error) when (error is InstallationRefusedException or
+                                      ArgumentException or IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    private void BuildSettingsUi()
+    {
+        _samplingSettings = new VBoxContainer();
+        AddChild(_samplingSettings);
+        _samplingIncludes = AddLineSetting(_samplingSettings, "Include assemblies", "Game",
+            text => _controller.UpdateSampling(CurrentSampling() with { IncludeAssemblies = text }));
+        _samplingExcludes = AddLineSetting(_samplingSettings, "Exclude assemblies", "",
+            text => _controller.UpdateSampling(CurrentSampling() with { ExcludeAssemblies = text }));
+        _samplingInterval = AddSpinSetting(_samplingSettings, "Interval (ns)", 100_000, 1_000_000_000,
+            2_000_000, value => _controller.UpdateSampling(CurrentSampling() with
+                { RequestedIntervalNanoseconds = (long)value }));
+
+        _automaticSettings = new VBoxContainer();
+        AddChild(_automaticSettings);
+        _automaticIncludes = AddLineSetting(_automaticSettings, "Include patterns", "Game",
+            text => _controller.UpdateAutomatic(CurrentAutomatic() with { IncludePatterns = text }));
+        _automaticExcludes = AddLineSetting(_automaticSettings, "Exclude patterns", "",
+            text => _controller.UpdateAutomatic(CurrentAutomatic() with { ExcludePatterns = text }));
+        _automaticMaximum = AddSpinSetting(_automaticSettings, "Maximum methods", 1, 1_000_000, 4096,
+            value => _controller.UpdateAutomatic(CurrentAutomatic() with { MaxMethods = (int)value }));
+        var installCommands = new HBoxContainer();
+        _automaticSettings.AddChild(installCommands);
+        _previewInstallButton = new Button { Text = "Preview Install" };
+        _previewInstallButton.Pressed += PreviewAutomaticInstall;
+        installCommands.AddChild(_previewInstallButton);
+        _applyInstallButton = new Button { Text = "Apply Confirmed", Disabled = true,
+            TooltipText = "Review the diff, then click to explicitly confirm Apply." };
+        _applyInstallButton.Pressed += ApplyAutomaticInstall;
+        installCommands.AddChild(_applyInstallButton);
+        _previewDiff = new TextEdit { Editable = false, CustomMinimumSize = new Vector2(0, 90) };
+        _automaticSettings.AddChild(_previewDiff);
+
+        _manualSettings = new VBoxContainer();
+        AddChild(_manualSettings);
+        _manualPrefix = AddLineSetting(_manualSettings, "Manual label prefix", "",
+            text => _controller.UpdateManual(new ManualSettings(text)));
+    }
+
+    private static LineEdit AddLineSetting(Control parent, string label, string value,
+        Action<string> changed)
+    {
+        var row = new HBoxContainer();
+        parent.AddChild(row);
+        row.AddChild(new Label { Text = label });
+        var edit = new LineEdit { Text = value, SizeFlagsHorizontal = SizeFlags.ExpandFill };
+        edit.TextChanged += changed;
+        row.AddChild(edit);
+        return edit;
+    }
+
+    private static SpinBox AddSpinSetting(Control parent, string label, double minimum,
+        double maximum, double value, Action<double> changed)
+    {
+        var row = new HBoxContainer();
+        parent.AddChild(row);
+        row.AddChild(new Label { Text = label });
+        var spin = new SpinBox { MinValue = minimum, MaxValue = maximum, Value = value, Rounded = true };
+        spin.ValueChanged += changed;
+        row.AddChild(spin);
+        return spin;
+    }
+
+    private SamplingSettings CurrentSampling() => new(_samplingIncludes?.Text ?? "Game",
+        _samplingExcludes?.Text ?? "", (long)(_samplingInterval?.Value ?? 2_000_000));
+    private AutomaticSettings CurrentAutomatic() => new(_automaticIncludes?.Text ?? "Game",
+        _automaticExcludes?.Text ?? "", (int)(_automaticMaximum?.Value ?? 4096));
+
+    private string _pendingPreviewToken;
+    private void PreviewAutomaticInstall()
+    {
+        var preview = _controller.PreviewAutomaticInstall();
+        _pendingPreviewToken = preview?.Token;
+        _applyInstallButton.Disabled = string.IsNullOrEmpty(_pendingPreviewToken);
+        if (preview != null)
+        {
+            _previewDiff.Text = preview.Diff;
+            _applyInstallButton.TooltipText = "Reviewed " + preview.ChangeCount +
+                " change(s). Click to explicitly confirm Apply.";
+        }
+    }
+
+    private void ApplyAutomaticInstall()
+    {
+        if (string.IsNullOrEmpty(_pendingPreviewToken)) return;
+        _controller.ApplyAutomaticInstall(_pendingPreviewToken, confirmed: true);
+        _pendingPreviewToken = null;
+        _applyInstallButton.Disabled = true;
+    }
+
     private static Button ModeButton(string text, Action pressed)
     {
         var button = new Button { Text = text, ToggleMode = true };
@@ -234,6 +358,50 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             ? state.SettingsStatus
             : state.SettingsStatus + " | " + state.InstallerStatus;
         _qualityLabel.Text = state.QualityBanner;
+        var primary = _controller.Configuration.Primary;
+        _samplingSettings.Visible = primary == PrimaryMode.Sampling;
+        _automaticSettings.Visible = primary == PrimaryMode.AutomaticInstrumentation;
+        _manualSettings.Visible = primary == PrimaryMode.None || _controller.Configuration.IncludeManual;
+        _previewDiff.Text = state.InstallerPreviewDiff;
+        if (string.IsNullOrEmpty(state.InstallerPreviewDiff))
+        {
+            _pendingPreviewToken = null;
+            _applyInstallButton.Disabled = true;
+        }
+        RenderResultGroups(state.ResultGroups);
+    }
+
+    private void RenderResultGroups(IReadOnlyList<ResultGroupViewState> groups)
+    {
+        if (_resultTabs == null) return;
+        foreach (var child in _resultTabs.GetChildren()) child.QueueFree();
+        foreach (var group in groups.Where(item => !item.IsCrossSourceTotal))
+        {
+            var tree = new Tree { Name = group.Title, Columns = group.Columns.Count,
+                ColumnTitlesVisible = true, HideRoot = true, SizeFlagsVertical = SizeFlags.ExpandFill };
+            for (var column = 0; column < group.Columns.Count; column++)
+                tree.SetColumnTitle(column, group.Columns[column]);
+            var root = tree.CreateItem();
+            foreach (var row in group.Rows)
+            {
+                var item = tree.CreateItem(root);
+                item.SetText(0, row.Name);
+                if (group.Source == CaptureSource.Sampling)
+                {
+                    item.SetText(1, row.Samples.ToString());
+                    item.SetText(2, $"{row.EstimatedCpuPercentage:0.##}%");
+                }
+                else
+                {
+                    item.SetText(1, $"{row.ObservedWallTimeMilliseconds:0.###} ms");
+                    item.SetText(2, row.Calls.ToString());
+                    item.SetText(3, $"{row.AverageWallTimeMilliseconds:0.###} ms");
+                    item.SetText(4, $"{row.MaximumWallTimeMilliseconds:0.###} ms");
+                }
+            }
+            _resultTabs.AddChild(tree);
+        }
+        _resultTabs.Visible = groups.Count > 0;
     }
 
     private static void ApplyMode(BaseButton button, ToggleViewState state)
@@ -242,6 +410,46 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         button.SetPressedNoSignal(state.Selected);
         button.Disabled = !state.Enabled;
         button.TooltipText = state.Tooltip;
+    }
+
+    public void Copy(ExportFormat format, ProfilerResults results)
+    {
+        var text = SerializeResults(results, format);
+        if (text.Length > 0) DisplayServer.ClipboardSet(text);
+    }
+
+    public void Export(ExportFormat format, ProfilerResults results)
+    {
+        var text = SerializeResults(results, format);
+        if (text.Length == 0) return;
+        var path = ProjectSettings.GlobalizePath("res://cs-profiler-export." +
+            (format == ExportFormat.VisibleCsv ? "csv" : "json"));
+        File.WriteAllText(path, text);
+        _controller.ReportStatus("Exported source-separated results to " + path);
+    }
+
+    private static string SerializeResults(ProfilerResults results, ExportFormat format)
+    {
+        var builder = new StringBuilder();
+        foreach (var group in results.Groups)
+        {
+            builder.AppendLine(group.Source.ToString());
+            builder.AppendLine(group.Source == CaptureSource.Sampling
+                ? "Name,Samples,Estimated CPU %"
+                : "Name,Wall time ms,Calls,Average wall time ms,Maximum wall time ms");
+            foreach (var row in group.Rows)
+            {
+                builder.Append(row.Name.Replace(',', ';')).Append(',');
+                if (group.Source == CaptureSource.Sampling)
+                    builder.Append(row.Samples).Append(',').Append(row.EstimatedCpuPercentage);
+                else
+                    builder.Append(row.ObservedWallTimeMilliseconds).Append(',').Append(row.Calls)
+                        .Append(',').Append(row.AverageWallTimeMilliseconds).Append(',')
+                        .Append(row.MaximumWallTimeMilliseconds);
+                builder.AppendLine();
+            }
+        }
+        return builder.ToString();
     }
 
     public void Send(ProfilerCommand command, ModeConfiguration configuration)
@@ -369,6 +577,12 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
 
     private static double NowSec() => Time.GetTicksMsec() / 1000.0;
 
+    private void ClearAllResults()
+    {
+        _controller?.Clear();
+        ClearHistory();
+    }
+
     private void ClearHistory()
     {
         if (_graph == null)
@@ -398,7 +612,8 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         {
             _tree.Clear();
             _displayedRowsForTests.Clear();
-            _statsLabel.Text = RuntimeStatus("Profiler data error: " + error);
+            _statsLabel.Text = RuntimeStatus(ProfilerDockController.SafeText(
+                "Profiler data error: " + error, 160, "Profiler data error"));
             return;
         }
         _lastFrameAtSec = NowSec();
@@ -455,6 +670,13 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _statsLabel.Text = RuntimeStatus(
             $"C# {frame.CsMs:0.00} ms | frame {frame.FrameMs:0.00} ms | " +
             $"{frame.Names.Length} scopes | frame #{frame.Index}");
+        _controller?.ReplaceResults(new ProfilerResults([
+            new SourceResultGroup(CaptureSource.ManualSpans,
+                frame.Names.Select((name, row) => new ResultRow(name, 0, 0,
+                    frame.Calls[row], frame.TotalUsec[row] / 1000.0,
+                    frame.Calls[row] > 0 ? frame.TotalUsec[row] / 1000.0 / frame.Calls[row] : 0,
+                    frame.TotalUsec[row] / 1000.0)).ToArray())
+        ], 0));
         RebuildTree(frame);
     }
 

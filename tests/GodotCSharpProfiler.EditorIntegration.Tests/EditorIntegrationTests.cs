@@ -87,6 +87,67 @@ public sealed class EditorIntegrationTests
         Assert.Contains("Wall time", view.Last.ResultGroups[1].Columns);
         Assert.DoesNotContain("Samples", view.Last.ResultGroups[1].Columns);
         Assert.All(view.Last.ResultGroups, group => Assert.False(group.IsCrossSourceTotal));
+        Assert.Equal(3.125, view.Last.ResultGroups[1].Rows[0].AverageWallTimeMilliseconds);
+        Assert.Equal(8.0, view.Last.ResultGroups[1].Rows[0].MaximumWallTimeMilliseconds);
+    }
+
+    [Fact]
+    public void Automatic_settings_invalidate_a_pending_preview()
+    {
+        var view = new FakeView();
+        var installer = new FakeInstaller();
+        var controller = new ProfilerDockController(view, new FakeTransport(), installer);
+        controller.UpdateSnapshot(Snapshot(CaptureState.Ready), "Game");
+        controller.SelectMode(PrimaryMode.AutomaticInstrumentation);
+        var preview = controller.PreviewAutomaticInstall();
+
+        controller.UpdateAutomatic(new AutomaticSettings("Game.*", "Generated", 1000));
+
+        Assert.NotNull(preview);
+        Assert.False(controller.ApplyAutomaticInstall(preview!.Token!, confirmed: true));
+        Assert.Contains("Preview required", view.Last!.InstallerStatus);
+        Assert.Equal("", view.Last.InstallerPreviewDiff);
+        Assert.Equal(0, installer.ApplyCalls);
+    }
+
+    [Fact]
+    public void Settings_updates_are_normalized_and_retained_per_mode()
+    {
+        var controller = new ProfilerDockController(new FakeView(), new FakeTransport(), null);
+        controller.UpdateSampling(new SamplingSettings(" Game ; Core ", " System ", 3_000_000));
+        controller.UpdateAutomatic(new AutomaticSettings(" Game.* ", " Generated ", 200));
+        controller.UpdateManual(new ManualSettings(" Scope "));
+
+        Assert.Equal("Game;Core", controller.Configuration.Sampling.IncludeAssemblies);
+        Assert.Equal("Game.*", controller.Configuration.Automatic.IncludePatterns);
+        Assert.Equal("Scope", controller.Configuration.Manual.LabelPrefix);
+    }
+
+    [Theory]
+    [InlineData(false, false, InstallerGate.Ready)]
+    [InlineData(true, false, InstallerGate.NeedsBuild)]
+    [InlineData(false, true, InstallerGate.NeedsRestart)]
+    [InlineData(true, true, InstallerGate.NeedsRestart)]
+    public void Apply_gate_prioritizes_restart_then_rebuild(bool rebuild, bool restart, InstallerGate gate)
+    {
+        Assert.Equal(gate, ProjectInstallerAdapter.GateFor(rebuild, restart));
+    }
+
+    [Fact]
+    public void Preview_receives_current_automatic_settings_and_exposes_diff()
+    {
+        var view = new FakeView();
+        var installer = new FakeInstaller();
+        var controller = new ProfilerDockController(view, new FakeTransport(), installer);
+        controller.UpdateSnapshot(Snapshot(CaptureState.Ready), "Game");
+        controller.SelectMode(PrimaryMode.AutomaticInstrumentation);
+        controller.UpdateAutomatic(new AutomaticSettings("Gameplay.*", "Generated", 321));
+
+        controller.PreviewAutomaticInstall();
+
+        Assert.Equal("Gameplay.*", installer.LastSettings!.IncludePatterns);
+        Assert.Equal(321, installer.LastSettings.MaxMethods);
+        Assert.Equal("diff", view.Last!.InstallerPreviewDiff);
     }
 
     [Fact]
@@ -154,7 +215,7 @@ public sealed class EditorIntegrationTests
         using var project = TemporaryProject.Create();
         var adapter = new ProjectInstallerAdapter(new ProjectInstaller(project.Path), () => false);
 
-        var preview = adapter.Preview();
+        var preview = adapter.Preview(ModeConfiguration.Default.Automatic);
 
         Assert.Equal(InstallerGate.PackageUnavailable, preview.Gate);
         Assert.Null(preview.Token);
@@ -185,9 +246,9 @@ public sealed class EditorIntegrationTests
         false, 2_000_000, 50_000);
 
     private static ProfilerResults Results() => new([
-        new SourceResultGroup(CaptureSource.Sampling, [new ResultRow("Tick", 8, 75, 0, 0)]),
-        new SourceResultGroup(CaptureSource.AutomaticSpans, [new ResultRow("Run", 0, 0, 4, 12.5)]),
-        new SourceResultGroup(CaptureSource.ManualSpans, [new ResultRow("Scope", 0, 0, 2, 3.5)])
+        new SourceResultGroup(CaptureSource.Sampling, [new ResultRow("Tick", 8, 75, 0, 0, 0, 0)]),
+        new SourceResultGroup(CaptureSource.AutomaticSpans, [new ResultRow("Run", 0, 0, 4, 12.5, 3.125, 8)]),
+        new SourceResultGroup(CaptureSource.ManualSpans, [new ResultRow("Scope", 0, 0, 2, 3.5, 1.75, 2)])
     ], 2);
 
     private sealed class FakeView : IProfilerDockView
@@ -215,9 +276,11 @@ public sealed class EditorIntegrationTests
         public InstallerGate Gate { get; set; } = InstallerGate.Ready;
         public int PreviewCalls { get; private set; }
         public int ApplyCalls { get; private set; }
-        public InstallerPreviewResult Preview()
+        public AutomaticSettings? LastSettings { get; private set; }
+        public InstallerPreviewResult Preview(AutomaticSettings settings)
         {
             PreviewCalls++;
+            LastSettings = settings;
             return Gate == InstallerGate.PackageUnavailable
                 ? new InstallerPreviewResult(Gate, null, "unavailable", 0)
                 : new InstallerPreviewResult(Gate, "token", "diff", 2);
