@@ -185,7 +185,7 @@ public sealed class InstallerTests
     [Fact]
     public void Uninstall_after_addon_deletion_leaves_clean_build_configuration()
     {
-        using var fixture = Fixture.Create("<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>");
+        using var fixture = Fixture.Create("<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>");
         fixture.Write("Player.cs", "public sealed class Player { public int Tick() => 42; }");
         fixture.Write("addons/godot_csharp_profiler/Runtime/Recorder.cs", "namespace AddonOnly; public static class Recorder { }");
         var installer = fixture.Installer();

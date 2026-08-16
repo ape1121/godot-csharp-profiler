@@ -14,6 +14,8 @@ public partial class CsProfilerPlugin : EditorPlugin
     private CsProfilerPanel _panel;
     private EditorDock _dock;
     private bool _editorAttachedProbeRunning;
+    private bool _editorAttachedProbeStopSent;
+    private double _editorAttachedProbeStartedAt;
     private double _editorAttachedProbeDeadline;
     private bool _registered;
     private ICoordinatorLifetime _coordinatorLifetime;
@@ -27,6 +29,7 @@ public partial class CsProfilerPlugin : EditorPlugin
         if (_registered)
             return;
         _registered = true;
+        EnsureRuntimeBridgeAutoload();
         _panel = new CsProfilerPanel { Name = "C# Profiler" };
         _dock = new EditorDock
         {
@@ -70,11 +73,55 @@ public partial class CsProfilerPlugin : EditorPlugin
         _panel = null;
         _coordinatorLifetime?.RequestDispose();
         _coordinatorLifetime = null;
+        RemoveOwnedRuntimeBridgeAutoload();
+    }
+
+    private void RemoveOwnedRuntimeBridgeAutoload()
+    {
+        if (!ProjectSettings.HasSetting(ProfilerAutoloadPolicy.Setting))
+            return;
+        var existing = ResolveAutoloadPath(ProjectSettings.GetSetting(ProfilerAutoloadPolicy.Setting).AsString());
+        if (ProfilerAutoloadPolicy.IsOwnedValue(existing))
+        {
+            RemoveAutoloadSingleton(ProfilerAutoloadPolicy.Name);
+            var saveError = ProjectSettings.Save();
+            if (saveError != Error.Ok)
+                GD.PushError($"C# Profiler removed its bridge but could not persist project.godot: {saveError}.");
+        }
+    }
+
+    private void EnsureRuntimeBridgeAutoload()
+    {
+        if (ProjectSettings.HasSetting(ProfilerAutoloadPolicy.Setting))
+        {
+            var existing = ResolveAutoloadPath(ProjectSettings.GetSetting(ProfilerAutoloadPolicy.Setting).AsString());
+            if (!ProfilerAutoloadPolicy.IsOwnedValue(existing))
+                GD.PushError($"C# Profiler cannot register its runtime bridge: autoload name {ProfilerAutoloadPolicy.Name} is owned by another path.");
+            return;
+        }
+        AddAutoloadSingleton(ProfilerAutoloadPolicy.Name, ProfilerAutoloadPolicy.ScriptPath);
+        // Godot may normalize C# script autoloads to generated uid:// sidecars. The addon archive
+        // intentionally does not depend on editor-generated sidecars, so persist our stable path.
+        ProjectSettings.SetSetting(ProfilerAutoloadPolicy.Setting, "*" + ProfilerAutoloadPolicy.ScriptPath);
+        var saveError = ProjectSettings.Save();
+        if (saveError != Error.Ok)
+            GD.PushError($"C# Profiler registered its bridge but could not persist project.godot: {saveError}.");
+    }
+
+    private static string ResolveAutoloadPath(string value)
+    {
+        var normalized = value.TrimStart('*');
+        if (!normalized.StartsWith("uid://", StringComparison.Ordinal))
+            return normalized;
+        var id = ResourceUid.TextToId(normalized);
+        return id == ResourceUid.InvalidId ? normalized : ResourceUid.GetIdPath(id);
     }
 
     private void StartEditorAttachedProbe()
     {
         _editorAttachedProbeRunning = true;
+        _editorAttachedProbeStopSent = false;
+        _editorAttachedProbeStartedAt = Time.GetTicksMsec() / 1000.0;
         _editorAttachedProbeDeadline = Time.GetTicksMsec() / 1000.0 + 30.0;
         _panel.RequestCaptureForTests();
         EditorInterface.Singleton.PlayMainScene();
@@ -86,9 +133,14 @@ public partial class CsProfilerPlugin : EditorPlugin
         if (!_editorAttachedProbeRunning)
             return;
         var now = Time.GetTicksMsec() / 1000.0;
+        if (!_editorAttachedProbeStopSent && _panel?.BridgeReadyForTests == true &&
+            now - _editorAttachedProbeStartedAt >= 3.0)
+        {
+            _editorAttachedProbeStopSent = true;
+            _panel.RequestStopForTests();
+        }
         if (_panel?.BridgeReadyForTests == true &&
-            _panel.IdentityForTests.EditorAttached &&
-            _panel.FrameCountForTests >= 3)
+            _panel.ProtocolResultRowsForTests >= 1)
         {
             var count = EditorInterface.Singleton.GetBaseControl()
                 .FindChildren("*", "EditorDock", recursive: true, owned: false)
@@ -101,8 +153,39 @@ public partial class CsProfilerPlugin : EditorPlugin
                 return;
             }
             GD.Print("CS_PROFILER_EDITOR_ATTACHED_ASSERTIONS_OK docks=1 " +
-                     $"editor_play=true frames={_panel.FrameCountForTests}");
-            FinishEditorAttachedProbe(0);
+                     $"strict_protocol_rows={_panel.ProtocolResultRowsForTests}");
+            var tree = GetTree();
+            var disableTimer = new Godot.Timer { OneShot = true, WaitTime = 0.1 };
+            tree.Root.AddChild(disableTimer);
+            disableTimer.Timeout += () =>
+            {
+                EditorInterface.Singleton.SetPluginEnabled("godot_csharp_profiler", false);
+                var verifyTimer = new Godot.Timer { OneShot = true, WaitTime = 0.5 };
+                tree.Root.AddChild(verifyTimer);
+                verifyTimer.Timeout += () =>
+                {
+                    if (ProjectSettings.HasSetting(ProfilerAutoloadPolicy.Setting) ||
+                        EditorInterface.Singleton.IsPluginEnabled("godot_csharp_profiler"))
+                    {
+                        GD.PushError("CS_PROFILER_DISABLE_ASSERTIONS_FAILED plugin or owned autoload remained after disable.");
+                        tree.Quit(1);
+                        return;
+                    }
+                    ProjectSettings.SetSetting("editor_plugins/enabled", Array.Empty<string>());
+                    var saveError = ProjectSettings.Save();
+                    if (saveError != Error.Ok)
+                    {
+                        GD.PushError($"CS_PROFILER_DISABLE_ASSERTIONS_FAILED plugin state save returned {saveError}.");
+                        tree.Quit(1);
+                        return;
+                    }
+                    GD.Print("CS_PROFILER_DISABLE_ASSERTIONS_OK plugin_disabled=true autoload_removed=true");
+                    tree.Quit(0);
+                };
+                verifyTimer.Start();
+            };
+            disableTimer.Start();
+            _editorAttachedProbeRunning = false;
         }
         else if (now >= _editorAttachedProbeDeadline)
         {
@@ -110,7 +193,7 @@ public partial class CsProfilerPlugin : EditorPlugin
             GD.PushError("CS_PROFILER_EDITOR_ATTACHED_ASSERTIONS_FAILED bridge timeout " +
                          $"ready={_panel?.BridgeReadyForTests} " +
                          $"editor_play={identity.EditorAttached} role={identity.Role} " +
-                         $"name={identity.DisplayName} frames={_panel?.FrameCountForTests} " +
+                         $"name={identity.DisplayName} strict_protocol_rows={_panel?.ProtocolResultRowsForTests} " +
                          $"status={_panel?.StatusTextForTests}");
             FinishEditorAttachedProbe(1);
         }
@@ -124,4 +207,6 @@ public partial class CsProfilerPlugin : EditorPlugin
         GetTree().Quit(exitCode);
     }
 }
+#else
+public partial class CsProfilerPlugin : Godot.Node { }
 #endif

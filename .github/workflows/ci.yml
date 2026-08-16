@@ -24,6 +24,8 @@ jobs:
       - name: Build addon and weaver
         shell: pwsh
         run: |
+          dotnet build GodotCSharpProfiler.csproj -c Debug
+          dotnet build GodotCSharpProfiler.csproj -c ExportDebug
           dotnet build GodotCSharpProfiler.csproj -c Release
           dotnet build src/GodotCSharpProfiler.Fody/GodotCSharpProfiler.Fody.csproj -c Release
       - name: Test

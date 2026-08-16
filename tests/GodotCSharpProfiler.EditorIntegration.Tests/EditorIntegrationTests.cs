@@ -210,6 +210,16 @@ public sealed class EditorIntegrationTests
     }
 
     [Fact]
+    public void Runtime_bridge_autoload_policy_recognizes_only_the_exact_owned_path()
+    {
+        Assert.True(ProfilerAutoloadPolicy.IsOwnedValue(ProfilerAutoloadPolicy.ScriptPath));
+        Assert.True(ProfilerAutoloadPolicy.IsOwnedValue("*" + ProfilerAutoloadPolicy.ScriptPath));
+        Assert.False(ProfilerAutoloadPolicy.IsOwnedValue("res://foreign/Bridge.cs"));
+        Assert.False(ProfilerAutoloadPolicy.IsOwnedValue(null));
+        Assert.Equal("autoload/GodotCSharpProfilerBridge", ProfilerAutoloadPolicy.Setting);
+    }
+
+    [Fact]
     public void Project_installer_adapter_checks_package_before_previewing()
     {
         using var project = TemporaryProject.Create();

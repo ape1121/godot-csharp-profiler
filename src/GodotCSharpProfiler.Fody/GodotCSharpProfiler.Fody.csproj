@@ -14,6 +14,10 @@
     <NoWarn>$(NoWarn);NU5100;NU5128</NoWarn>
   </PropertyGroup>
   <ItemGroup>
+    <!-- A release pack uses an isolated BaseIntermediateOutputPath. Keep the conventional
+         repository obj tree excluded even when MSBuild's default excludes move elsewhere. -->
+    <Compile Remove="obj/**/*.cs" />
+    <None Remove="obj/**/*" />
     <!-- FodyHelpers 6.9.3 carries Fody's signed Mono.Cecil 0.11.6 build. -->
     <PackageReference Include="FodyHelpers" Version="6.9.3" PrivateAssets="all" />
     <None Include="$(TargetPath)" Pack="true" PackagePath="weaver/" Visible="false" />

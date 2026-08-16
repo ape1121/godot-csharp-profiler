@@ -92,7 +92,9 @@ static void TestExtractedProject(string archive, string shell, string implicitUs
         Assert(installed.Contains("GodotCSharpProfilerSamplingDependencies BEGIN", StringComparison.Ordinal), "Owned sampling import was not installed.");
         Assert(installed.Contains("unknown-content-sentinel", StringComparison.Ordinal) && installed.Contains("CustomUnknownProperty", StringComparison.Ordinal) && installed.Contains("UnknownTarget", StringComparison.Ordinal), "Unknown project content was not preserved.");
         Assert(BytesEqual(configBytes, File.ReadAllBytes(config)), "Sampling install changed existing NuGet.Config.");
-        Run("dotnet", $"build \"{project}\" --nologo", root, $"build after sampling setup ({implicitUsings})");
+        Run("dotnet", $"build \"{project}\" -c Debug --nologo", root, $"Debug build after dependency setup ({implicitUsings})");
+        Assert(File.Exists(Path.Combine(root, ".godot", "mono", "temp", "bin", "Debug", "GodotSharpEditor.dll")),
+            "Setup did not copy GodotSharpEditor.dll required by the Debug game process.");
 
         Run(shell, $"-NoProfile -File \"{setup}\" -Project \"{project}\" -EnableAutomatic", root, "automatic redirect", expectedExitCode: 1);
         Assert(File.ReadAllText(project) == installed, "Rejected automatic request changed the project.");

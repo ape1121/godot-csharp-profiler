@@ -9,6 +9,8 @@ export_presets.cfg
 **/obj/
 *.user
 *.suo
+*.uid
+*.import
 
 # IDE / OS
 .vscode/

@@ -91,6 +91,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private bool _updatingSelector;
     private bool _rebuildingTree;
     private readonly List<string> _displayedRowsForTests = new();
+    private int _protocolResultRowsForTests;
     private bool _sessionActive;
     private readonly CsProfilerSessionDiscoveryState _discovery = new();
     private string _runtimeDescription = "";
@@ -102,6 +103,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     internal string StatusTextForTests => _statsLabel?.Text ?? "";
     internal string[] DisplayedRowsForTests() => _displayedRowsForTests.ToArray();
     internal int FrameCountForTests => _frames.Count;
+    internal int ProtocolResultRowsForTests => _protocolResultRowsForTests;
     internal int SelectedIndexForTests => _selectedIndex;
     internal bool BridgeReadyForTests => _discovery.BridgeReady;
     internal CsProfilerRuntimeIdentity IdentityForTests => _discovery.Identity;
@@ -113,9 +115,12 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     internal void RequestCaptureForTests()
     {
         if (_profilingRequested) return;
+        _controller?.SelectManualOnly();
         _profilingRequested = true;
         _controller?.Start();
     }
+
+    internal void RequestStopForTests() => _controller?.Stop();
 
     public override void _Ready()
     {
@@ -290,7 +295,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         parent.AddChild(row);
         row.AddChild(new Label { Text = label });
         var edit = new LineEdit { Text = value, SizeFlagsHorizontal = SizeFlags.ExpandFill };
-        edit.TextChanged += changed;
+        edit.TextChanged += text => changed(text);
         row.AddChild(edit);
         return edit;
     }
@@ -302,7 +307,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         parent.AddChild(row);
         row.AddChild(new Label { Text = label });
         var spin = new SpinBox { MinValue = minimum, MaxValue = maximum, Value = value, Rounded = true };
-        spin.ValueChanged += changed;
+        spin.ValueChanged += newValue => changed(newValue);
         row.AddChild(spin);
         return spin;
     }
@@ -375,6 +380,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private void RenderResultGroups(IReadOnlyList<ResultGroupViewState> groups)
     {
         if (_resultTabs == null) return;
+        _protocolResultRowsForTests = groups.Where(item => !item.IsCrossSourceTotal).Sum(item => item.Rows.Count);
         foreach (var child in _resultTabs.GetChildren()) child.QueueFree();
         foreach (var group in groups.Where(item => !item.IsCrossSourceTotal))
         {
@@ -964,4 +970,6 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             _collapsedPaths.Remove(path);
     }
 }
+#else
+public partial class CsProfilerPanel : Godot.Control { }
 #endif

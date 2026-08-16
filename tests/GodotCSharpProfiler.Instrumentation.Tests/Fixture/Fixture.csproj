@@ -1,4 +1,4 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup><TargetFramework>net10.0</TargetFramework><DebugType>portable</DebugType><Nullable>enable</Nullable></PropertyGroup>
+  <PropertyGroup><TargetFramework>net8.0</TargetFramework><DebugType>portable</DebugType><Nullable>enable</Nullable></PropertyGroup>
   <ItemGroup><Compile Include="../../../addons/godot_csharp_profiler/Runtime/Instrumentation/InstrumentationRecorder.cs" Link="InstrumentationRecorder.cs" /></ItemGroup>
 </Project>

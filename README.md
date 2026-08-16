@@ -63,7 +63,7 @@ Scopes become inert when no capture owns the runtime. Main-thread scopes form a 
 | Environment | Manual | Sampling | Automatic | Notes |
 |---|---:|---:|---:|---|
 | Godot 4.7 .NET, .NET 8, Windows x64 | Expected | Supported by .NET EventPipe; release validation required | Expected | CI builds/tests/packages on Windows but does not launch Godot. |
-| Godot 4.7 .NET, .NET 8, Linux x64 | Expected | Supported by .NET EventPipe; permissions/runtime policy apply | Expected | CI builds/tests/packages on Linux but does not launch Godot. |
+| Godot 4.7.1 .NET, .NET 8, Linux x64 | Verified editor-play lifecycle | Managed EventPipe suite verified; permissions/runtime policy apply | Verified build/weave path | Local release acceptance launched Godot headless, registered one dock/bridge, captured and rendered a strict-protocol Manual result, then disabled cleanly. CI itself does not launch Godot. |
 | macOS | Unverified | Unverified | Unverified | No release claim until tested. |
 | Android/iOS/Web, consoles, native AOT/export templates | Unsupported/unverified | Generally unavailable or constrained | Unverified | Editor-oriented addon; do not ship profiler integration without validation. |
 | Godot non-.NET | Unsupported | Unsupported | Unsupported | C# project required. |
