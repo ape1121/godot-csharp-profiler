@@ -6,6 +6,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <PackageId>GodotCSharpProfiler.Fody</PackageId>
+    <Version>0.1.0-dev</Version>
     <Description>Build-only Fody automatic instrumentation for GodotCSharpProfiler.</Description>
     <IncludeBuildOutput>false</IncludeBuildOutput>
     <GeneratePackageOnBuild>false</GeneratePackageOnBuild>

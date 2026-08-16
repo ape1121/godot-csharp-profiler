@@ -21,6 +21,8 @@ public sealed class ModuleWeaver : BaseModuleWeaver
     {
         var options = InstrumentationOptions.Parse(Config, ProjectDirectoryPath);
         var hash = ConfigurationHash(options);
+        if (options.EmbeddedConfigHash is not null && options.EmbeddedConfigHash != hash)
+            throw new WeavingException($"GodotCSharpProfiler embedded ConfigHash '{options.EmbeddedConfigHash}' does not match normalized configuration '{hash}'. Regenerate FodyWeavers.xml.");
         var marker = ModuleDefinition.Assembly.CustomAttributes.FirstOrDefault(a => a.AttributeType.FullName == MarkerName);
         if (marker is not null)
         {
@@ -36,15 +38,16 @@ public sealed class ModuleWeaver : BaseModuleWeaver
 
         var classified = AllMethods(ModuleDefinition.Types).Select(m => Classify(m, options)).OrderBy(x => x.Label, StringComparer.Ordinal).ToArray();
         var selected = classified.Where(x => x.Eligible).ToArray();
-        if (selected.Length > options.MaximumMethods || selected.Length > InstrumentationOptions.DefaultMaximumMethods)
-            throw new WeavingException($"GodotCSharpProfiler selected {selected.Length} methods, exceeding the configured/runtime bound of {Math.Min(options.MaximumMethods, InstrumentationOptions.DefaultMaximumMethods)}. Tighten ordered include/exclude rules; instrumentation never truncates silently.");
+        if (selected.Length > options.MaximumMethods)
+            throw new WeavingException($"GodotCSharpProfiler selected {selected.Length} methods, exceeding the configured/runtime bound of {options.MaximumMethods}. Tighten ordered include/exclude rules; instrumentation never truncates silently.");
         var longLabel = selected.FirstOrDefault(x => Encoding.UTF8.GetByteCount(x.Label) > options.MaximumLabelLength);
         if (longLabel is not null)
             throw new WeavingException($"GodotCSharpProfiler canonical label exceeds MaximumLabelLength={options.MaximumLabelLength}: '{longLabel.Label}'. Tighten filters or increase the bounded label limit.");
 
         for (var id = 0; id < selected.Length; id++) Instrument(selected[id].Method, id, enter!, exit!, tokenType!);
+        AddManifest(hash, selected.Select(item => item.Label).ToArray(), classified.Length - selected.Length);
         AddMarker(hash);
-        WriteInfo($"GodotCSharpProfiler instrumented {selected.Length} methods (config {hash}).");
+        WriteInfo($"GodotCSharpProfiler instrumented {selected.Length} methods and skipped {classified.Length - selected.Length} (config {hash}).");
     }
 
     public override IEnumerable<string> GetAssembliesForScanning() => new[] { "mscorlib", "System", "System.Runtime", "netstandard" };
@@ -75,31 +78,37 @@ public sealed class ModuleWeaver : BaseModuleWeaver
         else if (Generated(method)) reason = "generated";
         else if (HasAttribute(method, "System.Runtime.CompilerServices.AsyncStateMachineAttribute")) reason = "async";
         else if (HasAttribute(method, "System.Runtime.CompilerServices.IteratorStateMachineAttribute")) reason = "iterator";
-        else if (SafeNamespacePrefixes.Any(p => method.DeclaringType.Namespace == p || method.DeclaringType.Namespace.StartsWith(p + ".", StringComparison.Ordinal))) reason = "safe preset";
+        else if (SafeNamespacePrefixes.Any(p => method.DeclaringType.Namespace == p || method.DeclaringType.Namespace.StartsWith(p + ".", StringComparison.Ordinal))) reason = "protected namespace";
         else if (Unsupported(method)) reason = "unsupported IL";
         else if (Trivial(method)) reason = "trivial";
-        else if (!SourceAllowed(method, options.ProjectRoot)) reason = "source filter";
+        else if (!SourceAllowed(method, options.ProjectRoot)) reason = "missing or non-project source";
 
         var included = reason is null;
-        foreach (var rule in options.Rules.OrderBy(r => r.Order))
+        if (included)
         {
-            if (rule.Matches("namespace", method.DeclaringType.Namespace) || rule.Matches("type", method.DeclaringType.FullName.Replace('/', '+')) || rule.Matches("method", label))
-                included = rule.Include;
+            foreach (var rule in options.Rules)
+            {
+                if (rule.Matches("namespace", method.DeclaringType.Namespace) || rule.Matches("type", method.DeclaringType.FullName.Replace('/', '+')) || rule.Matches("method", label))
+                    included = rule.Include;
+            }
         }
-        // Hard safety/IL exclusions cannot be overridden by user globs.
-        if (reason is "bodyless/native/abstract" or "byref return" or "vararg" or "generated" or "async" or "iterator" or "unsupported IL" or "constructor" or "accessor" or "trivial") included = false;
         return new Classification(method, label, included, included ? "eligible" : reason ?? "excluded by rule");
     }
 
     private static bool SourceAllowed(MethodDefinition method, string root)
     {
-        var documents = method.DebugInformation.SequencePoints.Select(s => s.Document?.Url).Where(x => !string.IsNullOrEmpty(x)).Distinct(StringComparer.Ordinal).ToArray();
-        if (documents.Length == 0) return true;
+        if (root.Length == 0) return false;
+        var sequencePoints = method.DebugInformation.SequencePoints.Where(point => !point.IsHidden).ToArray();
+        if (sequencePoints.Length == 0) return false;
+        var documents = sequencePoints.Select(point => point.Document?.Url).Where(value => !string.IsNullOrWhiteSpace(value)).Distinct(StringComparer.Ordinal).ToArray();
+        if (documents.Length == 0) return false;
         foreach (var raw in documents)
         {
-            var path = InstrumentationOptions.CanonicalPath(raw!);
+            string path;
+            try { path = InstrumentationOptions.CanonicalPath(raw!); }
+            catch (WeavingException) { return false; }
             if (path.IndexOf("/obj/", StringComparison.OrdinalIgnoreCase) >= 0 || path.EndsWith(".g.cs", StringComparison.OrdinalIgnoreCase) || path.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase)) return false;
-            if (root.Length != 0 && !(path == root || path.StartsWith(root + "/", StringComparison.Ordinal))) return false;
+            if (!(path == root || path.StartsWith(root + "/", StringComparison.Ordinal))) return false;
         }
         return true;
     }
@@ -170,6 +179,36 @@ public sealed class ModuleWeaver : BaseModuleWeaver
         if (result is not null) il.Append(il.Create(OpCodes.Ldloc, result));
         il.Append(il.Create(OpCodes.Ret));
         body.ExceptionHandlers.Add(new ExceptionHandler(ExceptionHandlerType.Finally) { TryStart = originalFirst, TryEnd = finallyStart, HandlerStart = finallyStart, HandlerEnd = after });
+    }
+
+    private void AddManifest(string hash, IReadOnlyList<string> labels, int skipped)
+    {
+        var manifest = new TypeDefinition("Apeworks.GodotCSharpProfiler.Instrumentation", "GodotCSharpProfilerInstrumentationManifest", TypeAttributes.Class | TypeAttributes.Abstract | TypeAttributes.Sealed | TypeAttributes.Public, ModuleDefinition.TypeSystem.Object);
+        AddConstant("ConfigHash", hash, ModuleDefinition.TypeSystem.String);
+        AddConstant("InstrumentedCount", labels.Count, ModuleDefinition.TypeSystem.Int32);
+        AddConstant("SkippedCount", skipped, ModuleDefinition.TypeSystem.Int32);
+
+        var getLabel = new MethodDefinition("GetLabel", MethodAttributes.Public | MethodAttributes.Static | MethodAttributes.HideBySig, ModuleDefinition.TypeSystem.String);
+        getLabel.Parameters.Add(new ParameterDefinition("methodId", ParameterAttributes.None, ModuleDefinition.TypeSystem.Int32));
+        var il = getLabel.Body.GetILProcessor();
+        var targets = labels.Select(_ => il.Create(OpCodes.Nop)).ToArray();
+        il.Emit(OpCodes.Ldarg_0);
+        il.Emit(OpCodes.Switch, targets);
+        il.Emit(OpCodes.Ldnull);
+        il.Emit(OpCodes.Ret);
+        for (var id = 0; id < labels.Count; id++)
+        {
+            il.Append(targets[id]);
+            il.Emit(OpCodes.Ldstr, labels[id]);
+            il.Emit(OpCodes.Ret);
+        }
+        manifest.Methods.Add(getLabel);
+        ModuleDefinition.Types.Add(manifest);
+
+        void AddConstant(string name, object value, TypeReference type)
+        {
+            manifest.Fields.Add(new FieldDefinition(name, FieldAttributes.Public | FieldAttributes.Static | FieldAttributes.Literal | FieldAttributes.HasDefault, type) { Constant = value });
+        }
     }
 
     private void AddMarker(string hash)
