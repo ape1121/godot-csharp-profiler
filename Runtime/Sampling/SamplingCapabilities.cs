@@ -1,3 +1,4 @@
+#nullable enable
 namespace Apeworks.GodotCSharpProfiler.Runtime.Sampling;
 
 public enum SampleIntervalConfigurationScope
