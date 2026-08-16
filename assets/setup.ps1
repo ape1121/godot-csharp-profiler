@@ -14,7 +14,29 @@ In Godot, enable Godot C# Profiler, open its Automatic mode, choose Install, rev
 '@
 }
 
-$root = (Resolve-Path (Join-Path $PSScriptRoot '../../..')).Path
+function Assert-SafeExistingPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $current = $fullPath
+    while ($true) {
+        try { $item = Get-Item -Force -LiteralPath $current }
+        catch { throw "$Description does not exist or has an inaccessible parent: $fullPath" }
+        $linkType = $item.LinkType
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or -not [string]::IsNullOrEmpty($linkType)) {
+            throw "$Description must not be a symlink or reparse point and must not have one in its parent chain: $current"
+        }
+        $parent = [IO.Path]::GetDirectoryName($current)
+        if ([string]::IsNullOrEmpty($parent) -or $parent -eq $current) { break }
+        $current = $parent
+    }
+    return $fullPath
+}
+
+$root = Assert-SafeExistingPath ([IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../../..'))) 'Godot project root'
 if (-not $Project) {
     $projects = @(Get-ChildItem -LiteralPath $root -Filter *.csproj -File)
     if ($projects.Count -ne 1) { throw 'Exactly one top-level .csproj is required; pass -Project explicitly.' }
@@ -22,10 +44,11 @@ if (-not $Project) {
 }
 $Project = [IO.Path]::GetFullPath($Project)
 if ([IO.Path]::GetDirectoryName($Project) -ne $root) { throw 'The project must be top-level in the Godot project.' }
-if (-not (Test-Path -LiteralPath $Project -PathType Leaf)) { throw "Project does not exist: $Project" }
+$Project = Assert-SafeExistingPath $Project 'Selected project'
+if ((Get-Item -Force -LiteralPath $Project).PSIsContainer) { throw "Project is not a file: $Project" }
 
-$props = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'GodotCSharpProfiler.Dependencies.props'))
-if (-not (Test-Path -LiteralPath $props -PathType Leaf)) { throw "Dependency props do not exist: $props" }
+$props = Assert-SafeExistingPath ([IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'GodotCSharpProfiler.Dependencies.props'))) 'Dependency props'
+if ((Get-Item -Force -LiteralPath $props).PSIsContainer) { throw "Dependency props are not a file: $props" }
 
 # A deliberately narrow, ownership-marked textual edit keeps every unknown project
 # element, comment, encoding, and newline byte unchanged. This script never edits
@@ -33,6 +56,9 @@ if (-not (Test-Path -LiteralPath $props -PathType Leaf)) { throw "Dependency pro
 $label = 'GodotCSharpProfilerSamplingDependencies'
 $begin = "<!-- $label BEGIN -->"
 $end = "<!-- $label END -->"
+$root = Assert-SafeExistingPath $root 'Godot project root'
+$Project = Assert-SafeExistingPath $Project 'Selected project'
+$props = Assert-SafeExistingPath $props 'Dependency props'
 $original = [IO.File]::ReadAllBytes($Project)
 $encoding = [Text.UTF8Encoding]::new($false, $true)
 try { $text = $encoding.GetString($original) }
@@ -66,16 +92,24 @@ if (-not $PSCmdlet.ShouldProcess($Project, "$Action owned profiler sampling depe
 $replacement = $encoding.GetBytes($newText)
 $temp = Join-Path ([IO.Path]::GetDirectoryName($Project)) ('.' + [IO.Path]::GetFileName($Project) + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
 try {
+    $root = Assert-SafeExistingPath $root 'Godot project root'
+    $Project = Assert-SafeExistingPath $Project 'Selected project'
+    $props = Assert-SafeExistingPath $props 'Dependency props'
     [IO.File]::WriteAllBytes($temp, $replacement)
     [xml]$null = [IO.File]::ReadAllText($temp, $encoding)
+    $root = Assert-SafeExistingPath $root 'Godot project root'
+    $Project = Assert-SafeExistingPath $Project 'Selected project'
+    $props = Assert-SafeExistingPath $props 'Dependency props'
     [IO.File]::Move($temp, $Project, $true)
 } catch {
+    $failure = $_
     Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
     # Move is the sole commit point. If anything unexpectedly changed the target,
     # restore its exact pre-transaction bytes before reporting failure.
+    $Project = Assert-SafeExistingPath $Project 'Selected project during rollback'
     if (-not [Linq.Enumerable]::SequenceEqual([byte[]]$original, [byte[]][IO.File]::ReadAllBytes($Project))) {
         [IO.File]::WriteAllBytes($Project, $original)
     }
-    throw
+    throw $failure
 }
 Write-Host "$Action complete. Run 'dotnet restore', rebuild, and restart Godot."
