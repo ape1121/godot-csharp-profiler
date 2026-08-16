@@ -7,6 +7,13 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>
   <ItemGroup>
+    <!-- Standalone tests, feasibility proofs, and build tools own their dependencies in separate projects. -->
     <Compile Remove="tests/**/*.cs" />
+    <Compile Remove="spikes/**/*.cs" />
+    <Compile Remove="src/**/*.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Diagnostics.NETCore.Client" Version="0.2.661903" />
+    <PackageReference Include="Microsoft.Diagnostics.Tracing.TraceEvent" Version="3.2.5" />
   </ItemGroup>
 </Project>
