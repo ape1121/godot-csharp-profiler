@@ -3,7 +3,7 @@ namespace Apeworks.GodotCSharpProfiler.Protocol;
 
 public static class ProtocolVersion
 {
-    public const int Major = 1;
+    public const int Major = 2;
     public const int Minor = 0;
 }
 
@@ -15,6 +15,9 @@ public static class ProtocolLimits
     public const int MaxRoleCharacters = 32;
     public const int FingerprintCharacters = 32;
     public const int MaxErrorCharacters = 512;
+    public const int MaxMethodLabelCharacters = 512;
+    public const int MaxConfigurationListCharacters = 1024;
+    public const int MaxManualLabelPrefixCharacters = 128;
     public const int MaxMethodsPerBatch = 4096;
     public const int MaxDepth = 8;
     /// <summary>Sampling interval bounds: 100 microseconds (10 kHz) through 1 second (1 Hz).</summary>
@@ -47,7 +50,10 @@ public readonly record struct QualityCounters(long Observed, long Dropped, long 
         Overflowed + other.Overflowed, Invalid + other.Invalid));
 }
 
-public readonly record struct MethodSample(long MethodId, long Value, long Calls);
+public readonly record struct MethodSample(long MethodId, string Label, long Value, long Calls)
+{
+    public MethodSample(long methodId, long value, long calls) : this(methodId, $"Method {methodId}", value, calls) { }
+}
 
 public abstract record ProtocolMessage(int Major, int Minor, string RuntimeToken);
 public sealed record HelloMessage(int Major, int Minor, string RuntimeToken, string Role, int MaxBatchBytes)
@@ -57,8 +63,15 @@ public sealed record CapabilitiesMessage(int Major, int Minor, string RuntimeTok
     int MaxMethods, int MaxBatchBytes, int MaxDepth)
     : ProtocolMessage(Major, Minor, RuntimeToken);
 public sealed record ConfigureMessage(int Major, int Minor, string RuntimeToken, long Generation,
-    string Fingerprint, CaptureModes Modes, long RequestedSamplingIntervalNanoseconds, int MaxMethods)
-    : ProtocolMessage(Major, Minor, RuntimeToken);
+    string Fingerprint, CaptureModes Modes, long RequestedSamplingIntervalNanoseconds, int MaxMethods,
+    string SamplingIncludeAssemblies, string SamplingExcludeAssemblies, string ManualLabelPrefix)
+    : ProtocolMessage(Major, Minor, RuntimeToken)
+{
+    public ConfigureMessage(int major, int minor, string runtimeToken, long generation, string fingerprint,
+        CaptureModes modes, long requestedSamplingIntervalNanoseconds, int maxMethods)
+        : this(major, minor, runtimeToken, generation, fingerprint, modes, requestedSamplingIntervalNanoseconds,
+            maxMethods, string.Empty, string.Empty, string.Empty) { }
+}
 public sealed record StartMessage(int Major, int Minor, string RuntimeToken, long Generation, string Fingerprint)
     : ProtocolMessage(Major, Minor, RuntimeToken);
 public sealed record StateMessage(int Major, int Minor, string RuntimeToken, long Generation, long Sequence,
@@ -92,7 +105,7 @@ public static class ProtocolSchema
         {
             [MessageKind.Hello] = ["kind", "major", "minor", "runtimeToken", "role", "maxBatchBytes"],
             [MessageKind.Capabilities] = ["kind", "major", "minor", "runtimeToken", "generation", "modes", "samplingIntervalRuntimeConfigurable", "effectiveSamplingIntervalNanoseconds", "maxMethods", "maxBatchBytes", "maxDepth"],
-            [MessageKind.Configure] = ["kind", "major", "minor", "runtimeToken", "generation", "fingerprint", "modes", "requestedSamplingIntervalNanoseconds", "maxMethods"],
+            [MessageKind.Configure] = ["kind", "major", "minor", "runtimeToken", "generation", "fingerprint", "modes", "requestedSamplingIntervalNanoseconds", "maxMethods", "samplingIncludeAssemblies", "samplingExcludeAssemblies", "manualLabelPrefix"],
             [MessageKind.Start] = ["kind", "major", "minor", "runtimeToken", "generation", "fingerprint"],
             [MessageKind.State] = ["kind", "major", "minor", "runtimeToken", "generation", "sequence", "fingerprint", "state", "source", "completeness", "partialReason", "observed", "dropped", "overflowed", "invalid"],
             [MessageKind.Batch] = ["kind", "major", "minor", "runtimeToken", "generation", "sequence", "fingerprint", "source", "exactCalls", "cpuTime", "observed", "dropped", "overflowed", "invalid", "methods"],

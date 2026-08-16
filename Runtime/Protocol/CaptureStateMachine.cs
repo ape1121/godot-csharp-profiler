@@ -145,7 +145,10 @@ public sealed class CaptureStateMachine
         Source = message.Source;
         Completeness = message.Completeness;
         PartialReason = message.PartialReason;
-        Quality = message.Quality;
+        Quality = new QualityCounters(Math.Max(Quality.Observed, message.Quality.Observed),
+            Math.Max(Quality.Dropped, message.Quality.Dropped),
+            Math.Max(Quality.Overflowed, message.Quality.Overflowed),
+            Math.Max(Quality.Invalid, message.Quality.Invalid));
         if (State is CaptureState.Complete or CaptureState.Partial or CaptureState.Error) LeaseOwner = null;
         return true;
     }

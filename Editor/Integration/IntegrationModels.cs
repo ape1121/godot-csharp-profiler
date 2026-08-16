@@ -122,13 +122,21 @@ public sealed class EditorCaptureCoordinator
         var interval = (normalized.Modes & CaptureModes.Sampling) != 0 ? normalized.Sampling.RequestedIntervalNanoseconds : 0;
         var maxMethods = Math.Min(normalized.Automatic.MaxMethods, snapshot.CapabilityMaxMethods);
         if (normalized.Modes == CaptureModes.None || (normalized.Modes & ~snapshot.SupportedModes) != 0 ||
-            maxMethods < 1 || (interval != 0 && !snapshot.SamplingIntervalRuntimeConfigurable)) return false;
+            maxMethods < 1 || (interval != 0 && !snapshot.SamplingIntervalRuntimeConfigurable) ||
+            !ValidConfigurationText(normalized.Sampling.IncludeAssemblies,
+                ProtocolLimits.MaxConfigurationListCharacters) ||
+            !ValidConfigurationText(normalized.Sampling.ExcludeAssemblies,
+                ProtocolLimits.MaxConfigurationListCharacters) ||
+            !ValidConfigurationText(normalized.Manual.LabelPrefix,
+                ProtocolLimits.MaxManualLabelPrefixCharacters)) return false;
         snapshot = snapshot with { Generation = generation, Sequence = 0, Fingerprint = normalized.Fingerprint,
             LeaseOwner = owner, Modes = normalized.Modes, State = CaptureState.Starting,
             Completeness = CaptureCompleteness.InProgress, PartialReason = PartialReason.None, Quality = QualityCounters.Zero };
         pending.Clear();
         send(StrictWireAdapter.Serialize(new ConfigureMessage(ProtocolVersion.Major, ProtocolVersion.Minor,
-            snapshot.RuntimeToken, generation, normalized.Fingerprint, normalized.Modes, interval, maxMethods)));
+            snapshot.RuntimeToken, generation, normalized.Fingerprint, normalized.Modes, interval, maxMethods,
+            normalized.Sampling.IncludeAssemblies, normalized.Sampling.ExcludeAssemblies,
+            normalized.Manual.LabelPrefix)));
         send(StrictWireAdapter.Serialize(new StartMessage(ProtocolVersion.Major, ProtocolVersion.Minor,
             snapshot.RuntimeToken, generation, normalized.Fingerprint)));
         SnapshotChanged?.Invoke(snapshot);
@@ -181,18 +189,24 @@ public sealed class EditorCaptureCoordinator
         QualityCounters quality;
         try { quality = snapshot.Quality.Add(message.Quality); }
         catch (OverflowException) { return false; }
-        if (!pending.TryGetValue(message.Source, out var methods)) pending[message.Source] = methods = new();
+        pending.TryGetValue(message.Source, out var existing);
+        var methods = existing is null
+            ? new Dictionary<long, Aggregate>()
+            : existing.ToDictionary(pair => pair.Key, pair => pair.Value);
         try
         {
             foreach (var sample in message.Methods)
             {
                 methods.TryGetValue(sample.MethodId, out var current);
+                if (current.Label is not null && !string.Equals(current.Label, sample.Label, StringComparison.Ordinal))
+                    return false;
                 var maximum = sample.Calls == 0 ? 0 : sample.Value / (double)sample.Calls;
-                methods[sample.MethodId] = new Aggregate(checked(current.Value + sample.Value),
+                methods[sample.MethodId] = new Aggregate(sample.Label, checked(current.Value + sample.Value),
                     checked(current.Calls + sample.Calls), Math.Max(current.Maximum, maximum));
             }
         }
         catch (OverflowException) { return false; }
+        pending[message.Source] = methods;
         snapshot = snapshot with { Sequence = message.Sequence, Source = message.Source, Quality = quality };
         return true;
     }
@@ -209,8 +223,9 @@ public sealed class EditorCaptureCoordinator
             _ => false
         };
         if (!allowed) return false;
+        var quality = MergeTerminalQuality(snapshot.Quality, message.Quality);
         snapshot = snapshot with { State = message.State, Sequence = message.Sequence, Source = message.Source,
-            Completeness = message.Completeness, PartialReason = message.PartialReason, Quality = message.Quality,
+            Completeness = message.Completeness, PartialReason = message.PartialReason, Quality = quality,
             LeaseOwner = message.State is CaptureState.Complete or CaptureState.Partial or CaptureState.Error ? null : snapshot.LeaseOwner };
         return true;
     }
@@ -241,6 +256,9 @@ public sealed class EditorCaptureCoordinator
 
     private bool Reject(string status) { Rejected?.Invoke(status); return false; }
 
+    private static bool ValidConfigurationText(string value, int maximum) => value is not null &&
+        value.Length <= maximum && !value.Any(char.IsControl);
+
     private void CommitResults()
     {
         var groups = new List<SourceResultGroup>();
@@ -252,8 +270,8 @@ public sealed class EditorCaptureCoordinator
             {
                 var value = pair.Value;
                 return source == CaptureSource.Sampling
-                    ? new ResultRow($"Method {pair.Key}", value.Value, total == 0 ? 0 : value.Value * 100.0 / total, 0, 0, 0, 0)
-                    : new ResultRow($"Method {pair.Key}", 0, 0, value.Calls, value.Value / 1_000_000.0,
+                    ? new ResultRow(value.Label!, value.Value, total == 0 ? 0 : value.Value * 100.0 / total, 0, 0, 0, 0)
+                    : new ResultRow(value.Label!, 0, 0, value.Calls, value.Value / 1_000_000.0,
                         value.Calls == 0 ? 0 : value.Value / 1_000_000.0 / value.Calls, value.Maximum / 1_000_000.0);
             }).ToArray();
             groups.Add(new SourceResultGroup(source, rows));
@@ -264,5 +282,9 @@ public sealed class EditorCaptureCoordinator
         pending.Clear();
     }
 
-    private readonly record struct Aggregate(long Value, long Calls, double Maximum);
+    private static QualityCounters MergeTerminalQuality(QualityCounters accumulated, QualityCounters terminal) => new(
+        Math.Max(accumulated.Observed, terminal.Observed), Math.Max(accumulated.Dropped, terminal.Dropped),
+        Math.Max(accumulated.Overflowed, terminal.Overflowed), Math.Max(accumulated.Invalid, terminal.Invalid));
+
+    private readonly record struct Aggregate(string? Label, long Value, long Calls, double Maximum);
 }
