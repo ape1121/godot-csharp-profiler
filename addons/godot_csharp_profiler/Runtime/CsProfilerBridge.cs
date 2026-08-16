@@ -9,6 +9,7 @@ public partial class CsProfilerBridge : Node
     public const string MessagePrefix = "cs_profiler";
     public const string ProtocolMessage = MessagePrefix + ":protocol";
     public const string ReadyMessage = MessagePrefix + ":ready";
+    public const string HandshakeMessage = MessagePrefix + ":handshake";
 
     private bool _captureRegistered;
     private string _runtimeToken = "";
@@ -40,6 +41,7 @@ public partial class CsProfilerBridge : Node
         switch (message)
         {
             case "discover": SendReady(); return true;
+            case "handshake": _coordinator?.Announce(); return true;
             case "protocol":
                 if (_coordinator is null || !GodotDebuggerTransport.TryRead(data, out var payload)) return false;
                 return _coordinator.Receive(payload, "godot-editor-debugger");

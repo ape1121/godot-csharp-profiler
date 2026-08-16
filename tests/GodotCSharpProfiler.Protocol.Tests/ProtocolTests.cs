@@ -1,10 +1,35 @@
 #if PROTOCOL_TESTS
 using Apeworks.GodotCSharpProfiler.Protocol;
+using Apeworks.GodotCSharpProfiler.Runtime.Protocol.Adapters;
 
 namespace GodotCSharpProfiler.Protocol.Tests;
 
 public sealed class ProtocolTests
 {
+    [Fact]
+    public void ScalarJsonEnvelopeRoundTripsStrictWireMapsWithinPayloadLimit()
+    {
+        var wire = StrictWireAdapter.Serialize(new HelloMessage(
+            ProtocolVersion.Major, ProtocolVersion.Minor, "runtime", "game", 4096));
+
+        var encoded = WireJsonEnvelope.Encode(wire);
+
+        Assert.InRange(System.Text.Encoding.UTF8.GetByteCount(encoded), 1, ProtocolLimits.MaxPayloadBytes);
+        Assert.True(WireJsonEnvelope.TryDecode(encoded, out var decoded));
+        Assert.NotNull(decoded);
+        Assert.True(new CaptureProtocolParser().TryParse(decoded!, out var parsed, out var failure));
+        Assert.Equal(ParseFailure.None, failure);
+        Assert.IsType<HelloMessage>(parsed);
+    }
+
+    [Fact]
+    public void ScalarJsonEnvelopeRejectsOversizedOrUnsupportedPayloads()
+    {
+        Assert.False(WireJsonEnvelope.TryDecode(new string('x', ProtocolLimits.MaxPayloadBytes + 1), out _));
+        Assert.False(WireJsonEnvelope.TryDecode("null", out _));
+        Assert.False(WireJsonEnvelope.TryDecode("{\"x\":1.5}", out _));
+    }
+
     private const string Token = "runtime-1";
     private const string Fingerprint = "0123456789abcdef0123456789abcdef";
 

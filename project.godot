@@ -1,12 +1,23 @@
+; Engine configuration file.
+; It's best edited using the editor UI and not directly,
+; since the parameters that go here are not all obvious.
+;
+; Format:
+;   [section] ; section goes between []
+;   param=value ; assign values to parameters
+
 config_version=5
 
 [application]
+
 config/name="Godot C# Profiler Development"
 run/main_scene="res://development/Main.tscn"
 config/features=PackedStringArray("4.7", "C#", "Forward Plus")
 
 [dotnet]
+
 project/assembly_name="GodotCSharpProfiler"
 
 [editor_plugins]
+
 enabled=PackedStringArray("res://addons/godot_csharp_profiler/plugin.cfg")

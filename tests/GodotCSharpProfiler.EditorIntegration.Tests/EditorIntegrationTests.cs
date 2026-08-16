@@ -9,6 +9,69 @@ namespace GodotCSharpProfiler.EditorIntegration.Tests;
 public sealed class EditorIntegrationTests
 {
     [Fact]
+    public void CompactDockKeepsCaptureAndCallsPrimaryWhileAdvancedControlsMoveToSettings()
+    {
+        var layout = ProfilerDockLayoutPolicy.ForHeight(180);
+
+        Assert.True(layout.ShowPrimaryToolbar);
+        Assert.True(layout.ShowCalls);
+        Assert.True(layout.ShowSettingsButton);
+        Assert.False(layout.ShowInlineSettings);
+        Assert.False(layout.ShowQualityDetails);
+        Assert.InRange(layout.GraphMinimumHeight, 40, 64);
+    }
+
+    [Fact]
+    public void SamplingIsUniversalDefaultAndManualHooksAreAnOptionalOverlay()
+    {
+        var controller = new ProfilerDockController(new FakeView(), new FakeTransport(), null);
+
+        Assert.Equal(PrimaryMode.Sampling, controller.Configuration.Primary);
+        Assert.False(controller.Configuration.IncludeManual);
+
+        controller.SetManualOverlay(true);
+        Assert.Equal(CaptureModes.Sampling | CaptureModes.ManualScopes, controller.Configuration.Modes);
+    }
+
+    [Fact]
+    public void StartupOnlySamplingUsesRuntimeEffectiveIntervalInsteadOfRejectingStart()
+    {
+        var sent = new Queue<WireMap>();
+        var editor = new EditorCaptureCoordinator("owner", sent.Enqueue);
+        Assert.True(editor.Receive(StrictWireAdapter.Serialize(new HelloMessage(
+            ProtocolVersion.Major, ProtocolVersion.Minor, "runtime", "runtime", 4096))));
+        Assert.True(editor.Receive(StrictWireAdapter.Serialize(new CapabilitiesMessage(
+            ProtocolVersion.Major, ProtocolVersion.Minor, "runtime", 0,
+            CaptureModes.Sampling, false, 2_000_000, 4096, 4096, 8))));
+
+        Assert.True(editor.Start(ModeConfiguration.Default));
+        var configure = Assert.IsType<ConfigureMessage>(Parse(sent.Dequeue()));
+        Assert.Equal(0, configure.RequestedSamplingIntervalNanoseconds);
+    }
+
+    [Fact]
+    public void StartRequestedDuringNegotiationIsQueuedUntilCapabilitiesAreReady()
+    {
+        var sent = new Queue<WireMap>();
+        var endpoint = new EditorCaptureCoordinator("owner", sent.Enqueue);
+        var pending = new PendingCaptureRequest();
+
+        pending.Request(ModeConfiguration.Default);
+        Assert.False(pending.TryStart(endpoint));
+        Assert.Empty(sent);
+
+        Assert.True(endpoint.Receive(StrictWireAdapter.Serialize(new HelloMessage(
+            ProtocolVersion.Major, ProtocolVersion.Minor, "runtime", "runtime", 4096))));
+        Assert.True(endpoint.Receive(StrictWireAdapter.Serialize(new CapabilitiesMessage(
+            ProtocolVersion.Major, ProtocolVersion.Minor, "runtime", 0,
+            CaptureModes.Sampling | CaptureModes.ManualScopes, true, 2_000_000, 4096, 4096, 8))));
+
+        Assert.True(pending.TryStart(endpoint));
+        Assert.Equal(2, sent.Count);
+        Assert.False(pending.HasRequest);
+    }
+
+    [Fact]
     public void Controller_projects_mode_aware_target_commands_settings_and_quality()
     {
         var view = new FakeView();
@@ -321,6 +384,12 @@ public sealed class EditorIntegrationTests
         Assert.True(editor.Receive(State(CaptureState.Complete, 4, QualityCounters.Zero)));
         Assert.Equal(quality, editor.Snapshot.Quality);
         Assert.Equal(5, editor.CompletedResults.Truncated);
+    }
+
+    private static ProtocolMessage Parse(WireMap payload)
+    {
+        Assert.True(new CaptureProtocolParser().TryParse(payload, out var message, out var failure), failure.ToString());
+        return message!;
     }
 
     private static ModeConfiguration TestConfiguration => ModeConfiguration.Default with { IncludeManual = true };

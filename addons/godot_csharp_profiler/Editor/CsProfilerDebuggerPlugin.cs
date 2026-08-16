@@ -16,6 +16,7 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
     private readonly Dictionary<int, EditorCaptureCoordinator> _protocol = new();
     private readonly Dictionary<int, CsProfilerRuntimeIdentity> _identities = new();
     private readonly CsProfilerSessionRouterState _router = new();
+    private readonly PendingCaptureRequest _pendingCapture = new();
     private double _nextOwnedDiscoveryAtSeconds;
 
     public void Initialize(CsProfilerPanel panel)
@@ -94,10 +95,12 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
 
     private void SendControlMessage(bool start)
     {
+        if (start) _pendingCapture.Request(_panel.ConfigurationForProtocol);
+        else _pendingCapture.Cancel();
         ApplyRouteChange(_router.Reconcile(IsSessionActive));
         if (_router.SelectedSessionId < 0) { if (start) SendDiscoveryMessages(); return; }
         if (!_protocol.TryGetValue(_router.SelectedSessionId, out var endpoint)) return;
-        if (start) endpoint.Start(_panel.ConfigurationForProtocol);
+        if (start) _pendingCapture.TryStart(endpoint);
         else endpoint.Stop();
     }
 
@@ -139,6 +142,8 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
             }
             _identities[sessionId] = identity;
             ApplyRouteChange(_router.AcceptReady(sessionId, identity, IsSessionActive));
+            Callable.From(() => SendSessionMessage(sessionId, CsProfilerBridge.HandshakeMessage,
+                new Godot.Collections.Array())).CallDeferred();
             return true;
         }
         if (message != CsProfilerBridge.ProtocolMessage) return false;
@@ -147,7 +152,10 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
             _panel?.ReportDebuggerPayloadError("Profiler protocol payload rejected before conversion.");
             return true;
         }
-        Endpoint(sessionId).Receive(payload);
+        var endpoint = Endpoint(sessionId);
+        endpoint.Receive(payload);
+        if (_router.SelectedSessionId == sessionId && _pendingCapture.HasRequest)
+            Callable.From(() => _pendingCapture.TryStart(endpoint)).CallDeferred();
         return true;
     }
 
@@ -178,7 +186,11 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
         _panel?.OnBridgeReady(change.Identity);
         if (_protocol.TryGetValue(change.SelectedSessionId, out var endpoint))
             _panel?.ApplyProtocolSnapshot(endpoint.Snapshot, change.Identity);
-        if (_panel?.ProfilingRequested == true) Endpoint(change.SelectedSessionId).Start(_panel.ConfigurationForProtocol);
+        if (_panel?.ProfilingRequested == true)
+        {
+            _pendingCapture.Request(_panel.ConfigurationForProtocol);
+            _pendingCapture.TryStart(Endpoint(change.SelectedSessionId));
+        }
     }
 }
 

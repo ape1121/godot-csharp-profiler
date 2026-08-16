@@ -105,17 +105,19 @@ public sealed class ProfilerDockController
         installerStatus = "Preview required after automatic settings changed";
     }
 
-    public void Start()
+    public bool Start()
     {
         var presentation = Presentation();
-        if (presentation.Commands.Start.Enabled)
-            transport.Send(ProfilerCommand.Start, modes.Configuration);
+        if (!presentation.Commands.Start.Enabled) return false;
+        transport.Send(ProfilerCommand.Start, modes.Configuration);
+        return true;
     }
 
-    public void Stop()
+    public bool Stop()
     {
-        if (Presentation().Commands.Stop.Enabled)
-            transport.Send(ProfilerCommand.Stop, modes.Configuration);
+        if (!Presentation().Commands.Stop.Enabled) return false;
+        transport.Send(ProfilerCommand.Stop, modes.Configuration);
+        return true;
     }
 
     public void Clear()

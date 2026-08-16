@@ -61,6 +61,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private Button _stopButton;
     private Button _copyButton;
     private Button _exportButton;
+    private Button _settingsButton;
     private Button _samplingModeButton;
     private Button _automaticModeButton;
     private Button _manualModeButton;
@@ -84,6 +85,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private Button _previewUninstallButton;
     private Button _applyInstallButton;
     private TextEdit _previewDiff;
+    private Window _settingsWindow;
     private TabContainer _resultTabs;
     private CsProfilerFrameGraph _graph;
     private Tree _tree;
@@ -116,9 +118,9 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     internal void RequestCaptureForTests()
     {
         if (_profilingRequested) return;
-        _controller?.SelectManualOnly();
+        _controller?.SelectMode(PrimaryMode.Sampling);
         _profilingRequested = true;
-        _controller?.Start();
+        ProfilingToggled?.Invoke(true); // Test-only pre-launch intent; debugger queues until capabilities arrive.
     }
 
     internal void RequestStopForTests() => _controller?.Stop();
@@ -126,81 +128,75 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     public override void _Ready()
     {
         SizeFlagsVertical = SizeFlags.ExpandFill;
+        CustomMinimumSize = Vector2.Zero;
         _controller = new ProfilerDockController(this, this, CreateInstallerSafely(), this);
 
-        var targetBar = new HBoxContainer();
-        AddChild(targetBar);
-        targetBar.AddChild(new Label { Text = "Target:" });
-        _targetLabel = new Label { Text = "No target", SizeFlagsHorizontal = SizeFlags.ExpandFill };
-        targetBar.AddChild(_targetLabel);
-        _statsLabel = new Label { Text = "Disconnected" };
-        targetBar.AddChild(_statsLabel);
-
-        var modeBar = new HBoxContainer();
-        AddChild(modeBar);
-        modeBar.AddChild(new Label { Text = "Mode:" });
-        _samplingModeButton = ModeButton("Sampling", () => _controller.SelectMode(PrimaryMode.Sampling));
-        _automaticModeButton = ModeButton("Automatic", () => _controller.SelectMode(PrimaryMode.AutomaticInstrumentation));
-        _manualModeButton = ModeButton("Manual", _controller.SelectManualOnly);
-        modeBar.AddChild(_samplingModeButton);
-        modeBar.AddChild(_automaticModeButton);
-        modeBar.AddChild(_manualModeButton);
-        _includeManualButton = new CheckButton { Text = "Include Manual" };
-        _includeManualButton.Toggled += _controller.SetManualOverlay;
-        modeBar.AddChild(_includeManualButton);
+        var header = new HBoxContainer();
+        AddChild(header);
+        _targetLabel = new Label
+        {
+            Text = "No target",
+            SizeFlagsHorizontal = SizeFlags.ExpandFill,
+            TextOverrunBehavior = TextServer.OverrunBehavior.TrimEllipsis,
+            TooltipText = "Current debug target"
+        };
+        header.AddChild(_targetLabel);
+        _statsLabel = new Label
+        {
+            Text = "Disconnected",
+            TextOverrunBehavior = TextServer.OverrunBehavior.TrimEllipsis
+        };
+        header.AddChild(_statsLabel);
+        _settingsButton = new Button
+        {
+            Text = "⚙",
+            TooltipText = "Profiler settings and advanced modes",
+            CustomMinimumSize = new Vector2(32, 0)
+        };
+        _settingsButton.Pressed += ShowSettings;
+        header.AddChild(_settingsButton);
 
         var toolbar = new HBoxContainer();
         AddChild(toolbar);
-        _startButton = new Button { Text = "Start" };
+        _startButton = new Button { Text = "Start", TooltipText = "Start statistical sampling" };
         _startButton.Pressed += () =>
         {
-            _profilingRequested = true;
-            _controller.Start();
+            if (_controller.Start()) _profilingRequested = true;
+            else _statsLabel.Text = "Cannot start yet — open Settings for mode requirements or launch a debug target.";
         };
         toolbar.AddChild(_startButton);
         _stopButton = new Button { Text = "Stop" };
         _stopButton.Pressed += () =>
         {
-            _profilingRequested = false;
-            _controller.Stop();
+            if (_controller.Stop()) _profilingRequested = false;
         };
         toolbar.AddChild(_stopButton);
 
         var clearButton = new Button { Text = "Clear" };
         clearButton.Pressed += ClearAllResults;
         toolbar.AddChild(clearButton);
-
-        _copyButton = new Button
-        {
-            Text = "Copy",
-            Disabled = true,
-            TooltipText = "Copy the selected exact call tree. Sampling results are labelled separately."
-        };
+        _copyButton = new Button { Text = "Copy", Disabled = true,
+            TooltipText = "Copy visible source-separated results" };
         _copyButton.Pressed += () => _controller.Copy(ExportFormat.VisibleCsv);
         toolbar.AddChild(_copyButton);
-        _exportButton = new Button { Text = "Export JSON", Disabled = true,
-            TooltipText = "Export lossless source-separated JSON." };
+        _exportButton = new Button { Text = "Export", Disabled = true,
+            TooltipText = "Export lossless source-separated JSON" };
         _exportButton.Pressed += () => _controller.Export(ExportFormat.LosslessJson);
         toolbar.AddChild(_exportButton);
 
-        toolbar.AddChild(new VSeparator());
-        toolbar.AddChild(new Label { Text = "Frame:" });
-        _frameSelector = new SpinBox { MinValue = 0, MaxValue = 0, Rounded = true };
+        toolbar.AddChild(new Control { SizeFlagsHorizontal = SizeFlags.ExpandFill });
+        toolbar.AddChild(new Label { Text = "Frame" });
+        _frameSelector = new SpinBox
+        {
+            MinValue = 0,
+            MaxValue = 0,
+            Rounded = true,
+            CustomMinimumSize = new Vector2(72, 0)
+        };
         _frameSelector.ValueChanged += OnFrameSelectorChanged;
         toolbar.AddChild(_frameSelector);
 
-        var spacer = new Control { SizeFlagsHorizontal = SizeFlags.ExpandFill };
-        toolbar.AddChild(spacer);
-
-        _settingsLabel = new Label { Text = "Sampling settings" };
-        AddChild(_settingsLabel);
-        BuildSettingsUi();
-        _qualityLabel = new Label { Text = "Complete capture · no observations" };
-        AddChild(_qualityLabel);
-        _resultTabs = new TabContainer { SizeFlagsVertical = SizeFlags.ExpandFill };
-        AddChild(_resultTabs);
-
-        _graph = new CsProfilerFrameGraph();
+        _graph = new CsProfilerFrameGraph { SizeFlagsVertical = SizeFlags.ShrinkBegin };
         _graph.FrameClicked += index =>
         {
             _liveFollow = false;
@@ -208,9 +204,17 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         };
         AddChild(_graph);
 
-        _tree = new Tree
+        _resultTabs = new TabContainer
         {
             SizeFlagsVertical = SizeFlags.ExpandFill,
+            CustomMinimumSize = Vector2.Zero
+        };
+        AddChild(_resultTabs);
+        _tree = new Tree
+        {
+            Name = "Manual frames",
+            SizeFlagsVertical = SizeFlags.ExpandFill,
+            CustomMinimumSize = Vector2.Zero,
             Columns = 4,
             ColumnTitlesVisible = true,
             HideRoot = true,
@@ -218,17 +222,21 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         };
         _tree.SetColumnTitle(0, "Name");
         _tree.SetColumnTitle(1, "Wall time");
-        _tree.SetColumnTitle(2, "Self wall time");
+        _tree.SetColumnTitle(2, "Self");
         _tree.SetColumnTitle(3, "Calls");
         _tree.SetColumnExpand(0, true);
         for (var column = 1; column < 4; column++)
         {
             _tree.SetColumnExpand(column, false);
-            _tree.SetColumnCustomMinimumWidth(column, 96);
+            _tree.SetColumnCustomMinimumWidth(column, 72);
         }
         _tree.ItemCollapsed += OnItemCollapsed;
         _tree.GuiInput += OnTreeGuiInput;
-        AddChild(_tree);
+        _resultTabs.AddChild(_tree);
+
+        BuildSettingsUi();
+        Resized += ApplyResponsiveLayout;
+        ApplyResponsiveLayout();
 
         if (_discovery.BridgeReady)
             ApplyBridgeReadyUi(_discovery.Identity);
@@ -255,18 +263,61 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
 
     private void BuildSettingsUi()
     {
+        _settingsWindow = new Window
+        {
+            Title = "C# Profiler Settings",
+            Size = new Vector2I(560, 560),
+            MinSize = new Vector2I(420, 360),
+            Transient = true,
+            Exclusive = false
+        };
+        _settingsWindow.CloseRequested += _settingsWindow.Hide;
+        AddChild(_settingsWindow);
+        var scroll = new ScrollContainer
+        {
+            SizeFlagsHorizontal = SizeFlags.ExpandFill,
+            SizeFlagsVertical = SizeFlags.ExpandFill
+        };
+        _settingsWindow.AddChild(scroll);
+        var settingsRoot = new VBoxContainer { SizeFlagsHorizontal = SizeFlags.ExpandFill };
+        scroll.AddChild(settingsRoot);
+
+        settingsRoot.AddChild(new Label { Text = "Capture mode" });
+        var modeBar = new HBoxContainer();
+        settingsRoot.AddChild(modeBar);
+        _samplingModeButton = ModeButton("Sampling", () => _controller.SelectMode(PrimaryMode.Sampling));
+        _automaticModeButton = ModeButton("Automatic", () => _controller.SelectMode(PrimaryMode.AutomaticInstrumentation));
+        _manualModeButton = ModeButton("Manual only", _controller.SelectManualOnly);
+        modeBar.AddChild(_samplingModeButton);
+        modeBar.AddChild(_automaticModeButton);
+        modeBar.AddChild(_manualModeButton);
+        _includeManualButton = new CheckButton { Text = "Include manual semantic scopes" };
+        _includeManualButton.Toggled += _controller.SetManualOverlay;
+        settingsRoot.AddChild(_includeManualButton);
+        _settingsLabel = new Label
+        {
+            Text = "Sampling is the universal default. Add manual scopes only for named hotspots.",
+            AutowrapMode = TextServer.AutowrapMode.WordSmart
+        };
+        settingsRoot.AddChild(_settingsLabel);
+
         _samplingSettings = new VBoxContainer();
-        AddChild(_samplingSettings);
+        settingsRoot.AddChild(_samplingSettings);
         _samplingIncludes = AddLineSetting(_samplingSettings, "Include assemblies", "Game",
             text => _controller.UpdateSampling(CurrentSampling() with { IncludeAssemblies = text }));
         _samplingExcludes = AddLineSetting(_samplingSettings, "Exclude assemblies", "",
             text => _controller.UpdateSampling(CurrentSampling() with { ExcludeAssemblies = text }));
-        _samplingInterval = AddSpinSetting(_samplingSettings, "Interval (ns)", 100_000, 1_000_000_000,
+        _samplingInterval = AddSpinSetting(_samplingSettings, "Interval (ns, startup-only)", 100_000, 1_000_000_000,
             2_000_000, value => _controller.UpdateSampling(CurrentSampling() with
                 { RequestedIntervalNanoseconds = (long)value }));
 
         _automaticSettings = new VBoxContainer();
-        AddChild(_automaticSettings);
+        settingsRoot.AddChild(_automaticSettings);
+        _automaticSettings.AddChild(new Label
+        {
+            Text = "Advanced: build-time exact spans. Preview project changes before applying.",
+            AutowrapMode = TextServer.AutowrapMode.WordSmart
+        });
         _automaticIncludes = AddLineSetting(_automaticSettings, "Include patterns", "Game",
             text => _controller.UpdateAutomatic(CurrentAutomatic() with { IncludePatterns = text }));
         _automaticExcludes = AddLineSetting(_automaticSettings, "Exclude patterns", "",
@@ -285,13 +336,32 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             TooltipText = "Review the diff, then click to explicitly confirm Apply." };
         _applyInstallButton.Pressed += ApplyAutomaticInstall;
         installCommands.AddChild(_applyInstallButton);
-        _previewDiff = new TextEdit { Editable = false, CustomMinimumSize = new Vector2(0, 90) };
+        _previewDiff = new TextEdit { Editable = false, CustomMinimumSize = new Vector2(0, 120) };
         _automaticSettings.AddChild(_previewDiff);
 
         _manualSettings = new VBoxContainer();
-        AddChild(_manualSettings);
+        settingsRoot.AddChild(_manualSettings);
         _manualPrefix = AddLineSetting(_manualSettings, "Manual label prefix", "",
             text => _controller.UpdateManual(new ManualSettings(text)));
+        _qualityLabel = new Label
+        {
+            Text = "Complete capture · no observations",
+            AutowrapMode = TextServer.AutowrapMode.WordSmart
+        };
+        settingsRoot.AddChild(_qualityLabel);
+    }
+
+    private void ShowSettings()
+    {
+        if (_settingsWindow == null) return;
+        _settingsWindow.PopupCentered();
+    }
+
+    private void ApplyResponsiveLayout()
+    {
+        var layout = ProfilerDockLayoutPolicy.ForHeight(Size.Y);
+        if (_graph != null) _graph.CustomMinimumSize = new Vector2(0, layout.GraphMinimumHeight);
+        if (_qualityLabel != null) _qualityLabel.Visible = layout.ShowQualityDetails;
     }
 
     private static LineEdit AddLineSetting(Control parent, string label, string value,
@@ -394,7 +464,9 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     {
         if (_resultTabs == null) return;
         _protocolResultRowsForTests = groups.Where(item => !item.IsCrossSourceTotal).Sum(item => item.Rows.Count);
-        foreach (var child in _resultTabs.GetChildren()) child.QueueFree();
+        foreach (var child in _resultTabs.GetChildren())
+            if (!ReferenceEquals(child, _tree)) child.QueueFree();
+        _tree.Visible = _frames.Count > 0;
         foreach (var group in groups.Where(item => !item.IsCrossSourceTotal))
         {
             var tree = new Tree { Name = group.Title, Columns = group.Columns.Count,
@@ -421,7 +493,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             }
             _resultTabs.AddChild(tree);
         }
-        _resultTabs.Visible = groups.Count > 0;
+        _resultTabs.Visible = groups.Count > 0 || _frames.Count > 0;
     }
 
     private static void ApplyMode(BaseButton button, ToggleViewState state)
@@ -524,12 +596,6 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     {
         _sessionActive = true;
         var runtimeChanged = _discovery.AcceptReady(identity);
-        var snapshot = new CaptureSnapshot(
-            identity.Capturing ? CaptureState.Capturing : CaptureState.Ready,
-            identity.RuntimeToken, 0, 0, null, null, CaptureModes.ManualScopes,
-            CaptureSource.ManualSpans, CaptureCompleteness.InProgress, PartialReason.None,
-            QualityCounters.Zero, CaptureModes.ManualScopes, false, 0, 4096);
-        _controller?.UpdateSnapshot(snapshot, FormatRuntimeDescription(identity));
         if (runtimeChanged && _frames.Count > 0)
             ClearHistory();
         ApplyBridgeReadyUi(identity);

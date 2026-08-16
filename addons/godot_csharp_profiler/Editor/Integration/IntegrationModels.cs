@@ -119,10 +119,13 @@ public sealed class EditorCaptureCoordinator
             snapshot.RuntimeToken is null || snapshot.SupportedModes == CaptureModes.None) return false;
         var normalized = configuration.Normalize();
         var generation = checked(snapshot.Generation + 1);
-        var interval = (normalized.Modes & CaptureModes.Sampling) != 0 ? normalized.Sampling.RequestedIntervalNanoseconds : 0;
+        var interval = (normalized.Modes & CaptureModes.Sampling) != 0 &&
+                       snapshot.SamplingIntervalRuntimeConfigurable
+            ? normalized.Sampling.RequestedIntervalNanoseconds
+            : 0;
         var maxMethods = Math.Min(normalized.Automatic.MaxMethods, snapshot.CapabilityMaxMethods);
         if (normalized.Modes == CaptureModes.None || (normalized.Modes & ~snapshot.SupportedModes) != 0 ||
-            maxMethods < 1 || (interval != 0 && !snapshot.SamplingIntervalRuntimeConfigurable) ||
+            maxMethods < 1 ||
             !ValidConfigurationText(normalized.Sampling.IncludeAssemblies,
                 ProtocolLimits.MaxConfigurationListCharacters) ||
             !ValidConfigurationText(normalized.Sampling.ExcludeAssemblies,
