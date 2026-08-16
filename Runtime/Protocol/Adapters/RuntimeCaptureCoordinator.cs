@@ -39,6 +39,13 @@ public sealed class RuntimeCaptureCoordinator : IDisposable
         ThrowIfDisposed();
         if (_connected) return;
         _connected = true;
+        Announce();
+    }
+
+    public void Announce()
+    {
+        ThrowIfDisposed();
+        if (!_connected) return;
         Send(new HelloMessage(ProtocolVersion.Major, ProtocolVersion.Minor, _runtimeToken, "runtime", ProtocolLimits.MaxBatchBytes));
         var c = _backend.Capabilities;
         Send(new CapabilitiesMessage(ProtocolVersion.Major, ProtocolVersion.Minor, _runtimeToken, 0, c.Modes,
