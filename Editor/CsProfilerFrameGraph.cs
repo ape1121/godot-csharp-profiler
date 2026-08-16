@@ -1,5 +1,7 @@
 #if TOOLS
 using Godot;
+using Apeworks.GodotCSharpProfiler.Editor.Integration;
+using Apeworks.GodotCSharpProfiler.Protocol;
 using System;
 using System.Collections.Generic;
 
@@ -17,6 +19,7 @@ public partial class CsProfilerFrameGraph : Control
     private const double ZoomStep = 1.25;
 
     private IReadOnlyList<CsProfilerPanel.ProfileFrame> _frames = Array.Empty<CsProfilerPanel.ProfileFrame>();
+    private IReadOnlyList<CaptureTimelinePoint> _timeline = Array.Empty<CaptureTimelinePoint>();
     private int _selectedIndex = -1;
     private bool _selecting;
     private bool _panning;
@@ -35,28 +38,41 @@ public partial class CsProfilerFrameGraph : Control
 
     public CsProfilerFrameGraph()
     {
-        CustomMinimumSize = new Vector2(0, 96);
+        CustomMinimumSize = new Vector2(0, 48);
         MouseDefaultCursorShape = CursorShape.PointingHand;
         ClipContents = true;
-        TooltipText = "Exact observed wall time · Click/drag: select frame · Wheel: zoom · Middle-drag: pan";
+        TooltipText = "Capture timeline · Sampling bars are sample counts; exact-span bars are observed time";
     }
 
     public void SetFrames(IReadOnlyList<CsProfilerPanel.ProfileFrame> frames)
     {
+        _timeline = Array.Empty<CaptureTimelinePoint>();
         _frames = frames ?? Array.Empty<CsProfilerPanel.ProfileFrame>();
-        if (_frames.Count == 0)
+        ResetWindow(_frames.Count);
+        QueueRedraw();
+    }
+
+    public void SetTimeline(CaptureTimeline timeline)
+    {
+        _frames = Array.Empty<CsProfilerPanel.ProfileFrame>();
+        _timeline = timeline?.Points ?? Array.Empty<CaptureTimelinePoint>();
+        ResetWindow(_timeline.Count);
+        QueueRedraw();
+    }
+
+    private void ResetWindow(int count)
+    {
+        if (count == 0)
         {
             _viewCount = -1;
             _pinnedToEnd = true;
         }
         else if (_viewCount > 0)
         {
-            _viewCount = Math.Min(_viewCount, _frames.Count);
-            if (_pinnedToEnd)
-                _viewStart = _frames.Count - _viewCount;
+            _viewCount = Math.Min(_viewCount, count);
+            if (_pinnedToEnd) _viewStart = count - _viewCount;
             ClampView();
         }
-        QueueRedraw();
     }
 
     public void SetSelectedIndex(int index)
@@ -67,10 +83,12 @@ public partial class CsProfilerFrameGraph : Control
         QueueRedraw();
     }
 
-    private (double Start, double Count) VisibleWindow()
+    private int ItemCount => _timeline.Count > 0 ? _timeline.Count : _frames.Count;
+
+        private (double Start, double Count) VisibleWindow()
     {
-        if (_viewCount <= 0 || _viewCount >= _frames.Count)
-            return (0, Math.Max(1, _frames.Count));
+        if (_viewCount <= 0 || _viewCount >= ItemCount)
+            return (0, Math.Max(1, ItemCount));
         return (_viewStart, _viewCount);
     }
 
@@ -109,11 +127,11 @@ public partial class CsProfilerFrameGraph : Control
 
     private void ZoomAt(float x, double factor)
     {
-        if (_frames.Count == 0)
+        if (ItemCount == 0)
             return;
         var (start, count) = VisibleWindow();
-        var newCount = Math.Clamp(count * factor, MinVisibleFrames, _frames.Count);
-        if (newCount >= _frames.Count)
+        var newCount = Math.Clamp(count * factor, MinVisibleFrames, ItemCount);
+        if (newCount >= ItemCount)
         {
             // Fully zoomed out returns to fit-everything mode so future history growth keeps
             // filling the whole strip.
@@ -131,7 +149,7 @@ public partial class CsProfilerFrameGraph : Control
 
     private void PanBy(float deltaPixels)
     {
-        if (_frames.Count == 0 || _viewCount <= 0)
+        if (ItemCount == 0 || _viewCount <= 0)
             return;
         _viewStart -= deltaPixels / Mathf.Max(1.0f, Size.X) * _viewCount;
         ClampView();
@@ -140,70 +158,74 @@ public partial class CsProfilerFrameGraph : Control
 
     private void ClampView()
     {
-        _viewStart = Math.Clamp(_viewStart, 0, Math.Max(0, _frames.Count - _viewCount));
-        _pinnedToEnd = _viewStart + _viewCount >= _frames.Count - 0.5;
+        _viewStart = Math.Clamp(_viewStart, 0, Math.Max(0, ItemCount - _viewCount));
+        _pinnedToEnd = _viewStart + _viewCount >= ItemCount - 0.5;
     }
 
     private void SelectAt(float x)
     {
-        if (_frames.Count == 0)
+        if (ItemCount == 0)
             return;
         var (start, count) = VisibleWindow();
         var index = (int)(start + x / Mathf.Max(1.0f, Size.X) * count);
-        FrameClicked?.Invoke(Mathf.Clamp(index, 0, _frames.Count - 1));
+        FrameClicked?.Invoke(Mathf.Clamp(index, 0, ItemCount - 1));
     }
 
     public override void _Draw()
     {
         var size = Size;
         DrawRect(new Rect2(Vector2.Zero, size), BackgroundColor);
-        if (_frames.Count == 0)
-            return;
+        if (ItemCount == 0) return;
 
         var (start, count) = VisibleWindow();
         var firstVisible = Math.Max(0, (int)Math.Floor(start));
-        var lastVisible = Math.Min(_frames.Count, (int)Math.Ceiling(start + count));
-
-        // Vertical scale adapts to the visible window, so zooming into a calm stretch expands
-        // its detail instead of staying scaled to the worst spike in all of history.
-        var maxMs = 20.0;
-        for (var i = firstVisible; i < lastVisible; i++)
-            maxMs = Math.Max(maxMs, _frames[i].FrameMs);
-        maxMs *= 1.05;
-
+        var lastVisible = Math.Min(ItemCount, (int)Math.Ceiling(start + count));
         var font = GetThemeFont("font", "Label");
         var fontSize = Mathf.Max(10, GetThemeFontSize("font_size", "Label") - 2);
-        foreach (var guideMs in new[] { 1000.0 / 60.0, 1000.0 / 30.0 })
-        {
-            if (guideMs >= maxMs)
-                continue;
-            var y = (float)(size.Y - guideMs / maxMs * size.Y);
-            DrawLine(new Vector2(0, y), new Vector2(size.X, y), GuideColor);
-            DrawString(font, new Vector2(4, y - 3), $"{guideMs:0.0} ms",
-                HorizontalAlignment.Left, -1, fontSize, GuideTextColor);
-        }
-
-        // With more visible frames than pixels several frames share a column; drawing each as a
-        // >= 1 px bar keeps the worst frame in a column visible through overdraw.
         var step = size.X / (float)count;
         var barWidth = Mathf.Max(1.0f, step - (step >= 3.0f ? 1.0f : 0.0f));
-        for (var i = firstVisible; i < lastVisible; i++)
-        {
-            var frame = _frames[i];
-            var x = (float)((i - start) * step);
-            var frameHeight = (float)(frame.FrameMs / maxMs * size.Y);
-            var csHeight = (float)(frame.CsMs / maxMs * size.Y);
-            DrawRect(new Rect2(x, size.Y - frameHeight, barWidth, frameHeight), FrameColor);
-            DrawRect(new Rect2(x, size.Y - csHeight, barWidth, csHeight), CsColor);
-        }
 
-        if (_viewCount > 0 && _viewCount < _frames.Count)
+        if (_timeline.Count > 0)
         {
-            DrawString(font, new Vector2(4, 14),
-                $"zoom {_frames.Count / count:0.#}x  [{firstVisible}–{lastVisible - 1}]",
+            var maxValue = 1L;
+            for (var i = firstVisible; i < lastVisible; i++) maxValue = Math.Max(maxValue, _timeline[i].Value);
+            for (var i = firstVisible; i < lastVisible; i++)
+            {
+                var point = _timeline[i];
+                var x = (float)((i - start) * step);
+                var height = (float)(point.Value / (double)maxValue * size.Y);
+                var color = point.Source == CaptureSource.Sampling ? CsColor : FrameColor;
+                DrawRect(new Rect2(x, size.Y - height, barWidth, height), color);
+            }
+            var sampling = _timeline.Any(point => point.Source == CaptureSource.Sampling);
+            DrawString(font, new Vector2(4, 14), sampling ? "Samples per batch" : "Observed exact-span time per batch",
                 HorizontalAlignment.Left, -1, fontSize, GuideTextColor);
         }
+        else
+        {
+            var maxMs = 20.0;
+            for (var i = firstVisible; i < lastVisible; i++) maxMs = Math.Max(maxMs, _frames[i].FrameMs);
+            maxMs *= 1.05;
+            foreach (var guideMs in new[] { 1000.0 / 60.0, 1000.0 / 30.0 })
+            {
+                if (guideMs >= maxMs) continue;
+                var y = (float)(size.Y - guideMs / maxMs * size.Y);
+                DrawLine(new Vector2(0, y), new Vector2(size.X, y), GuideColor);
+            }
+            for (var i = firstVisible; i < lastVisible; i++)
+            {
+                var frame = _frames[i];
+                var x = (float)((i - start) * step);
+                var frameHeight = (float)(frame.FrameMs / maxMs * size.Y);
+                var csHeight = (float)(frame.CsMs / maxMs * size.Y);
+                DrawRect(new Rect2(x, size.Y - frameHeight, barWidth, frameHeight), FrameColor);
+                DrawRect(new Rect2(x, size.Y - csHeight, barWidth, csHeight), CsColor);
+            }
+        }
 
+        if (_viewCount > 0 && _viewCount < ItemCount)
+            DrawString(font, new Vector2(4, size.Y - 4), $"zoom {ItemCount / count:0.#}x",
+                HorizontalAlignment.Left, -1, fontSize, GuideTextColor);
         if (_selectedIndex >= firstVisible && _selectedIndex < lastVisible)
         {
             var x = (float)((_selectedIndex - start) * step) + barWidth * 0.5f;

@@ -58,6 +58,6 @@ public sealed class DebuggerPayloadGate
             "Unknown target", status, Array.Empty<ToggleViewState>(),
             new ToggleViewState("Include Manual", false, false, ""),
             new CommandViewState(false, false, false, false, false), "", "", "", "", false,
-            Array.Empty<ResultGroupViewState>()));
+            Array.Empty<ResultGroupViewState>(), CaptureTimeline.Empty, false));
     }
 }

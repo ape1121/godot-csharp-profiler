@@ -17,6 +17,7 @@ public partial class CsProfilerPlugin : EditorPlugin
     private bool _editorAttachedProbeStopSent;
     private double _editorAttachedProbeStartedAt;
     private double _editorAttachedProbeDeadline;
+    private int _editorAttachedProbeRuns;
     private bool _registered;
     private ICoordinatorLifetime _coordinatorLifetime;
 
@@ -117,13 +118,13 @@ public partial class CsProfilerPlugin : EditorPlugin
         return id == ResourceUid.InvalidId ? normalized : ResourceUid.GetIdPath(id);
     }
 
-    private void StartEditorAttachedProbe()
+        private void StartEditorAttachedProbe()
     {
         _editorAttachedProbeRunning = true;
         _editorAttachedProbeStopSent = false;
         _editorAttachedProbeStartedAt = Time.GetTicksMsec() / 1000.0;
         _editorAttachedProbeDeadline = Time.GetTicksMsec() / 1000.0 + 30.0;
-        _panel.RequestCaptureForTests();
+        _panel.RequestSamplingCapture();
         EditorInterface.Singleton.PlayMainScene();
     }
 
@@ -134,13 +135,16 @@ public partial class CsProfilerPlugin : EditorPlugin
             return;
         var now = Time.GetTicksMsec() / 1000.0;
         if (!_editorAttachedProbeStopSent && _panel?.BridgeReadyForTests == true &&
+            _panel.TimelinePointCountForTests >= 1 &&
             now - _editorAttachedProbeStartedAt >= 3.0)
         {
             _editorAttachedProbeStopSent = true;
             _panel.RequestStopForTests();
         }
         if (_panel?.BridgeReadyForTests == true &&
-            _panel.ProtocolResultRowsForTests >= 1)
+            _panel.SamplingResultRowsForTests >= 1 &&
+            _panel.TimelinePointCountForTests >= 1 &&
+            _panel.SelectedIndexForTests >= 0)
         {
             var count = EditorInterface.Singleton.GetBaseControl()
                 .FindChildren("*", "EditorDock", recursive: true, owned: false)
@@ -152,8 +156,18 @@ public partial class CsProfilerPlugin : EditorPlugin
                 FinishEditorAttachedProbe(1);
                 return;
             }
-            GD.Print("CS_PROFILER_EDITOR_ATTACHED_ASSERTIONS_OK docks=1 " +
-                     $"strict_protocol_rows={_panel.ProtocolResultRowsForTests}");
+            GD.Print($"CS_PROFILER_EDITOR_ATTACHED_RUN_OK run={_editorAttachedProbeRuns + 1} docks=1 " +
+                     $"sampling_rows={_panel.SamplingResultRowsForTests} " +
+                     $"timeline_points={_panel.TimelinePointCountForTests} selected={_panel.SelectedIndexForTests}");
+            if (++_editorAttachedProbeRuns == 1)
+            {
+                _editorAttachedProbeStopSent = false;
+                _editorAttachedProbeStartedAt = now;
+                _editorAttachedProbeDeadline = now + 30.0;
+                _panel.RequestSamplingCapture();
+                return;
+            }
+            GD.Print("CS_PROFILER_EDITOR_ATTACHED_ASSERTIONS_OK reruns=2");
             var tree = GetTree();
             var disableTimer = new Godot.Timer { OneShot = true, WaitTime = 0.1 };
             tree.Root.AddChild(disableTimer);
@@ -193,7 +207,8 @@ public partial class CsProfilerPlugin : EditorPlugin
             GD.PushError("CS_PROFILER_EDITOR_ATTACHED_ASSERTIONS_FAILED bridge timeout " +
                          $"ready={_panel?.BridgeReadyForTests} " +
                          $"editor_play={identity.EditorAttached} role={identity.Role} " +
-                         $"name={identity.DisplayName} strict_protocol_rows={_panel?.ProtocolResultRowsForTests} " +
+                         $"name={identity.DisplayName} sampling_rows={_panel?.SamplingResultRowsForTests} " +
+                         $"timeline_points={_panel?.TimelinePointCountForTests} " +
                          $"status={_panel?.StatusTextForTests}");
             FinishEditorAttachedProbe(1);
         }

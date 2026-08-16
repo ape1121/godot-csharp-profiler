@@ -39,6 +39,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     // missed around plugin/assembly reloads, so state shown to the user is queried, not cached.
     public Func<bool> SessionActiveQuery;
     public bool ProfilingRequested => _profilingRequested;
+    private CaptureTimeline _protocolTimeline = CaptureTimeline.Empty;
 
     private bool SessionActive
     {
@@ -95,11 +96,11 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private bool _rebuildingTree;
     private readonly List<string> _displayedRowsForTests = new();
     private int _protocolResultRowsForTests;
+    private int _samplingResultRowsForTests;
     private bool _sessionActive;
     private readonly CsProfilerSessionDiscoveryState _discovery = new();
     private string _runtimeDescription = "";
     private double _lastFrameAtSec = double.NegativeInfinity;
-    private double _lastStartSentAtSec = double.NegativeInfinity;
     private bool _profilingRequested;
     private ProfilerDockController _controller;
     internal ModeConfiguration ConfigurationForProtocol => _controller?.Configuration ?? ModeConfiguration.Default;
@@ -107,6 +108,8 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     internal string[] DisplayedRowsForTests() => _displayedRowsForTests.ToArray();
     internal int FrameCountForTests => _frames.Count;
     internal int ProtocolResultRowsForTests => _protocolResultRowsForTests;
+    internal int SamplingResultRowsForTests => _samplingResultRowsForTests;
+    internal int TimelinePointCountForTests => _protocolTimeline.Points.Count;
     internal int SelectedIndexForTests => _selectedIndex;
     internal bool BridgeReadyForTests => _discovery.BridgeReady;
     internal CsProfilerRuntimeIdentity IdentityForTests => _discovery.Identity;
@@ -114,6 +117,13 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
                                                   _selectedIndex < _frames.Count
         ? BuildCallReport(_frames[_selectedIndex], "")
         : "";
+
+    internal bool RequestSamplingCapture()
+    {
+        if (_profilingRequested || _controller == null) return false;
+        _controller.SelectMode(PrimaryMode.Sampling);
+        return _controller.RequestStart();
+    }
 
     internal void RequestCaptureForTests()
     {
@@ -149,8 +159,8 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         header.AddChild(_statsLabel);
         _settingsButton = new Button
         {
-            Text = "⚙",
-            TooltipText = "Profiler settings and advanced modes",
+            Text = "⋮",
+            TooltipText = "Profiler settings, advanced modes, export, and diagnostics",
             CustomMinimumSize = new Vector2(32, 0)
         };
         _settingsButton.Pressed += ShowSettings;
@@ -161,8 +171,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _startButton = new Button { Text = "Start", TooltipText = "Start statistical sampling" };
         _startButton.Pressed += () =>
         {
-            if (_controller.Start()) _profilingRequested = true;
-            else _statsLabel.Text = "Cannot start yet — open Settings for mode requirements or launch a debug target.";
+            if (_controller.RequestStart()) _profilingRequested = true;
         };
         toolbar.AddChild(_startButton);
         _stopButton = new Button { Text = "Stop" };
@@ -175,14 +184,13 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         var clearButton = new Button { Text = "Clear" };
         clearButton.Pressed += ClearAllResults;
         toolbar.AddChild(clearButton);
-        _copyButton = new Button { Text = "Copy", Disabled = true,
+        // Copy/export are advanced actions and belong in the compact settings window.
+        _copyButton = new Button { Text = "Copy Results", Disabled = true,
             TooltipText = "Copy visible source-separated results" };
         _copyButton.Pressed += () => _controller.Copy(ExportFormat.VisibleCsv);
-        toolbar.AddChild(_copyButton);
-        _exportButton = new Button { Text = "Export", Disabled = true,
+        _exportButton = new Button { Text = "Export Results", Disabled = true,
             TooltipText = "Export lossless source-separated JSON" };
         _exportButton.Pressed += () => _controller.Export(ExportFormat.LosslessJson);
-        toolbar.AddChild(_exportButton);
 
         toolbar.AddChild(new Control { SizeFlagsHorizontal = SizeFlags.ExpandFill });
         toolbar.AddChild(new Label { Text = "Frame" });
@@ -267,7 +275,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         {
             Title = "C# Profiler Settings",
             Size = new Vector2I(560, 560),
-            MinSize = new Vector2I(420, 360),
+            MinSize = new Vector2I(320, 240),
             Transient = true,
             Exclusive = false
         };
@@ -281,6 +289,11 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _settingsWindow.AddChild(scroll);
         var settingsRoot = new VBoxContainer { SizeFlagsHorizontal = SizeFlags.ExpandFill };
         scroll.AddChild(settingsRoot);
+
+        var outputCommands = new HBoxContainer();
+        outputCommands.AddChild(_copyButton);
+        outputCommands.AddChild(_exportButton);
+        settingsRoot.AddChild(outputCommands);
 
         settingsRoot.AddChild(new Label { Text = "Capture mode" });
         var modeBar = new HBoxContainer();
@@ -303,7 +316,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
 
         _samplingSettings = new VBoxContainer();
         settingsRoot.AddChild(_samplingSettings);
-        _samplingIncludes = AddLineSetting(_samplingSettings, "Include assemblies", "Game",
+        _samplingIncludes = AddLineSetting(_samplingSettings, "Include assemblies", "",
             text => _controller.UpdateSampling(CurrentSampling() with { IncludeAssemblies = text }));
         _samplingExcludes = AddLineSetting(_samplingSettings, "Exclude assemblies", "",
             text => _controller.UpdateSampling(CurrentSampling() with { ExcludeAssemblies = text }));
@@ -351,15 +364,22 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         settingsRoot.AddChild(_qualityLabel);
     }
 
-    private void ShowSettings()
+        private void ShowSettings()
     {
         if (_settingsWindow == null) return;
-        _settingsWindow.PopupCentered();
+        var usable = DisplayServer.ScreenGetUsableRect();
+        var width = Math.Clamp(560, _settingsWindow.MinSize.X, Math.Max(_settingsWindow.MinSize.X, usable.Size.X - 32));
+        var height = Math.Clamp(560, _settingsWindow.MinSize.Y, Math.Max(_settingsWindow.MinSize.Y, usable.Size.Y - 32));
+        _settingsWindow.PopupCentered(new Vector2I(width, height));
     }
 
-    private void ApplyResponsiveLayout()
+        private void ApplyResponsiveLayout()
     {
         var layout = ProfilerDockLayoutPolicy.ForHeight(Size.Y);
+        Visible = layout.ShowPrimaryToolbar && layout.ShowCalls && layout.ShowSettingsButton;
+        if (_settingsButton != null) _settingsButton.Visible = layout.ShowSettingsButton;
+        if (_resultTabs != null) _resultTabs.Visible = layout.ShowCalls &&
+            (_protocolTimeline.Points.Count > 0 || _frames.Count > 0 || _protocolResultRowsForTests > 0);
         if (_graph != null) _graph.CustomMinimumSize = new Vector2(0, layout.GraphMinimumHeight);
         if (_qualityLabel != null) _qualityLabel.Visible = layout.ShowQualityDetails;
     }
@@ -388,7 +408,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         return spin;
     }
 
-    private SamplingSettings CurrentSampling() => new(_samplingIncludes?.Text ?? "Game",
+    private SamplingSettings CurrentSampling() => new(_samplingIncludes?.Text ?? "",
         _samplingExcludes?.Text ?? "", (long)(_samplingInterval?.Value ?? 2_000_000));
     private AutomaticSettings CurrentAutomatic() => new(_automaticIncludes?.Text ?? "Game",
         _automaticExcludes?.Text ?? "", (int)(_automaticMaximum?.Value ?? 4096));
@@ -429,7 +449,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         return button;
     }
 
-    public void Render(ProfilerDockViewState state)
+        public void Render(ProfilerDockViewState state)
     {
         if (_targetLabel == null)
             return;
@@ -458,12 +478,34 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             _applyInstallButton.Disabled = true;
         }
         RenderResultGroups(state.ResultGroups);
+        ApplyTimeline(state.Timeline);
+        ApplyResponsiveLayout();
     }
 
-    private void RenderResultGroups(IReadOnlyList<ResultGroupViewState> groups)
+            private void ApplyTimeline(CaptureTimeline timeline)
+    {
+        _protocolTimeline = timeline ?? CaptureTimeline.Empty;
+        _graph?.SetTimeline(_protocolTimeline);
+        _updatingSelector = true;
+        _frameSelector.MaxValue = Math.Max(0, _protocolTimeline.Points.Count - 1);
+        _updatingSelector = false;
+        if (_protocolTimeline.Points.Count == 0)
+        {
+            _selectedIndex = -1;
+            _graph?.SetSelectedIndex(-1);
+            return;
+        }
+        if (_liveFollow || _selectedIndex < 0 || _selectedIndex >= _protocolTimeline.Points.Count)
+            _selectedIndex = _protocolTimeline.Points.Count - 1;
+        SelectFrame(_selectedIndex);
+    }
+
+        private void RenderResultGroups(IReadOnlyList<ResultGroupViewState> groups)
     {
         if (_resultTabs == null) return;
         _protocolResultRowsForTests = groups.Where(item => !item.IsCrossSourceTotal).Sum(item => item.Rows.Count);
+        _samplingResultRowsForTests = groups.Where(item => !item.IsCrossSourceTotal &&
+            item.Source == CaptureSource.Sampling).Sum(item => item.Rows.Count);
         foreach (var child in _resultTabs.GetChildren())
             if (!ReferenceEquals(child, _tree)) child.QueueFree();
         _tree.Visible = _frames.Count > 0;
@@ -481,7 +523,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
                 if (group.Source == CaptureSource.Sampling)
                 {
                     item.SetText(1, row.Samples.ToString());
-                    item.SetText(2, $"{row.EstimatedCpuPercentage:0.##}%");
+                    item.SetText(2, $"{row.EstimatedStackFrameShare:0.##}%");
                 }
                 else
                 {
@@ -493,7 +535,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             }
             _resultTabs.AddChild(tree);
         }
-        _resultTabs.Visible = groups.Count > 0 || _frames.Count > 0;
+        _resultTabs.Visible = groups.Count > 0 || _frames.Count > 0 || _protocolTimeline.Points.Count > 0;
     }
 
     private static void ApplyMode(BaseButton button, ToggleViewState state)
@@ -527,13 +569,13 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         {
             builder.AppendLine(group.Source.ToString());
             builder.AppendLine(group.Source == CaptureSource.Sampling
-                ? "Name,Samples,Estimated CPU %"
+                ? "Name,Samples,Estimated stack-frame %"
                 : "Name,Wall time ms,Calls,Average wall time ms,Maximum wall time ms");
             foreach (var row in group.Rows)
             {
                 builder.Append(row.Name.Replace(',', ';')).Append(',');
                 if (group.Source == CaptureSource.Sampling)
-                    builder.Append(row.Samples).Append(',').Append(row.EstimatedCpuPercentage);
+                    builder.Append(row.Samples).Append(',').Append(row.EstimatedStackFrameShare);
                 else
                     builder.Append(row.ObservedWallTimeMilliseconds).Append(',').Append(row.Calls)
                         .Append(',').Append(row.AverageWallTimeMilliseconds).Append(',')
@@ -544,11 +586,19 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         return builder.ToString();
     }
 
-    public void Send(ProfilerCommand command, ModeConfiguration configuration)
+            public void Send(ProfilerCommand command, ModeConfiguration configuration)
     {
+        _ = configuration;
+        if (command == ProfilerCommand.CancelPending)
+        {
+            _profilingRequested = false;
+            ProfilingToggled?.Invoke(false);
+            return;
+        }
         var start = command == ProfilerCommand.Start;
+        _profilingRequested = start;
         _liveFollow = start;
-        _lastStartSentAtSec = NowSec();
+        if (!start) _controller?.UpdateTimeline(_protocolTimeline);
         ProfilingToggled?.Invoke(start);
     }
 
@@ -592,6 +642,9 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     internal void ApplyProtocolResults(ProfilerResults results) =>
         _controller?.ReplaceResults(results);
 
+    internal void ApplyProtocolTimeline(CaptureTimeline timeline) =>
+        _controller?.UpdateTimeline(timeline);
+
     internal void OnBridgeReady(CsProfilerRuntimeIdentity identity)
     {
         _sessionActive = true;
@@ -618,15 +671,10 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         }
     }
 
-    // The start message can be lost around session startup (and gives no error when it is), so
-    // while the toggle is held and no frames are flowing, re-send it once a second. The game
-    // side treats repeated starts as no-ops, and the plugin drops sends while the session is
-    // down — so this must NOT gate on session state, or a missed session signal wedges the
-    // panel forever.
-    public override void _Process(double delta)
+        public override void _Process(double delta)
     {
-        if (_statsLabel == null)
-            return;
+        _ = delta;
+        if (_statsLabel == null) return;
         var now = NowSec();
         var active = SessionActive;
         if (active && !_discovery.SessionActive)
@@ -634,17 +682,6 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         else if (!active && _discovery.SessionActive)
             _discovery.OnSessionStopped();
         TryRequestDiscovery(now);
-
-        if (!ProfilingRequested)
-            return;
-        if (now - _lastFrameAtSec < 1.0 || now - _lastStartSentAtSec < 1.0)
-            return;
-        _lastStartSentAtSec = now;
-        ProfilingToggled?.Invoke(true);
-        _statsLabel.Text = SessionActive
-            ? "Start sent — no frames yet. Check this session's game is running " +
-              "and check its Output for 'C# Profiler: capture started.'"
-            : "Waiting for a debug session — capture starts when the game launches.";
     }
 
     private void TryRequestDiscovery(double nowSeconds)
@@ -675,14 +712,15 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         ClearHistory();
     }
 
-    private void ClearHistory()
+        private void ClearHistory()
     {
         if (_graph == null)
             return; // session signal arrived before _Ready built the controls
         _frames.Clear();
+        _protocolTimeline = CaptureTimeline.Empty;
         _selectedIndex = -1;
         _liveFollow = true;
-        _graph.SetFrames(_frames);
+        _graph.SetTimeline(_protocolTimeline);
         _graph.SetSelectedIndex(-1);
         _tree?.Clear();
         if (_copyButton != null)
@@ -737,10 +775,37 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         SelectFrame((int)value);
     }
 
-    private void SelectFrame(int index)
+        private void SelectFrame(int index)
     {
-        if (_frames.Count == 0)
+        if (_protocolTimeline.Points.Count > 0)
+        {
+            index = Math.Clamp(index, 0, _protocolTimeline.Points.Count - 1);
+            _selectedIndex = index;
+            _graph.SetSelectedIndex(index);
+            _updatingSelector = true;
+            _frameSelector.Value = index;
+            _updatingSelector = false;
+            var point = _protocolTimeline.Points[index];
+            var title = point.Source switch
+            {
+                CaptureSource.Sampling => "Sampling batch (estimated)",
+                CaptureSource.AutomaticSpans => "Automatic instrumentation batch (exact)",
+                CaptureSource.ManualSpans => "Manual scopes batch (exact)",
+                _ => "Capture batch"
+            };
+            _statsLabel.Text = point.Source == CaptureSource.Sampling
+                ? RuntimeStatus($"{point.Value} samples | {point.Rows.Count} methods | batch #{point.Sequence}")
+                : RuntimeStatus($"{point.Value / 1_000_000.0:0.###} ms observed exact-span time | " +
+                    $"{point.Observations} calls | batch #{point.Sequence}");
+            RenderResultGroups([new ResultGroupViewState(title, point.Source,
+                point.Source == CaptureSource.Sampling
+                    ? ["Name", "Samples", "Estimated stack-frame %"]
+                    : ["Name", "Wall time", "Calls", "Average wall time", "Maximum wall time"],
+                point.Rows)]);
             return;
+        }
+
+        if (_frames.Count == 0) return;
         index = Math.Clamp(index, 0, _frames.Count - 1);
         _selectedIndex = index;
         _graph.SetSelectedIndex(index);
@@ -749,13 +814,11 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _updatingSelector = false;
 
         var frame = _frames[index];
-        if (_copyButton != null)
-            _copyButton.Disabled = frame.Names.Length == 0;
+        if (_copyButton != null) _copyButton.Disabled = frame.Names.Length == 0;
         if (frame.Names.Length == 0)
         {
             _statsLabel.Text = RuntimeStatus(
-                $"No samples | C# {frame.CsMs:0.00} ms | frame {frame.FrameMs:0.00} ms | " +
-                $"frame #{frame.Index}");
+                $"No samples | C# {frame.CsMs:0.00} ms | frame {frame.FrameMs:0.00} ms | frame #{frame.Index}");
             RebuildTree(frame);
             return;
         }
