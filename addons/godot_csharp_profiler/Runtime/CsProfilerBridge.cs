@@ -1,0 +1,144 @@
+using Godot;
+using System;
+using System.Diagnostics;
+using Apeworks.GodotCSharpProfiler.Runtime.Protocol.Adapters;
+
+namespace Apeworks.GodotCSharpProfiler;
+
+public partial class CsProfilerBridge : Node
+{
+    public const string MessagePrefix = "cs_profiler";
+    public const string ProtocolMessage = MessagePrefix + ":protocol";
+    public const string ReadyMessage = MessagePrefix + ":ready";
+    public const string HandshakeMessage = MessagePrefix + ":handshake";
+    public const string MetricsMessage = MessagePrefix + ":metrics";
+    public const string BatchFrameMessage = MessagePrefix + ":batch_frame";
+
+    private bool _captureRegistered;
+    private string _runtimeToken = "";
+    private RuntimeCaptureCoordinator _coordinator;
+    private long _runtimeFrame;
+    private long _lastProcessTimestamp;
+    private long _flushFrameElapsedNanoseconds;
+    private bool _associatingFlush;
+
+    public override void _EnterTree()
+    {
+        ProcessPriority = int.MaxValue;
+        ProcessMode = ProcessModeEnum.Always;
+        _runtimeToken = $"{OS.GetProcessId()}:{Guid.NewGuid():N}";
+        TryRegisterCapture();
+    }
+
+    public override void _Ready() => TryRegisterCapture();
+
+    public override void _ExitTree()
+    {
+        if (_captureRegistered)
+        {
+            EngineDebugger.UnregisterMessageCapture(MessagePrefix);
+            _captureRegistered = false;
+        }
+        _coordinator?.Dispose();
+        _coordinator = null;
+    }
+
+    private bool OnEditorMessage(string message, Godot.Collections.Array data)
+    {
+        switch (message)
+        {
+            case "discover": SendReady(); return true;
+            case "handshake": _coordinator?.Announce(); return true;
+            case "protocol":
+                if (_coordinator is null || !GodotDebuggerTransport.TryRead(data, out var payload)) return false;
+                return _coordinator.Receive(payload, "godot-editor-debugger");
+            default: return false;
+        }
+    }
+
+    private void SendReady()
+    {
+        if (!_captureRegistered) return;
+        EngineDebugger.SendMessage(ReadyMessage, BuildReadyPayload(_runtimeToken, OS.GetProcessId(),
+            IsEditorLaunched(OS.GetCmdlineArgs(), EngineDebugger.IsActive()), OS.GetCmdlineUserArgs(),
+            _coordinator?.Capturing == true));
+    }
+
+    internal static Godot.Collections.Array BuildReadyPayload(string runtimeToken, long processId,
+        bool editorLaunched, string[] userArguments, bool capturing)
+    {
+        var role = "game";
+        var displayName = "Game";
+        var arguments = userArguments ?? Array.Empty<string>();
+        for (var index = 0; index < arguments.Length; index++)
+        {
+            switch (arguments[index])
+            {
+                case "--mp-host": role = "host"; displayName = "Host"; break;
+                case "--mp-join": role = "client"; displayName = "Client"; break;
+                case "--mp-name" when index + 1 < arguments.Length: displayName = arguments[++index]; break;
+            }
+        }
+        if (editorLaunched) { role = "editor-play"; displayName = "Editor Play"; }
+        return new Godot.Collections.Array
+        {
+            CsProfilerRuntimeIdentity.Normalize(runtimeToken, CsProfilerRuntimeIdentity.MaximumTokenLength, "unknown"),
+            Math.Max(0, processId), editorLaunched,
+            CsProfilerRuntimeIdentity.Normalize(role, CsProfilerRuntimeIdentity.MaximumLabelLength, "game"),
+            CsProfilerRuntimeIdentity.Normalize(displayName, CsProfilerRuntimeIdentity.MaximumLabelLength, "Game"), capturing
+        };
+    }
+
+    internal static bool IsEditorLaunched(string[] engineArguments, bool debuggerActive = false)
+    {
+        if (debuggerActive) return true;
+        foreach (var argument in engineArguments ?? Array.Empty<string>())
+            if (string.Equals(argument, "--editor-pid", StringComparison.Ordinal) ||
+                argument.StartsWith("--editor-pid=", StringComparison.Ordinal)) return true;
+        return false;
+    }
+
+    public override void _Process(double delta)
+    {
+        if (!_captureRegistered) { TryRegisterCapture(); return; }
+        _runtimeFrame++;
+        var timestamp = Stopwatch.GetTimestamp();
+        var elapsedNanoseconds = _lastProcessTimestamp > 0
+            ? (long)((timestamp - _lastProcessTimestamp) * (1_000_000_000.0 / Stopwatch.Frequency))
+            : 0;
+        _lastProcessTimestamp = timestamp;
+        var frameMilliseconds = Math.Max(0, delta) * 1000.0;
+        var fps = frameMilliseconds > 0 ? 1000.0 / frameMilliseconds : 0;
+        EngineDebugger.SendMessage(MetricsMessage, new Godot.Collections.Array
+        {
+            (double)fps, frameMilliseconds, _runtimeFrame
+        });
+        if (_coordinator is null) return;
+        _associatingFlush = elapsedNanoseconds > 0;
+        _flushFrameElapsedNanoseconds = elapsedNanoseconds;
+        try { _coordinator.Flush(); }
+        finally { _associatingFlush = false; }
+    }
+
+    private void TryRegisterCapture()
+    {
+        if (_captureRegistered || !EngineDebugger.IsActive()) return;
+        EngineDebugger.RegisterMessageCapture(MessagePrefix,
+            Callable.From<string, Godot.Collections.Array, bool>(OnEditorMessage));
+        _captureRegistered = true;
+        _coordinator = new RuntimeCaptureCoordinator(_runtimeToken,
+            new GodotDebuggerTransport(ProtocolMessage), new ProductionRuntimeCaptureBackend());
+        _coordinator.BatchEmitted += OnBatchEmitted;
+        _coordinator.Connect();
+        SendReady();
+    }
+
+    private void OnBatchEmitted(long generation, long sequence)
+    {
+        if (!_associatingFlush || generation <= 0 || sequence <= 0 || _flushFrameElapsedNanoseconds <= 0) return;
+        EngineDebugger.SendMessage(BatchFrameMessage, new Godot.Collections.Array
+        {
+            generation, sequence, _runtimeFrame, _flushFrameElapsedNanoseconds
+        });
+    }
+}

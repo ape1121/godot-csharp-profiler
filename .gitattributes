@@ -1,0 +1,5 @@
+* text=auto eol=lf
+*.nupkg binary
+/**        export-ignore
+/addons    !export-ignore
+/addons/** !export-ignore

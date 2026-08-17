@@ -1,0 +1,13 @@
+<Project>
+  <!-- Imported by setup.ps1. Sampling source is inert until these exact references are present. -->
+  <PropertyGroup>
+    <DefineConstants>$(DefineConstants);GODOT_CSHARP_PROFILER_SAMPLING</DefineConstants>
+    <!-- Godot editor play loads the Debug project assembly in a game process. Its generated
+         script map includes editor types, so copy the SDK-declared GodotSharpEditor dependency. -->
+    <CopyLocalLockFileAssemblies Condition="'$(Configuration)' == 'Debug'">true</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Diagnostics.NETCore.Client" Version="0.2.661903" />
+    <PackageReference Include="Microsoft.Diagnostics.Tracing.TraceEvent" Version="3.2.5" />
+  </ItemGroup>
+</Project>

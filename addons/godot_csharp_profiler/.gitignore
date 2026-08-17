@@ -1,0 +1,29 @@
+# Godot generated/import metadata
+.godot/
+.import/
+*.uid
+*.import
+*.translation
+mono_crash.*.json
+
+# .NET build and IDE state
+**/bin/
+**/obj/
+*.user
+*.suo
+*.csproj.old
+.vscode/
+.idea/
+
+# Local exports and temporary output
+export.cfg
+export_presets.cfg
+builds/
+exports/
+TestResults/
+artifacts/
+.tmp/
+
+# OS metadata
+.DS_Store
+Thumbs.db
