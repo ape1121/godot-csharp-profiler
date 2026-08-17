@@ -53,7 +53,7 @@ public partial class CsProfilerBridge : Node
     {
         if (!_captureRegistered) return;
         EngineDebugger.SendMessage(ReadyMessage, BuildReadyPayload(_runtimeToken, OS.GetProcessId(),
-            IsEditorLaunched(System.Environment.GetCommandLineArgs()), OS.GetCmdlineUserArgs(),
+            IsEditorLaunched(OS.GetCmdlineArgs(), EngineDebugger.IsActive()), OS.GetCmdlineUserArgs(),
             _coordinator?.Capturing == true));
     }
 
@@ -82,8 +82,9 @@ public partial class CsProfilerBridge : Node
         };
     }
 
-    internal static bool IsEditorLaunched(string[] engineArguments)
+    internal static bool IsEditorLaunched(string[] engineArguments, bool debuggerActive = false)
     {
+        if (debuggerActive) return true;
         foreach (var argument in engineArguments ?? Array.Empty<string>())
             if (string.Equals(argument, "--editor-pid", StringComparison.Ordinal) ||
                 argument.StartsWith("--editor-pid=", StringComparison.Ordinal)) return true;
