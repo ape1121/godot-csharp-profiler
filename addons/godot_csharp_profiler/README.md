@@ -15,7 +15,7 @@ Pass `-Project path/to/Project.csproj` if more than one top-level project exists
 
 Open the **C# Profiler** bottom dock, run the game, leave **Sampling** selected, press **Start**, exercise the workload, and press **Stop**. Sampling needs no source annotations or weaving. Start may also be pressed before the game target is ready: one request is queued while the debugger discovers the bridge and negotiates capabilities, then starts automatically on the selected compatible target. Stop cancels a pending request.
 
-The shrinkable main dock contains only target/status, Start/Stop/Clear, timeline, and calls/results. Open the compact **⋮** button for modes, filters, automatic installation, export, and quality diagnostics.
+The shrinkable main dock contains only target/status, Start/Stop/Clear, timeline, selected-batch Copy, and calls/results. Open the compact **⚙** button for modes, filters, automatic installation, export, and quality diagnostics.
 
 ## Result semantics
 
@@ -35,7 +35,7 @@ The interval is **process-startup-only**. Set `DOTNET_EventPipeSamplingRate` or 
 Automatic profiling is opt-in and is not required for Sampling.
 
 1. Commit the project and stop the game.
-2. Open **⋮ > Automatic**, configure narrow filters and a method limit, and choose **Preview Install**.
+2. Open **⚙ > Automatic**, configure narrow filters and a method limit, and choose **Preview Install**.
 3. Review every proposed change, then choose **Apply Confirmed**.
 4. Run `dotnet clean` and `dotnet build`; restart Godot and the game.
 5. Rebuild/restart after every rule change.
@@ -64,7 +64,7 @@ Stopping the game disconnects that runtime, while completed editor-owned results
 ### Start disabled
 
 - Wait for Ready/capability negotiation, or use the queued pre-target Start path.
-- Open **⋮** and check whether the selected mode is supported by the target.
+- Open **⚙** and check whether the selected mode is supported by the target.
 - For Sampling, rerun setup, restore/build, restart Godot, and ensure diagnostics are enabled.
 - For Automatic, preview/apply, clean/build/restart, and resolve no-manifest, stale, no-match, needs-build, or needs-restart status.
 - Stop another capture/diagnostics owner if the runtime is busy.
@@ -78,21 +78,21 @@ Stopping the game disconnects that runtime, while completed editor-owned results
 
 ### No frames or call rows
 
-- Sampling includes all managed assemblies by default. Check any include/exclude prefixes under **⋮**.
+- Sampling includes all managed assemblies by default. Check any include/exclude prefixes under **⚙**.
 - Inspect quality diagnostics for drops, truncation, ignored threads, missing symbols/rundown, or partial disconnect.
 - Ensure `DOTNET_EnableDiagnostics` is not `0`; interval variables must be set before the game starts.
 - Automatic/Manual rows require executed woven methods/scopes and do not substitute for Sampling rows.
 
 ## Export, privacy, and security
 
-Copy/export and diagnostics live under **⋮** and activate when results exist. Exports are local and source-separated. Review them before sharing because method/type names and project identifiers may be sensitive.
+Selected-batch Copy is beside the batch selector; per-call Copy is in the row context menu. Export and diagnostics live under **⚙** and activate when results exist. Exports are local and source-separated. Review them before sharing because method/type names and project identifiers may be sensitive.
 
 There is **no telemetry, analytics, account, or automatic upload**. NuGet restore can contact project-configured package sources. Protocol packets are versioned, identity/owner/sequence checked, strictly parsed, and bounded. Setup accepts a safe top-level SDK-style UTF-8 project, marks only its owned import, preserves unrelated project bytes, rejects symlink/reparse-point paths, and never edits `NuGet.Config`. Automatic changes require preview plus explicit confirmation.
 
 ## Safe removal
 
 1. Stop capture and games.
-2. If Automatic is installed, use **⋮ > Automatic > Preview Uninstall**, review, then **Apply Confirmed** before disabling the plugin.
+2. If Automatic is installed, use **⚙ > Automatic > Preview Uninstall**, review, then **Apply Confirmed** before disabling the plugin.
 3. Remove user-authored `CsProfiler.Scope` / `CsProfiler.Fn` calls and profiler namespace imports; host source is never rewritten automatically.
 4. Disable the plugin so it removes only its owned bridge autoload.
 5. While files remain, run:

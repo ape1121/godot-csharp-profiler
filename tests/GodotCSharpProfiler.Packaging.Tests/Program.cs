@@ -27,10 +27,14 @@ using (var zip = ZipFile.OpenRead(path))
     const string root = "addons/godot_csharp_profiler/";
     Assert(names.Length > 10, "Archive is unexpectedly empty.");
     Assert(names.All(n => n.StartsWith(root, StringComparison.Ordinal)), "Every entry must be rooted at addons/godot_csharp_profiler.");
-    foreach (var required in new[] { "plugin.cfg", "README.md", "LICENSE", "THIRD-PARTY-NOTICES.md", "licenses/FodyHelpers-LICENSE.txt", "licenses/Mono.Cecil-LICENSE.txt", "icon.svg", "Compatibility/GlobalUsings.cs", "Runtime/CsProfiler.cs", "Editor/CsProfilerPlugin.cs", "assets/setup.ps1", "assets/dependencies.json", "assets/GodotCSharpProfiler.Dependencies.props" })
+    foreach (var required in new[] { "plugin.cfg", "README.md", "LICENSE", "THIRD-PARTY-NOTICES.md", "licenses/FodyHelpers-LICENSE.txt", "licenses/Mono.Cecil-LICENSE.txt", "icon.svg", "icon.png", ".gitignore", "Compatibility/GlobalUsings.cs", "Runtime/CsProfiler.cs", "Editor/CsProfilerPlugin.cs", "assets/setup.ps1", "assets/dependencies.json", "assets/GodotCSharpProfiler.Dependencies.props" })
         Assert(names.Contains(root + required, StringComparer.Ordinal), $"Missing {required}.");
     Assert(!names.Any(n => Regex.IsMatch(n, @"(^|/)(bin|obj|\.godot|spikes|tests|src|docs|\.git)(/|$)", RegexOptions.IgnoreCase)), "Development content leaked into archive.");
     Assert(!names.Any(n => n.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase)), "Project files must not be archived.");
+    Assert(!names.Any(n => n.EndsWith(".uid", StringComparison.OrdinalIgnoreCase) ||
+                           n.EndsWith(".import", StringComparison.OrdinalIgnoreCase) ||
+                           n.EndsWith(".translation", StringComparison.OrdinalIgnoreCase)),
+        "Godot-generated metadata must not be archived.");
     var plugin = Read(zip, root + "plugin.cfg");
     Assert(plugin.Contains("script=\"Editor/CsProfilerPlugin.cs\"", StringComparison.Ordinal), "Invalid plugin script path.");
     Assert(plugin.Contains($"version=\"{version}\"", StringComparison.Ordinal), "Exact release plugin version is missing.");

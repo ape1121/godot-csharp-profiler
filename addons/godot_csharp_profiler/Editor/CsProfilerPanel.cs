@@ -95,6 +95,9 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private Tree _selectedBatchTree;
     private PopupMenu _callContextMenu;
     private CaptureTimelinePoint _selectedTimelinePoint;
+    private long _runtimeFrame = -1;
+    private double _runtimeFrameMilliseconds;
+    private readonly Dictionary<long, (long Frame, double Milliseconds)> _timelineFrameMetrics = new();
     private CsProfilerFrameGraph _graph;
     private Tree _tree;
     private int _selectedIndex = -1;
@@ -134,10 +137,10 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         var allManaged = string.IsNullOrEmpty(_controller.Configuration.Sampling.IncludeAssemblies);
         _samplingFilter.EmitSignal(OptionButton.SignalName.ItemSelected, 0L);
         var projectOnly = _controller.Configuration.Sampling.IncludeAssemblies == ProjectAssemblyName();
-        ApplyRuntimeMetrics(60, 1000.0 / 60.0);
+        ApplyRuntimeMetrics(42, 60, 1000.0 / 60.0);
         return _startSignalInvocations == 1 && _stopSignalInvocations == 1 &&
                _optionsSignalInvocations == 1 && _settingsPopup.Visible && allManaged && projectOnly &&
-               _performanceLabel.Text == "FPS 60 · frame 16.67 ms" &&
+               _performanceLabel.Text == "Frame 42 · 16.67 ms · 60 FPS" &&
                _settingsPopup.FindChildren("*", "Control", recursive: true, owned: false).Count >= 10;
     }
     internal int TimelinePointCountForTests => _protocolTimeline.Points.Count;
@@ -206,9 +209,8 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             new Callable(this, nameof(OnSamplingFilterSelected)));
         toolbar.AddChild(_samplingFilter);
 
-        // Copy/export are advanced actions and belong in the compact settings popup.
-        _copyButton = new Button { Text = "⧉ Copy AI Batch", Disabled = true,
-            TooltipText = "Copy every call in the selected batch as an AI-ready report" };
+        _copyButton = new Button { Text = "⧉ Copy", Disabled = true,
+            TooltipText = "Copy every call in the selected batch" };
         _copyButton.Connect(BaseButton.SignalName.Pressed, new Callable(this, nameof(OnCopyPressed)));
         _exportButton = new Button { Text = "Export Results", Disabled = true,
             TooltipText = "Export lossless source-separated JSON" };
@@ -232,7 +234,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _performanceLabel = new Label
         {
             Text = "FPS — · frame — ms",
-            TooltipText = "Live engine frame rate and average frame duration; independent of sampling batches."
+            TooltipText = "Actual game _Process delta for the latest or selected associated runtime frame."
         };
         toolbar.AddChild(_performanceLabel);
         toolbar.AddChild(new Label { Text = "Batch" });
@@ -246,6 +248,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _frameSelector.Connect(Godot.Range.SignalName.ValueChanged,
             new Callable(this, nameof(OnFrameSelectorChanged)));
         toolbar.AddChild(_frameSelector);
+        toolbar.AddChild(_copyButton);
 
         _graph = new CsProfilerFrameGraph { SizeFlagsVertical = SizeFlags.ShrinkBegin };
         _graph.Connect(CsProfilerFrameGraph.SignalName.FrameClicked,
@@ -299,8 +302,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             new Callable(this, nameof(OnSelectedBatchGuiInput)));
         _resultTabs.AddChild(_selectedBatchTree);
         _callContextMenu = new PopupMenu();
-        _callContextMenu.AddItem("Copy call for AI", 0);
-        _callContextMenu.AddItem("Copy complete batch for AI", 1);
+        _callContextMenu.AddItem("Copy call", 0);
         _callContextMenu.Connect(PopupMenu.SignalName.IdPressed,
             new Callable(this, nameof(OnCallContextAction)));
         AddChild(_callContextMenu);
@@ -351,7 +353,6 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         scroll.AddChild(settingsRoot);
 
         var outputCommands = new HBoxContainer();
-        outputCommands.AddChild(_copyButton);
         outputCommands.AddChild(_exportButton);
         settingsRoot.AddChild(outputCommands);
 
@@ -527,10 +528,12 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private void OnManualPrefixChanged(string text) =>
         _controller.UpdateManual(new ManualSettings(text));
 
-    internal void ApplyRuntimeMetrics(double fps, double frameMilliseconds)
+    internal void ApplyRuntimeMetrics(long runtimeFrame, double fps, double frameMilliseconds)
     {
+        _runtimeFrame = runtimeFrame;
+        _runtimeFrameMilliseconds = frameMilliseconds;
         if (_performanceLabel != null)
-            _performanceLabel.Text = $"FPS {fps:0} · frame {frameMilliseconds:0.00} ms";
+            _performanceLabel.Text = $"Frame {runtimeFrame} · {frameMilliseconds:0.00} ms · {fps:0} FPS";
     }
 
     private static string ProjectAssemblyName()
@@ -828,8 +831,32 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     internal void ApplyProtocolResults(ProfilerResults results) =>
         _controller?.ReplaceResults(results);
 
-    internal void ApplyProtocolTimeline(CaptureTimeline timeline) =>
+    internal void ApplyProtocolTimeline(CaptureTimeline timeline)
+    {
+        if (timeline != null)
+        {
+            var activeSequences = timeline.Points.Select(point => point.Sequence).ToHashSet();
+            foreach (var stale in _timelineFrameMetrics.Keys.Where(sequence => !activeSequences.Contains(sequence)).ToArray())
+                _timelineFrameMetrics.Remove(stale);
+            var points = timeline.Points.Select(point =>
+            {
+                if (point.RuntimeFrame >= 0) return point;
+                if (!_timelineFrameMetrics.TryGetValue(point.Sequence, out var metrics))
+                {
+                    if (_runtimeFrame < 0) return point;
+                    metrics = (_runtimeFrame, _runtimeFrameMilliseconds);
+                    _timelineFrameMetrics[point.Sequence] = metrics;
+                }
+                return point with
+                {
+                    RuntimeFrame = metrics.Frame,
+                    RuntimeFrameMilliseconds = metrics.Milliseconds
+                };
+            }).ToArray();
+            timeline = new CaptureTimeline(points);
+        }
         _controller?.UpdateTimeline(timeline);
+    }
 
     internal void OnBridgeReady(CsProfilerRuntimeIdentity identity)
     {
@@ -904,6 +931,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             return; // session signal arrived before _Ready built the controls
         _frames.Clear();
         _protocolTimeline = CaptureTimeline.Empty;
+        _timelineFrameMetrics.Clear();
         _selectedIndex = -1;
         _liveFollow = true;
         _graph.SetTimeline(_protocolTimeline);
@@ -1016,6 +1044,9 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     {
         if (_selectedBatchTree == null) return;
         _selectedTimelinePoint = point;
+        if (point.RuntimeFrame >= 0 && point.RuntimeFrameMilliseconds > 0)
+            _performanceLabel.Text = $"Frame {point.RuntimeFrame} · {point.RuntimeFrameMilliseconds:0.00} ms · " +
+                $"{1000.0 / point.RuntimeFrameMilliseconds:0} FPS";
         _selectedBatchTree.Clear();
         var sampling = point.Source == CaptureSource.Sampling;
         _selectedBatchTree.Columns = sampling ? 3 : 5;
@@ -1068,9 +1099,8 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         }
     }
 
-    private void OnCallContextAction(long id) => CopyTimelineReport(id == 0
-        ? _selectedBatchTree.GetSelected()?.GetMetadata(0).AsString()
-        : null);
+    private void OnCallContextAction(long id) =>
+        CopyTimelineReport(_selectedBatchTree.GetSelected()?.GetMetadata(0).AsString());
 
     private void CopyTimelineReport(string selectedName)
     {
@@ -1079,8 +1109,8 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         if (report.Length == 0) return;
         DisplayServer.ClipboardSet(report);
         _statsLabel.Text = RuntimeStatus(selectedName == null
-            ? $"Copied batch #{_selectedTimelinePoint.Sequence} for AI"
-            : $"Copied {selectedName} for AI");
+            ? $"Copied batch #{_selectedTimelinePoint.Sequence}"
+            : $"Copied {selectedName}");
     }
 
     private static string BuildTimelineReport(CaptureTimelinePoint point, string selectedName)
@@ -1095,6 +1125,9 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             .Append("- Source: ").AppendLine(sampling ? "statistical sampling" : "exact instrumentation")
             .Append("- Batch: ").AppendLine(point.Sequence.ToString())
             .Append("- Scope: ").AppendLine(selectedName ?? "complete selected batch");
+        if (point.RuntimeFrame >= 0)
+            builder.Append("- Associated runtime frame: ").Append(point.RuntimeFrame)
+                .Append(" (").Append(point.RuntimeFrameMilliseconds.ToString("0.###")).AppendLine(" ms)");
         if (sampling)
             builder.AppendLine("- Timing note: samples/share identify hotspots; they are not call durations.")
                 .AppendLine("| Function | Samples | Share |")

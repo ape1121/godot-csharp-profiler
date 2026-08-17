@@ -11,7 +11,7 @@ return await ReleaseBuilder.RunAsync(args);
 static class ReleaseBuilder
 {
     static readonly UTF8Encoding Utf8 = new(false);
-    static readonly string[] Required = ["plugin.cfg", "README.md", "LICENSE", "THIRD-PARTY-NOTICES.md", "licenses/FodyHelpers-LICENSE.txt", "licenses/Mono.Cecil-LICENSE.txt", "icon.svg", "Compatibility/GlobalUsings.cs", "Runtime/CsProfiler.cs", "Editor/CsProfilerPlugin.cs", "assets/setup.ps1", "assets/dependencies.json", "assets/GodotCSharpProfiler.Dependencies.props"];
+    static readonly string[] Required = ["plugin.cfg", "README.md", "LICENSE", "THIRD-PARTY-NOTICES.md", "licenses/FodyHelpers-LICENSE.txt", "licenses/Mono.Cecil-LICENSE.txt", "icon.svg", "icon.png", ".gitignore", "Compatibility/GlobalUsings.cs", "Runtime/CsProfiler.cs", "Editor/CsProfilerPlugin.cs", "assets/setup.ps1", "assets/dependencies.json", "assets/GodotCSharpProfiler.Dependencies.props"];
     static readonly string[] RequiredPackageEntries = ["README.md", "THIRD-PARTY-NOTICES.md", "licenses/FodyHelpers-LICENSE.txt", "licenses/Mono.Cecil-LICENSE.txt", "weaver/GodotCSharpProfiler.Fody.dll", "weaver/FodyHelpers.dll", "weaver/Mono.Cecil.dll", "weaver/Mono.Cecil.Pdb.dll", "weaver/Mono.Cecil.Rocks.dll"];
     static readonly HashSet<string> Forbidden = new(StringComparer.OrdinalIgnoreCase) { "bin", "obj", ".godot", "spikes", "tests", "src", "docs", ".git", "TestResults" };
 
@@ -88,6 +88,9 @@ static class ReleaseBuilder
             if ((info.Attributes & FileAttributes.ReparsePoint) != 0) throw new InvalidDataException($"Symlinks are forbidden in release input: {path}");
             var relative = Relative(source, path);
             if (relative.Split('/').Any(Forbidden.Contains)) continue;
+            if (relative.EndsWith(".uid", StringComparison.OrdinalIgnoreCase) ||
+                relative.EndsWith(".import", StringComparison.OrdinalIgnoreCase) ||
+                relative.EndsWith(".translation", StringComparison.OrdinalIgnoreCase)) continue;
             var target = Path.Combine(destination, relative.Replace('/', Path.DirectorySeparatorChar));
             if (Directory.Exists(path)) Directory.CreateDirectory(target);
             else { Directory.CreateDirectory(Path.GetDirectoryName(target)!); File.Copy(path, target); }
@@ -97,8 +100,8 @@ static class ReleaseBuilder
     static void TransformStage(string addon, string version)
     {
         Transform(Path.Combine(addon, "Runtime", "Sampling", "ManagedSamplingSession.cs"), text => "#if GODOT_CSHARP_PROFILER_SAMPLING\n" + NormalizeLf(text).TrimEnd('\n') + "\n#endif\n");
-        ReplaceExactly(Path.Combine(addon, "plugin.cfg"), "version=\"0.1.0-dev\"", $"version=\"{version}\"");
-        ReplaceExactly(Path.Combine(addon, "Editor", "Installation", "ProjectInstaller.cs"), "ProfilerFodyVersion = \"0.1.0-dev\"", $"ProfilerFodyVersion = \"{version}\"");
+        ReplaceExactly(Path.Combine(addon, "plugin.cfg"), "version=\"0.1.0\"", $"version=\"{version}\"");
+        ReplaceExactly(Path.Combine(addon, "Editor", "Installation", "ProjectInstaller.cs"), "ProfilerFodyVersion = \"0.1.0\"", $"ProfilerFodyVersion = \"{version}\"");
         var manifestPath = Path.Combine(addon, "assets", "dependencies.json");
         var manifest = JsonNode.Parse(File.ReadAllText(manifestPath))?.AsObject() ?? throw new InvalidDataException("Invalid dependencies.json.");
         manifest["bootstrapPackage"]!["version"] = version;

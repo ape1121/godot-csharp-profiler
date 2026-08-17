@@ -2,7 +2,7 @@
   "schema": 1,
   "bootstrapPackage": {
     "id": "GodotCSharpProfiler.Dependencies",
-    "version": "0.1.0-dev"
+    "version": "0.1.0"
   },
   "sampling": {
     "define": "GODOT_CSHARP_PROFILER_SAMPLING",
@@ -14,7 +14,7 @@
   "automatic": {
     "packages": {
       "Fody": "6.9.3",
-      "GodotCSharpProfiler.Fody": "0.1.0-dev"
+      "GodotCSharpProfiler.Fody": "0.1.0"
     },
     "requiresRebuildAndRestart": true
   },

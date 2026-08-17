@@ -7,20 +7,20 @@
 - **Godot version:** 4.7
 - **License:** MIT
 - **Support level:** Community
-- **Repository:** `https://github.com/apeworks/godot-csharp-profiler`
-- **Download:** attach `godot-csharp-profiler-VERSION.zip` from the matching GitHub release
-- **Icon:** `addons/godot_csharp_profiler/icon.svg` (original artwork)
+- **Repository:** `https://github.com/ape1121/godot-csharp-profiler`
+- **Download commit:** use the immutable commit of the matching `main` addon release
+- **Icon URL:** `https://raw.githubusercontent.com/ape1121/godot-csharp-profiler/main/icon.png`
 - **Summary:** Managed CPU profiling for Godot .NET with statistical sampling, opt-in exact build instrumentation, and exact manual scopes.
 
 ## Description draft
 
-Profile managed C# work inside Godot 4.7 .NET projects without a custom engine build. Manual scopes are lightweight and exact; EventPipe sampling estimates CPU distribution; optional Fody weaving records filtered method wall time. Captures remain local and the addon has no telemetry.
+Profile managed C# work inside Godot 4.7 .NET projects without a custom engine build. EventPipe sampling identifies statistical hotspots; optional Fody weaving and manual scopes record observed wall-clock spans and calls. Captures remain local and the addon has no telemetry.
 
 Sampling and automatic instrumentation require the included dependency setup. Automatic mode changes the project build and requires a rebuild and process restart. See the packaged README for limitations and clean removal.
 
 ## Submission checklist
 
-- [ ] Replace the draft repository/download URLs if ownership or release location changes.
+- [x] Canonical repository and direct 256×256 PNG icon URLs are recorded.
 - [ ] Release version equals `plugin.cfg`, dependency manifest, Fody package, tag, and archive name.
 - [ ] Run `pwsh scripts/build-release.ps1 -Version X.Y.Z` from a clean checkout.
 - [ ] Linux and Windows Actions are green; do not state editor validation unless a workflow actually launches Godot.
