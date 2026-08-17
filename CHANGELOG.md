@@ -2,6 +2,15 @@
 
 All notable changes use [Keep a Changelog](https://keepachangelog.com/) conventions.
 
+## [0.1.1] - 2026-08-17
+
+### Fixed
+
+- Copy and Export remain enabled while reviewing retained captured batches after Stop.
+- Selected-batch call rows support multi-selection and copy as concise plain-text lines.
+- Timeline Export writes the complete retained capture as JSON.
+- Removed redundant sampling-default text from Options.
+
 ## [0.1.0] - 2026-08-17
 
 ### Added
@@ -28,4 +37,5 @@ All notable changes use [Keep a Changelog](https://keepachangelog.com/) conventi
 - Setup edits only an ownership-marked top-level project import, rejects unsafe path indirection, preserves unrelated project content, and never edits `NuGet.Config`.
 - Automatic installation requires a fresh reviewed preview and explicit confirmation; disable/uninstall remove only addon-owned configuration.
 
+[0.1.1]: https://github.com/ape1121/godot-csharp-profiler/releases/tag/v0.1.1
 [0.1.0]: https://github.com/ape1121/godot-csharp-profiler/releases/tag/v0.1.0
