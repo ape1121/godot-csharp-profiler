@@ -120,7 +120,13 @@ public sealed class ProductionRuntimeCaptureBackend : IRuntimeCaptureBackend
         _sampler = null;
         if (sampler is not null)
         {
-            try { sampler.Stop(); result.Add(SamplingBatch(sampler.Snapshot(reset: true))); }
+            try
+            {
+                sampler.Stop();
+                var sampling = SamplingBatch(sampler.Snapshot(reset: true));
+                if (sampling.Methods.Count > 0 || sampling.Quality != QualityCounters.Zero)
+                    result.Add(sampling);
+            }
             catch (Exception exception) { failure = exception; }
             finally { try { sampler.Dispose(); } catch (Exception exception) { failure ??= exception; } }
         }
