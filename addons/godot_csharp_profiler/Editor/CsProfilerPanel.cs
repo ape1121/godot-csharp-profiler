@@ -70,6 +70,8 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private SpinBox _frameSelector;
     private Label _targetLabel;
     private Label _statsLabel;
+    private Label _performanceLabel;
+    private OptionButton _samplingFilter;
     private Label _settingsLabel;
     private Label _qualityLabel;
     private LineEdit _samplingIncludes;
@@ -109,6 +111,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private ProfilerDockController _controller;
     internal ModeConfiguration ConfigurationForProtocol => _controller?.Configuration ?? ModeConfiguration.Default;
     internal string StatusTextForTests => _statsLabel?.Text ?? "";
+    internal string PerformanceTextForTests => _performanceLabel?.Text ?? "";
     internal string[] DisplayedRowsForTests() => _displayedRowsForTests.ToArray();
     internal int FrameCountForTests => _frames.Count;
     internal int ProtocolResultRowsForTests => _protocolResultRowsForTests;
@@ -123,8 +126,14 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _startButton.EmitSignal(BaseButton.SignalName.Pressed);
         _stopButton.EmitSignal(BaseButton.SignalName.Pressed);
         _settingsButton.EmitSignal(BaseButton.SignalName.Pressed);
+        _samplingFilter.EmitSignal(OptionButton.SignalName.ItemSelected, 2L);
+        var allManaged = string.IsNullOrEmpty(_controller.Configuration.Sampling.IncludeAssemblies);
+        _samplingFilter.EmitSignal(OptionButton.SignalName.ItemSelected, 0L);
+        var projectOnly = _controller.Configuration.Sampling.IncludeAssemblies == ProjectAssemblyName();
+        ApplyRuntimeMetrics(60, 1000.0 / 60.0);
         return _startSignalInvocations == 1 && _stopSignalInvocations == 1 &&
-               _optionsSignalInvocations == 1 && _settingsPopup.Visible &&
+               _optionsSignalInvocations == 1 && _settingsPopup.Visible && allManaged && projectOnly &&
+               _performanceLabel.Text == "FPS 60 · frame 16.67 ms" &&
                _settingsPopup.FindChildren("*", "Control", recursive: true, owned: false).Count >= 10;
     }
     internal int TimelinePointCountForTests => _protocolTimeline.Points.Count;
@@ -158,6 +167,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         SizeFlagsVertical = SizeFlags.ExpandFill;
         CustomMinimumSize = Vector2.Zero;
         _controller = new ProfilerDockController(this, this, CreateInstallerSafely(), this);
+        _controller.UpdateSampling(new SamplingSettings(ProjectAssemblyName(), string.Empty, 2_000_000));
 
         var toolbar = new HBoxContainer();
         AddChild(toolbar);
@@ -178,6 +188,19 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         };
         _settingsButton.Connect(BaseButton.SignalName.Pressed, new Callable(this, nameof(ShowSettings)));
         toolbar.AddChild(_settingsButton);
+        _samplingFilter = new OptionButton
+        {
+            TooltipText = "Sampling assembly filter (applies on next Start). Project hides framework and engine internals.",
+            CustomMinimumSize = new Vector2(132, 0)
+        };
+        _samplingFilter.AddItem("Calls: Project", 0);
+        _samplingFilter.AddItem("Calls: Project + Godot", 1);
+        _samplingFilter.AddItem("Calls: All managed", 2);
+        _samplingFilter.AddItem("Custom…", 3);
+        _samplingFilter.Selected = 0;
+        _samplingFilter.Connect(OptionButton.SignalName.ItemSelected,
+            new Callable(this, nameof(OnSamplingFilterSelected)));
+        toolbar.AddChild(_samplingFilter);
 
         // Copy/export are advanced actions and belong in the compact settings popup.
         _copyButton = new Button { Text = "Copy Results", Disabled = true,
@@ -202,6 +225,12 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             TextOverrunBehavior = TextServer.OverrunBehavior.TrimEllipsis
         };
         toolbar.AddChild(_statsLabel);
+        _performanceLabel = new Label
+        {
+            Text = "FPS — · frame — ms",
+            TooltipText = "Live engine frame rate and average frame duration; independent of sampling batches."
+        };
+        toolbar.AddChild(_performanceLabel);
         toolbar.AddChild(new Label { Text = "Batch" });
         _frameSelector = new SpinBox
         {
@@ -336,12 +365,19 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
 
         _samplingSettings = new VBoxContainer();
         settingsRoot.AddChild(_samplingSettings);
-        _samplingIncludes = AddLineSetting(_samplingSettings, "Include assemblies", "",
+        _samplingIncludes = AddLineSetting(_samplingSettings, "Include assemblies", ProjectAssemblyName(),
             nameof(OnSamplingIncludesChanged));
         _samplingExcludes = AddLineSetting(_samplingSettings, "Exclude assemblies", "",
             nameof(OnSamplingExcludesChanged));
+        _samplingIncludes.Editable = false;
+        _samplingExcludes.Editable = false;
         _samplingInterval = AddSpinSetting(_samplingSettings, "Interval (ns, startup-only)", 100_000, 1_000_000_000,
             2_000_000, nameof(OnSamplingIntervalChanged));
+        _samplingSettings.AddChild(new Label
+        {
+            Text = "Sampling is statistical: Samples and Share estimate hot methods; per-call milliseconds require Automatic mode.",
+            AutowrapMode = TextServer.AutowrapMode.WordSmart
+        });
 
         _automaticSettings = new VBoxContainer();
         settingsRoot.AddChild(_automaticSettings);
@@ -412,6 +448,31 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private void OnManualModePressed() => _controller.SelectManualOnly();
     private void OnManualOverlayToggled(bool included) => _controller.SetManualOverlay(included);
 
+    private void OnSamplingFilterSelected(long index)
+    {
+        var assembly = ProjectAssemblyName();
+        switch (index)
+        {
+            case 0:
+                _controller.UpdateSampling(CurrentSampling() with
+                    { IncludeAssemblies = assembly, ExcludeAssemblies = string.Empty });
+                break;
+            case 1:
+                _controller.UpdateSampling(CurrentSampling() with
+                    { IncludeAssemblies = $"{assembly};GodotSharp", ExcludeAssemblies = string.Empty });
+                break;
+            case 2:
+                _controller.UpdateSampling(CurrentSampling() with
+                    { IncludeAssemblies = string.Empty, ExcludeAssemblies = string.Empty });
+                break;
+            case 3:
+                break;
+        }
+        var custom = index == 3;
+        if (_samplingIncludes != null) _samplingIncludes.Editable = custom;
+        if (_samplingExcludes != null) _samplingExcludes.Editable = custom;
+    }
+
     private void OnSamplingIncludesChanged(string text) =>
         _controller.UpdateSampling(CurrentSampling() with { IncludeAssemblies = text });
     private void OnSamplingExcludesChanged(string text) =>
@@ -426,6 +487,20 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _controller.UpdateAutomatic(CurrentAutomatic() with { MaxMethods = (int)value });
     private void OnManualPrefixChanged(string text) =>
         _controller.UpdateManual(new ManualSettings(text));
+
+    internal void ApplyRuntimeMetrics(double fps, double frameMilliseconds)
+    {
+        if (_performanceLabel != null)
+            _performanceLabel.Text = $"FPS {fps:0} · frame {frameMilliseconds:0.00} ms";
+    }
+
+    private static string ProjectAssemblyName()
+    {
+        var configured = ProjectSettings.GetSetting("dotnet/project/assembly_name").AsString().Trim();
+        if (!string.IsNullOrEmpty(configured)) return configured;
+        var projectName = ProjectSettings.GetSetting("application/config/name").AsString().Trim();
+        return string.IsNullOrEmpty(projectName) ? "Game" : projectName.Replace(" ", string.Empty);
+    }
 
     private void ShowSettings()
     {
@@ -857,7 +932,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             var point = _protocolTimeline.Points[index];
             RenderSelectedBatch(point);
             _statsLabel.Text = point.Source == CaptureSource.Sampling
-                ? RuntimeStatus($"{point.Value} samples | {point.Rows.Count} methods | batch #{point.Sequence}")
+                ? RuntimeStatus($"{point.Value} statistical samples | {point.Rows.Count} methods | batch #{point.Sequence}")
                 : RuntimeStatus($"{point.Value / 1_000_000.0:0.###} ms observed exact-span time | " +
                     $"{point.Observations} calls | batch #{point.Sequence}");
             return;

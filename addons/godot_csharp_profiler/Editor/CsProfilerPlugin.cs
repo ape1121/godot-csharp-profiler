@@ -159,6 +159,13 @@ public partial class CsProfilerPlugin : EditorPlugin
                 FinishEditorAttachedProbe(1);
                 return;
             }
+            if (!_panel.PerformanceTextForTests.StartsWith("FPS ", StringComparison.Ordinal) ||
+                _panel.PerformanceTextForTests.Contains('—'))
+            {
+                GD.PushError($"CS_PROFILER_EDITOR_ATTACHED_ASSERTIONS_FAILED runtime metrics missing: {_panel.PerformanceTextForTests}");
+                FinishEditorAttachedProbe(1);
+                return;
+            }
             var count = EditorInterface.Singleton.GetBaseControl()
                 .FindChildren("*", "EditorDock", recursive: true, owned: false)
                 .OfType<EditorDock>()
