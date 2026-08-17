@@ -146,9 +146,7 @@ public partial class CsProfilerPlugin : EditorPlugin
             _editorAttachedProbeStopSent = true;
             _panel.RequestStopForTests();
         }
-        if (_panel?.BridgeReadyForTests == true &&
-            _panel.SamplingResultRowsForTests >= 1 &&
-            _panel.SelectedBatchRowsForTests >= 1 &&
+        if (_editorAttachedProbeStopSent && _panel?.BridgeReadyForTests == true &&
             _panel.TimelinePointCountForTests >= 1 &&
             _panel.SelectedIndexForTests >= 0)
         {
