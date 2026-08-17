@@ -209,7 +209,8 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
             _protocol.TryGetValue(change.PreviousSessionId, out var previous)) previous.Stop();
         if (change.SelectedSessionId < 0 || change.Identity == null)
         {
-            if (change.PreviousSessionId >= 0) _pendingCapture.Cancel();
+            // A queued pre-target request must survive transient route loss during debugger startup.
+            // Requests that started were already consumed; explicit Stop/teardown still cancel waiting intent.
             _panel?.OnSessionStopped();
             return;
         }
