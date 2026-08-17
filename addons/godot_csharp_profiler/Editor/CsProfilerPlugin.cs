@@ -14,6 +14,7 @@ public partial class CsProfilerPlugin : EditorPlugin
     private CsProfilerPanel _panel;
     private EditorDock _dock;
     private bool _editorAttachedProbeRunning;
+    private bool _editorAttachedProbeCaptureRequested;
     private bool _editorAttachedProbeStopSent;
     private double _editorAttachedProbeStartedAt;
     private double _editorAttachedProbeDeadline;
@@ -30,7 +31,9 @@ public partial class CsProfilerPlugin : EditorPlugin
         if (_registered)
             return;
         _registered = true;
-        EnsureRuntimeBridgeAutoload();
+        // Clean an owned entry left by an older build or interrupted editor session. Merely
+        // opening the editor must not add this setting to the tracked project configuration.
+        RemoveOwnedRuntimeBridgeAutoload();
         _panel = new CsProfilerPanel { Name = "C# Profiler" };
         _dock = new EditorDock
         {
@@ -126,10 +129,10 @@ public partial class CsProfilerPlugin : EditorPlugin
         private void StartEditorAttachedProbe()
     {
         _editorAttachedProbeRunning = true;
+        _editorAttachedProbeCaptureRequested = false;
         _editorAttachedProbeStopSent = false;
         _editorAttachedProbeStartedAt = Time.GetTicksMsec() / 1000.0;
         _editorAttachedProbeDeadline = Time.GetTicksMsec() / 1000.0 + 30.0;
-        _panel.RequestSamplingCapture();
         EditorInterface.Singleton.PlayMainScene();
     }
 
@@ -139,6 +142,12 @@ public partial class CsProfilerPlugin : EditorPlugin
         if (!_editorAttachedProbeRunning)
             return;
         var now = Time.GetTicksMsec() / 1000.0;
+        if (!_editorAttachedProbeCaptureRequested && EditorInterface.Singleton.IsPlayingScene() &&
+            _panel?.BridgeReadyForTests == true && _panel.IdentityForTests.EditorAttached)
+        {
+            _editorAttachedProbeCaptureRequested = true;
+            _panel.RequestSamplingCapture();
+        }
         if (!_editorAttachedProbeStopSent && _panel?.BridgeReadyForTests == true &&
             _panel.TimelinePointCountForTests >= 1 &&
             now - _editorAttachedProbeStartedAt >= 3.0)
