@@ -2,7 +2,7 @@
 
 All notable changes use [Keep a Changelog](https://keepachangelog.com/) conventions.
 
-## [Unreleased]
+## [0.1.0] - 2026-08-17
 
 ### Added
 
@@ -28,4 +28,4 @@ All notable changes use [Keep a Changelog](https://keepachangelog.com/) conventi
 - Setup edits only an ownership-marked top-level project import, rejects unsafe path indirection, preserves unrelated project content, and never edits `NuGet.Config`.
 - Automatic installation requires a fresh reviewed preview and explicit confirmation; disable/uninstall remove only addon-owned configuration.
 
-[Unreleased]: https://github.com/apeworks/godot-csharp-profiler/commits/main
+[0.1.0]: https://github.com/ape1121/godot-csharp-profiler/releases/tag/v0.1.0

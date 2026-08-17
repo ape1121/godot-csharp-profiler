@@ -9,7 +9,7 @@ namespace Apeworks.GodotCSharpProfiler.Editor.Installation;
 public sealed class ProjectInstaller
 {
     public const string FodyVersion = "6.9.3";
-    public const string ProfilerFodyVersion = "0.1.0-dev";
+    public const string ProfilerFodyVersion = "0.1.0";
     public const string OwnershipElementName = "GodotCSharpProfilerInstallation";
     public const string ReferenceOwnershipElementName = "GodotCSharpProfilerOwned";
     public const string PackageSourceElementName = "GodotCSharpProfilerPackageSource";

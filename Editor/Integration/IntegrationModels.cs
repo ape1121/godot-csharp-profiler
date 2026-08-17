@@ -25,7 +25,9 @@ public sealed record CaptureTimelinePoint(
     CaptureSource Source,
     long Value,
     long Observations,
-    IReadOnlyList<ResultRow> Rows);
+    IReadOnlyList<ResultRow> Rows,
+    long RuntimeFrame = -1,
+    double RuntimeFrameMilliseconds = 0);
 public sealed record CaptureTimeline(IReadOnlyList<CaptureTimelinePoint> Points)
 {
     public const int MaximumPoints = 120;

@@ -154,13 +154,14 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
         }
         if (message == CsProfilerBridge.MetricsMessage)
         {
-            if (_router.SelectedSessionId == sessionId && data.Count == 2)
+            if (_router.SelectedSessionId == sessionId && data.Count == 3)
             {
                 var fps = data[0].AsDouble();
                 var frameMilliseconds = data[1].AsDouble();
+                var runtimeFrame = data[2].AsInt64();
                 if (double.IsFinite(fps) && fps >= 0 && double.IsFinite(frameMilliseconds) &&
-                    frameMilliseconds >= 0)
-                    _panel?.ApplyRuntimeMetrics(fps, frameMilliseconds);
+                    frameMilliseconds >= 0 && runtimeFrame >= 0)
+                    _panel?.ApplyRuntimeMetrics(runtimeFrame, fps, frameMilliseconds);
             }
             return true;
         }
