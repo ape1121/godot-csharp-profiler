@@ -15,6 +15,7 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
     private readonly HashSet<int> _activeSessionIds = new();
     private readonly Dictionary<int, EditorCaptureCoordinator> _protocol = new();
     private readonly Dictionary<int, CsProfilerRuntimeIdentity> _identities = new();
+    private readonly Dictionary<(int Session, long Generation, long Sequence), BatchFlushFrame> _batchFrames = new();
     private readonly CsProfilerSessionRouterState _router = new();
     private readonly PendingCaptureRequest _pendingCapture = new();
     private double _nextOwnedDiscoveryAtSeconds;
@@ -46,6 +47,7 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
             _router.Forget(stopped);
             if (_protocol.Remove(stopped, out var endpoint)) endpoint.Disconnect();
             _identities.Remove(stopped);
+            foreach (var key in _batchFrames.Keys.Where(key => key.Session == stopped).ToArray()) _batchFrames.Remove(key);
         }
         _activeSessionIds.Clear();
         _activeSessionIds.UnionWith(active);
@@ -70,6 +72,7 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
         _activeSessionIds.Clear();
         _protocol.Clear();
         _identities.Clear();
+        _batchFrames.Clear();
         _router.Clear();
         _panel = null;
     }
@@ -165,6 +168,25 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
             }
             return true;
         }
+        if (message == CsProfilerBridge.BatchFrameMessage)
+        {
+            if (_router.SelectedSessionId == sessionId && data.Count == 4 &&
+                data.All(value => value.VariantType == Variant.Type.Int))
+            {
+                var generation = data[0].AsInt64();
+                var sequence = data[1].AsInt64();
+                var processFrame = data[2].AsInt64();
+                var elapsedNanoseconds = data[3].AsInt64();
+                if (generation > 0 && sequence > 0 && processFrame >= 0 && elapsedNanoseconds > 0)
+                {
+                    var association = new BatchFlushFrame(processFrame, elapsedNanoseconds);
+                    _batchFrames[(sessionId, generation, sequence)] = association;
+                    if (_protocol.TryGetValue(sessionId, out var associatedEndpoint))
+                        associatedEndpoint.AssociateBatchFlushFrame(generation, sequence, association);
+                }
+            }
+            return true;
+        }
         if (message != CsProfilerBridge.ProtocolMessage) return false;
         if (!GodotDebuggerTransport.TryRead(data, out var payload))
         {
@@ -173,6 +195,9 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
         }
         var endpoint = Endpoint(sessionId);
         var accepted = endpoint.Receive(payload);
+        if (accepted)
+            foreach (var pair in _batchFrames.Where(pair => pair.Key.Session == sessionId).ToArray())
+                endpoint.AssociateBatchFlushFrame(pair.Key.Generation, pair.Key.Sequence, pair.Value);
         if (accepted && _router.SelectedSessionId == sessionId && _pendingCapture.HasRequest &&
             _identities.TryGetValue(sessionId, out var selectedIdentity) &&
             string.Equals(endpoint.Snapshot.RuntimeToken, selectedIdentity.RuntimeToken, StringComparison.Ordinal))

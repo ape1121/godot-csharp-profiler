@@ -95,9 +95,6 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private Tree _selectedBatchTree;
     private PopupMenu _callContextMenu;
     private CaptureTimelinePoint _selectedTimelinePoint;
-    private long _runtimeFrame = -1;
-    private double _runtimeFrameMilliseconds;
-    private readonly Dictionary<long, (long Frame, double Milliseconds)> _timelineFrameMetrics = new();
     private CsProfilerFrameGraph _graph;
     private Tree _tree;
     private int _selectedIndex = -1;
@@ -234,7 +231,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _performanceLabel = new Label
         {
             Text = "FPS — · frame — ms",
-            TooltipText = "Actual game _Process delta for the latest or selected associated runtime frame."
+            TooltipText = "Live game _Process delta, or the selected batch emission-frame timing when available."
         };
         toolbar.AddChild(_performanceLabel);
         toolbar.AddChild(new Label { Text = "Batch" });
@@ -530,8 +527,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
 
     internal void ApplyRuntimeMetrics(long runtimeFrame, double fps, double frameMilliseconds)
     {
-        _runtimeFrame = runtimeFrame;
-        _runtimeFrameMilliseconds = frameMilliseconds;
+        if (_selectedTimelinePoint != null) return;
         if (_performanceLabel != null)
             _performanceLabel.Text = $"Frame {runtimeFrame} · {frameMilliseconds:0.00} ms · {fps:0} FPS";
     }
@@ -831,32 +827,8 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     internal void ApplyProtocolResults(ProfilerResults results) =>
         _controller?.ReplaceResults(results);
 
-    internal void ApplyProtocolTimeline(CaptureTimeline timeline)
-    {
-        if (timeline != null)
-        {
-            var activeSequences = timeline.Points.Select(point => point.Sequence).ToHashSet();
-            foreach (var stale in _timelineFrameMetrics.Keys.Where(sequence => !activeSequences.Contains(sequence)).ToArray())
-                _timelineFrameMetrics.Remove(stale);
-            var points = timeline.Points.Select(point =>
-            {
-                if (point.RuntimeFrame >= 0) return point;
-                if (!_timelineFrameMetrics.TryGetValue(point.Sequence, out var metrics))
-                {
-                    if (_runtimeFrame < 0) return point;
-                    metrics = (_runtimeFrame, _runtimeFrameMilliseconds);
-                    _timelineFrameMetrics[point.Sequence] = metrics;
-                }
-                return point with
-                {
-                    RuntimeFrame = metrics.Frame,
-                    RuntimeFrameMilliseconds = metrics.Milliseconds
-                };
-            }).ToArray();
-            timeline = new CaptureTimeline(points);
-        }
+    internal void ApplyProtocolTimeline(CaptureTimeline timeline) =>
         _controller?.UpdateTimeline(timeline);
-    }
 
     internal void OnBridgeReady(CsProfilerRuntimeIdentity identity)
     {
@@ -931,7 +903,6 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             return; // session signal arrived before _Ready built the controls
         _frames.Clear();
         _protocolTimeline = CaptureTimeline.Empty;
-        _timelineFrameMetrics.Clear();
         _selectedIndex = -1;
         _liveFollow = true;
         _graph.SetTimeline(_protocolTimeline);
@@ -1044,9 +1015,14 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     {
         if (_selectedBatchTree == null) return;
         _selectedTimelinePoint = point;
-        if (point.RuntimeFrame >= 0 && point.RuntimeFrameMilliseconds > 0)
-            _performanceLabel.Text = $"Frame {point.RuntimeFrame} · {point.RuntimeFrameMilliseconds:0.00} ms · " +
-                $"{1000.0 / point.RuntimeFrameMilliseconds:0} FPS";
+        if (point.FlushFrame is { } flush)
+        {
+            var milliseconds = flush.ElapsedNanoseconds / 1_000_000.0;
+            _performanceLabel.Text = $"Flush frame {flush.ProcessFrame} · {milliseconds:0.00} ms · " +
+                $"{1_000_000_000.0 / flush.ElapsedNanoseconds:0} FPS";
+        }
+        else
+            _performanceLabel.Text = "Flush-frame timing unavailable";
         _selectedBatchTree.Clear();
         var sampling = point.Source == CaptureSource.Sampling;
         _selectedBatchTree.Columns = sampling ? 3 : 5;
@@ -1125,9 +1101,12 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             .Append("- Source: ").AppendLine(sampling ? "statistical sampling" : "exact instrumentation")
             .Append("- Batch: ").AppendLine(point.Sequence.ToString())
             .Append("- Scope: ").AppendLine(selectedName ?? "complete selected batch");
-        if (point.RuntimeFrame >= 0)
-            builder.Append("- Associated runtime frame: ").Append(point.RuntimeFrame)
-                .Append(" (").Append(point.RuntimeFrameMilliseconds.ToString("0.###")).AppendLine(" ms)");
+        if (point.FlushFrame is { } flush)
+            builder.Append("- Batch emission frame: ").Append(flush.ProcessFrame)
+                .Append(" (").Append((flush.ElapsedNanoseconds / 1_000_000.0).ToString("0.###")).AppendLine(" ms)")
+                .AppendLine("- Frame note: this batch was flushed during that frame; the batch is not a frame and may cover a wider interval.");
+        else
+            builder.AppendLine("- Batch emission frame: unavailable");
         if (sampling)
             builder.AppendLine("- Timing note: samples/share identify hotspots; they are not call durations.")
                 .AppendLine("| Function | Samples | Share |")

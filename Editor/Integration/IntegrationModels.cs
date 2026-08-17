@@ -26,8 +26,8 @@ public sealed record CaptureTimelinePoint(
     long Value,
     long Observations,
     IReadOnlyList<ResultRow> Rows,
-    long RuntimeFrame = -1,
-    double RuntimeFrameMilliseconds = 0);
+    BatchFlushFrame? FlushFrame = null);
+public sealed record BatchFlushFrame(long ProcessFrame, long ElapsedNanoseconds);
 public sealed record CaptureTimeline(IReadOnlyList<CaptureTimelinePoint> Points)
 {
     public const int MaximumPoints = 120;
@@ -110,6 +110,18 @@ public sealed class EditorCaptureCoordinator
     public event Action<ProfilerResults>? CompletedResultsChanged;
     public event Action<CaptureTimeline>? TimelineChanged;
     public event Action<string>? Rejected;
+
+    public bool AssociateBatchFlushFrame(long generation, long sequence, BatchFlushFrame frame)
+    {
+        if (generation != snapshot.Generation || sequence <= 0 || frame is null ||
+            frame.ProcessFrame < 0 || frame.ElapsedNanoseconds <= 0) return false;
+        var index = timeline.FindIndex(point => point.Sequence == sequence);
+        if (index < 0) return false;
+        if (timeline[index].FlushFrame is { } existing) return existing == frame;
+        timeline[index] = timeline[index] with { FlushFrame = frame };
+        TimelineChanged?.Invoke(Timeline);
+        return true;
+    }
 
     public bool Receive(object? payload)
     {

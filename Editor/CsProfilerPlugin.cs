@@ -157,8 +157,8 @@ public partial class CsProfilerPlugin : EditorPlugin
                 FinishEditorAttachedProbe(1);
                 return;
             }
-            if (!_panel.PerformanceTextForTests.StartsWith("Frame ", StringComparison.Ordinal) ||
-                _panel.PerformanceTextForTests.Contains('—'))
+            if (!_panel.PerformanceTextForTests.StartsWith("Flush frame ", StringComparison.Ordinal) &&
+                !string.Equals(_panel.PerformanceTextForTests, "Flush-frame timing unavailable", StringComparison.Ordinal))
             {
                 GD.PushError($"CS_PROFILER_EDITOR_ATTACHED_ASSERTIONS_FAILED runtime metrics missing: {_panel.PerformanceTextForTests}");
                 FinishEditorAttachedProbe(1);

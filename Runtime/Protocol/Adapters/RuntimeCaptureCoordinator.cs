@@ -33,6 +33,7 @@ public sealed class RuntimeCaptureCoordinator : IDisposable
     public long Generation => _generation;
     public long Sequence => _sequence;
     public string? LeaseOwner => _owner;
+    public event Action<long, long>? BatchEmitted;
 
     public void Connect()
     {
@@ -181,6 +182,7 @@ public sealed class RuntimeCaptureCoordinator : IDisposable
                 Send(new BatchMessage(ProtocolVersion.Major, ProtocolVersion.Minor, _runtimeToken, _generation, ++_sequence,
                     _configuration.Fingerprint, batch.Source, batch.ExactCalls, batch.CpuTime,
                     firstChunk ? batch.Quality : QualityCounters.Zero, methods));
+                BatchEmitted?.Invoke(_generation, _sequence);
                 firstChunk = false;
                 offset += count;
                 if (remaining == 0) break;
