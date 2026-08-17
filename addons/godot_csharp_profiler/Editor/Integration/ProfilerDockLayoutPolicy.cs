@@ -24,7 +24,7 @@ public static class ProfilerDockLayoutPolicy
             ShowSettingsButton: true,
             ShowInlineSettings: false,
             ShowQualityDetails: !compact,
-            GraphMinimumHeight: compact ? 48 : 72);
+            GraphMinimumHeight: compact ? 36 : 56);
     }
 }
 

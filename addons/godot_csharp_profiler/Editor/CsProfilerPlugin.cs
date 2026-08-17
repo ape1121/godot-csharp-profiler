@@ -143,9 +143,17 @@ public partial class CsProfilerPlugin : EditorPlugin
         }
         if (_panel?.BridgeReadyForTests == true &&
             _panel.SamplingResultRowsForTests >= 1 &&
+            _panel.SelectedBatchRowsForTests >= 1 &&
             _panel.TimelinePointCountForTests >= 1 &&
             _panel.SelectedIndexForTests >= 0)
         {
+            _panel.OpenSettingsForTests();
+            if (!_panel.SettingsVisibleForTests)
+            {
+                GD.PushError("CS_PROFILER_EDITOR_ATTACHED_ASSERTIONS_FAILED options popup did not open");
+                FinishEditorAttachedProbe(1);
+                return;
+            }
             var count = EditorInterface.Singleton.GetBaseControl()
                 .FindChildren("*", "EditorDock", recursive: true, owned: false)
                 .OfType<EditorDock>()
@@ -158,6 +166,7 @@ public partial class CsProfilerPlugin : EditorPlugin
             }
             GD.Print($"CS_PROFILER_EDITOR_ATTACHED_RUN_OK run={_editorAttachedProbeRuns + 1} docks=1 " +
                      $"sampling_rows={_panel.SamplingResultRowsForTests} " +
+                     $"selected_rows={_panel.SelectedBatchRowsForTests} options_open=true " +
                      $"timeline_points={_panel.TimelinePointCountForTests} selected={_panel.SelectedIndexForTests}");
             if (++_editorAttachedProbeRuns == 1)
             {

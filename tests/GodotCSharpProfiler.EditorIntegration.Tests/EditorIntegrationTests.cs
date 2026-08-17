@@ -18,7 +18,7 @@ public sealed class EditorIntegrationTests
         Assert.True(layout.ShowSettingsButton);
         Assert.False(layout.ShowInlineSettings);
         Assert.False(layout.ShowQualityDetails);
-        Assert.InRange(layout.GraphMinimumHeight, 40, 64);
+        Assert.InRange(layout.GraphMinimumHeight, 32, 56);
     }
 
     [Fact]

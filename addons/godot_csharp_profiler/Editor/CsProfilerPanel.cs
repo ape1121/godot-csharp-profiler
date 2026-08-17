@@ -86,8 +86,9 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private Button _previewUninstallButton;
     private Button _applyInstallButton;
     private TextEdit _previewDiff;
-    private Window _settingsWindow;
+    private PopupPanel _settingsPopup;
     private TabContainer _resultTabs;
+    private Tree _selectedBatchTree;
     private CsProfilerFrameGraph _graph;
     private Tree _tree;
     private int _selectedIndex = -1;
@@ -109,6 +110,9 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     internal int FrameCountForTests => _frames.Count;
     internal int ProtocolResultRowsForTests => _protocolResultRowsForTests;
     internal int SamplingResultRowsForTests => _samplingResultRowsForTests;
+    internal int SelectedBatchRowsForTests => _selectedBatchTree?.GetRoot()?.GetChildCount() ?? 0;
+    internal bool SettingsVisibleForTests => _settingsPopup?.Visible == true;
+    internal void OpenSettingsForTests() => ShowSettings();
     internal int TimelinePointCountForTests => _protocolTimeline.Points.Count;
     internal int SelectedIndexForTests => _selectedIndex;
     internal bool BridgeReadyForTests => _discovery.BridgeReady;
@@ -141,31 +145,6 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         CustomMinimumSize = Vector2.Zero;
         _controller = new ProfilerDockController(this, this, CreateInstallerSafely(), this);
 
-        var header = new HBoxContainer();
-        AddChild(header);
-        _targetLabel = new Label
-        {
-            Text = "No target",
-            SizeFlagsHorizontal = SizeFlags.ExpandFill,
-            TextOverrunBehavior = TextServer.OverrunBehavior.TrimEllipsis,
-            TooltipText = "Current debug target"
-        };
-        header.AddChild(_targetLabel);
-        _statsLabel = new Label
-        {
-            Text = "Disconnected",
-            TextOverrunBehavior = TextServer.OverrunBehavior.TrimEllipsis
-        };
-        header.AddChild(_statsLabel);
-        _settingsButton = new Button
-        {
-            Text = "⋮",
-            TooltipText = "Profiler settings, advanced modes, export, and diagnostics",
-            CustomMinimumSize = new Vector2(32, 0)
-        };
-        _settingsButton.Pressed += ShowSettings;
-        header.AddChild(_settingsButton);
-
         var toolbar = new HBoxContainer();
         AddChild(toolbar);
         _startButton = new Button { Text = "Start", TooltipText = "Start statistical sampling" };
@@ -184,7 +163,15 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         var clearButton = new Button { Text = "Clear" };
         clearButton.Pressed += ClearAllResults;
         toolbar.AddChild(clearButton);
-        // Copy/export are advanced actions and belong in the compact settings window.
+        _settingsButton = new Button
+        {
+            Text = "Options",
+            TooltipText = "Profiler settings, advanced modes, export, and diagnostics"
+        };
+        _settingsButton.Pressed += ShowSettings;
+        toolbar.AddChild(_settingsButton);
+
+        // Copy/export are advanced actions and belong in the compact settings popup.
         _copyButton = new Button { Text = "Copy Results", Disabled = true,
             TooltipText = "Copy visible source-separated results" };
         _copyButton.Pressed += () => _controller.Copy(ExportFormat.VisibleCsv);
@@ -192,8 +179,22 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             TooltipText = "Export lossless source-separated JSON" };
         _exportButton.Pressed += () => _controller.Export(ExportFormat.LosslessJson);
 
-        toolbar.AddChild(new Control { SizeFlagsHorizontal = SizeFlags.ExpandFill });
-        toolbar.AddChild(new Label { Text = "Frame" });
+        toolbar.AddChild(new VSeparator());
+        _targetLabel = new Label
+        {
+            Text = "No target",
+            TextOverrunBehavior = TextServer.OverrunBehavior.TrimEllipsis,
+            TooltipText = "Current debug target"
+        };
+        toolbar.AddChild(_targetLabel);
+        _statsLabel = new Label
+        {
+            Text = "Disconnected",
+            SizeFlagsHorizontal = SizeFlags.ExpandFill,
+            TextOverrunBehavior = TextServer.OverrunBehavior.TrimEllipsis
+        };
+        toolbar.AddChild(_statsLabel);
+        toolbar.AddChild(new Label { Text = "Batch" });
         _frameSelector = new SpinBox
         {
             MinValue = 0,
@@ -241,6 +242,21 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _tree.ItemCollapsed += OnItemCollapsed;
         _tree.GuiInput += OnTreeGuiInput;
         _resultTabs.AddChild(_tree);
+        _selectedBatchTree = new Tree
+        {
+            Name = "Selected batch",
+            SizeFlagsVertical = SizeFlags.ExpandFill,
+            CustomMinimumSize = Vector2.Zero,
+            Columns = 3,
+            ColumnTitlesVisible = true,
+            HideRoot = true,
+            SelectMode = Tree.SelectModeEnum.Row
+        };
+        _selectedBatchTree.SetColumnTitle(0, "Function");
+        _selectedBatchTree.SetColumnTitle(1, "Samples");
+        _selectedBatchTree.SetColumnTitle(2, "Share");
+        _selectedBatchTree.SetColumnExpand(0, true);
+        _resultTabs.AddChild(_selectedBatchTree);
 
         BuildSettingsUi();
         Resized += ApplyResponsiveLayout;
@@ -271,22 +287,14 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
 
     private void BuildSettingsUi()
     {
-        _settingsWindow = new Window
-        {
-            Title = "C# Profiler Settings",
-            Size = new Vector2I(560, 560),
-            MinSize = new Vector2I(320, 240),
-            Transient = true,
-            Exclusive = false
-        };
-        _settingsWindow.CloseRequested += _settingsWindow.Hide;
-        AddChild(_settingsWindow);
+        _settingsPopup = new PopupPanel();
+        AddChild(_settingsPopup);
         var scroll = new ScrollContainer
         {
             SizeFlagsHorizontal = SizeFlags.ExpandFill,
             SizeFlagsVertical = SizeFlags.ExpandFill
         };
-        _settingsWindow.AddChild(scroll);
+        _settingsPopup.AddChild(scroll);
         var settingsRoot = new VBoxContainer { SizeFlagsHorizontal = SizeFlags.ExpandFill };
         scroll.AddChild(settingsRoot);
 
@@ -364,13 +372,16 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         settingsRoot.AddChild(_qualityLabel);
     }
 
-        private void ShowSettings()
+    private void ShowSettings()
     {
-        if (_settingsWindow == null) return;
+        if (_settingsPopup == null || _settingsButton == null) return;
         var usable = DisplayServer.ScreenGetUsableRect();
-        var width = Math.Clamp(560, _settingsWindow.MinSize.X, Math.Max(_settingsWindow.MinSize.X, usable.Size.X - 32));
-        var height = Math.Clamp(560, _settingsWindow.MinSize.Y, Math.Max(_settingsWindow.MinSize.Y, usable.Size.Y - 32));
-        _settingsWindow.PopupCentered(new Vector2I(width, height));
+        var size = new Vector2I(Math.Min(520, usable.Size.X - 32), Math.Min(520, usable.Size.Y - 32));
+        var anchorPosition = _settingsButton.GetScreenPosition() + new Vector2(0, _settingsButton.Size.Y);
+        var anchor = new Vector2I((int)anchorPosition.X, (int)anchorPosition.Y);
+        var x = Math.Clamp(anchor.X, usable.Position.X + 8, usable.End.X - size.X - 8);
+        var y = Math.Clamp(anchor.Y, usable.Position.Y + 8, usable.End.Y - size.Y - 8);
+        _settingsPopup.Popup(new Rect2I(new Vector2I(x, y), size));
     }
 
         private void ApplyResponsiveLayout()
@@ -507,8 +518,9 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _samplingResultRowsForTests = groups.Where(item => !item.IsCrossSourceTotal &&
             item.Source == CaptureSource.Sampling).Sum(item => item.Rows.Count);
         foreach (var child in _resultTabs.GetChildren())
-            if (!ReferenceEquals(child, _tree)) child.QueueFree();
+            if (!ReferenceEquals(child, _tree) && !ReferenceEquals(child, _selectedBatchTree)) child.QueueFree();
         _tree.Visible = _frames.Count > 0;
+        _selectedBatchTree.Visible = _protocolTimeline.Points.Count > 0;
         foreach (var group in groups.Where(item => !item.IsCrossSourceTotal))
         {
             var tree = new Tree { Name = group.Title, Columns = group.Columns.Count,
@@ -723,6 +735,8 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _graph.SetTimeline(_protocolTimeline);
         _graph.SetSelectedIndex(-1);
         _tree?.Clear();
+        _selectedBatchTree?.Clear();
+        if (_selectedBatchTree != null) _selectedBatchTree.Visible = false;
         if (_copyButton != null)
             _copyButton.Disabled = true;
         _updatingSelector = true;
@@ -786,6 +800,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             _frameSelector.Value = index;
             _updatingSelector = false;
             var point = _protocolTimeline.Points[index];
+            RenderSelectedBatch(point);
             _statsLabel.Text = point.Source == CaptureSource.Sampling
                 ? RuntimeStatus($"{point.Value} samples | {point.Rows.Count} methods | batch #{point.Sequence}")
                 : RuntimeStatus($"{point.Value / 1_000_000.0:0.###} ms observed exact-span time | " +
@@ -821,6 +836,42 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
                     frame.TotalUsec[row] / 1000.0)).ToArray())
         ], 0));
         RebuildTree(frame);
+    }
+
+    private void RenderSelectedBatch(CaptureTimelinePoint point)
+    {
+        if (_selectedBatchTree == null) return;
+        _selectedBatchTree.Clear();
+        var sampling = point.Source == CaptureSource.Sampling;
+        _selectedBatchTree.Columns = sampling ? 3 : 5;
+        _selectedBatchTree.SetColumnTitle(0, "Function");
+        _selectedBatchTree.SetColumnTitle(1, sampling ? "Samples" : "Wall time");
+        _selectedBatchTree.SetColumnTitle(2, sampling ? "Share" : "Calls");
+        if (!sampling)
+        {
+            _selectedBatchTree.SetColumnTitle(3, "Average");
+            _selectedBatchTree.SetColumnTitle(4, "Maximum");
+        }
+        var root = _selectedBatchTree.CreateItem();
+        foreach (var row in point.Rows)
+        {
+            var item = _selectedBatchTree.CreateItem(root);
+            item.SetText(0, row.Name);
+            if (sampling)
+            {
+                item.SetText(1, row.Samples.ToString());
+                item.SetText(2, $"{row.EstimatedStackFrameShare:0.##}%");
+            }
+            else
+            {
+                item.SetText(1, $"{row.ObservedWallTimeMilliseconds:0.###} ms");
+                item.SetText(2, row.Calls.ToString());
+                item.SetText(3, $"{row.AverageWallTimeMilliseconds:0.###} ms");
+                item.SetText(4, $"{row.MaximumWallTimeMilliseconds:0.###} ms");
+            }
+        }
+        _selectedBatchTree.Visible = true;
+        _resultTabs.CurrentTab = _selectedBatchTree.GetIndex();
     }
 
     private sealed class DisplayNode
