@@ -230,6 +230,23 @@ public sealed class EditorIntegrationTests
     }
 
     [Fact]
+    public void Negotiating_target_allows_one_cancellable_queued_start()
+    {
+        var view = new FakeView();
+        var transport = new FakeTransport();
+        var controller = new ProfilerDockController(view, transport, null);
+        controller.UpdateSnapshot(Snapshot(CaptureState.Negotiating), "Negotiating game");
+
+        Assert.True(view.Last!.Commands.Start);
+        Assert.False(view.Last.Commands.Stop);
+        Assert.True(controller.RequestStart());
+        Assert.False(view.Last.Commands.Start);
+        Assert.True(view.Last.Commands.Stop);
+        Assert.True(controller.Stop());
+        Assert.Equal([ProfilerCommand.Start, ProfilerCommand.CancelPending], transport.Commands);
+    }
+
+    [Fact]
     public void Disconnect_recovers_controls_and_next_start_queues_for_a_fresh_target()
     {
         var view = new FakeView();
