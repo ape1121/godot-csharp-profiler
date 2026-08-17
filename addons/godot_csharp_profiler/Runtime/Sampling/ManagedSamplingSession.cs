@@ -157,7 +157,7 @@ public sealed class ManagedSamplingSession : IAsyncDisposable
         {
             while (State == ManagedSamplingSessionState.Running)
             {
-                using var epochTimer = new Timer(
+                using var epochTimer = new System.Threading.Timer(
                     static state => ((ManagedSamplingSession)state!).StopCurrentTraceEpoch(),
                     this,
                     _options.TraceRetentionDuration,

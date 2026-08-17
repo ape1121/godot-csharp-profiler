@@ -347,7 +347,7 @@ public sealed class ProjectInstaller
         var temporary = path + ".tmp-" + Guid.NewGuid().ToString("N");
         try
         {
-            using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough)) { stream.Write(bytes); stream.Flush(true); }
+            using (var stream = new FileStream(temporary, FileMode.CreateNew, System.IO.FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough)) { stream.Write(bytes); stream.Flush(true); }
             File.Move(temporary, path, true);
         }
         finally { if (File.Exists(temporary)) File.Delete(temporary); }
