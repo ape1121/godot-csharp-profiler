@@ -16,6 +16,7 @@ public partial class CsProfilerBridge : Node
     private string _runtimeToken = "";
     private RuntimeCaptureCoordinator _coordinator;
     private double _metricsElapsed;
+    private double _smoothedFrameSeconds;
 
     public override void _EnterTree()
     {
@@ -97,12 +98,16 @@ public partial class CsProfilerBridge : Node
     {
         if (!_captureRegistered) { TryRegisterCapture(); return; }
         _coordinator?.Flush();
+        if (delta > 0 && delta < 1)
+            _smoothedFrameSeconds = _smoothedFrameSeconds <= 0
+                ? delta
+                : _smoothedFrameSeconds * 0.9 + delta * 0.1;
         _metricsElapsed += Math.Max(0, delta);
         if (_metricsElapsed >= 0.25)
         {
             _metricsElapsed = 0;
-            var fps = Math.Max(0, Engine.GetFramesPerSecond());
-            var frameMilliseconds = fps > 0 ? 1000.0 / fps : Math.Max(0, delta) * 1000.0;
+            var frameMilliseconds = Math.Max(0, _smoothedFrameSeconds) * 1000.0;
+            var fps = frameMilliseconds > 0 ? 1000.0 / frameMilliseconds : 0;
             EngineDebugger.SendMessage(MetricsMessage, new Godot.Collections.Array
             {
                 (double)fps, frameMilliseconds

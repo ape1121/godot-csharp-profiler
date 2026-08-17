@@ -54,6 +54,7 @@ public sealed class ProfilerDockController
             RuntimeToken = null,
             SupportedModes = CaptureModes.None
         };
+        waitingForTarget = false;
         statusOverride = SafeText(status, 160, "Target disconnected");
         Render();
     }
@@ -300,7 +301,8 @@ public sealed class ProfilerDockController
                 Segment("Manual", config.Primary == PrimaryMode.None, presentation.Modes.Manual)
             ],
             Segment("Include Manual", config.IncludeManual, presentation.Modes.Manual),
-            new CommandViewState(waitingForTarget ? false : presentation.Commands.Start.Enabled,
+            new CommandViewState(waitingForTarget ? false :
+                    snapshot.State == CaptureState.Disconnected || presentation.Commands.Start.Enabled,
                 waitingForTarget || presentation.Commands.Stop.Enabled,
                 presentation.Commands.Clear.Enabled, presentation.Commands.Copy.Enabled,
                 presentation.Commands.Export.Enabled),

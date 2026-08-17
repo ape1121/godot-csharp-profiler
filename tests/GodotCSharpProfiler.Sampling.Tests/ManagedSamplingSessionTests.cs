@@ -62,6 +62,23 @@ public sealed class ManagedSamplingSessionTests
     }
 
     [Fact]
+    public void ExcludePrefixesAlsoRemoveProfilerNamespaceFrames()
+    {
+        var aggregator = new SamplingAggregator(new SamplingOptions
+        {
+            ExcludeAssemblyPrefixes = new[] { "Apeworks.GodotCSharpProfiler" }
+        });
+        aggregator.AddSample("worker", new[]
+        {
+            new SamplingFrame("ShopSimulator", "Apeworks.GodotCSharpProfiler.Runtime.Flush"),
+            new SamplingFrame("ShopSimulator", "ShopSimulator.NpcManager.Tick")
+        });
+
+        Assert.Equal(new[] { "ShopSimulator.NpcManager.Tick" },
+            aggregator.GetSnapshot(reset: false).Methods.Select(method => method.Label));
+    }
+
+    [Fact]
     public async Task OnlyOneSessionMayBeActive()
     {
         await using var first = new ManagedSamplingSession(new SamplingOptions());
