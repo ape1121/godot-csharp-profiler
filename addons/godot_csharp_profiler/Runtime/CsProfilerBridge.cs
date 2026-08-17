@@ -1,5 +1,6 @@
 using Godot;
 using System;
+using System.Diagnostics;
 using Apeworks.GodotCSharpProfiler.Runtime.Protocol.Adapters;
 
 namespace Apeworks.GodotCSharpProfiler;
@@ -11,11 +12,15 @@ public partial class CsProfilerBridge : Node
     public const string ReadyMessage = MessagePrefix + ":ready";
     public const string HandshakeMessage = MessagePrefix + ":handshake";
     public const string MetricsMessage = MessagePrefix + ":metrics";
+    public const string BatchFrameMessage = MessagePrefix + ":batch_frame";
 
     private bool _captureRegistered;
     private string _runtimeToken = "";
     private RuntimeCaptureCoordinator _coordinator;
     private long _runtimeFrame;
+    private long _lastProcessTimestamp;
+    private long _flushFrameElapsedNanoseconds;
+    private bool _associatingFlush;
 
     public override void _EnterTree()
     {
@@ -97,13 +102,22 @@ public partial class CsProfilerBridge : Node
     {
         if (!_captureRegistered) { TryRegisterCapture(); return; }
         _runtimeFrame++;
+        var timestamp = Stopwatch.GetTimestamp();
+        var elapsedNanoseconds = _lastProcessTimestamp > 0
+            ? (long)((timestamp - _lastProcessTimestamp) * (1_000_000_000.0 / Stopwatch.Frequency))
+            : 0;
+        _lastProcessTimestamp = timestamp;
         var frameMilliseconds = Math.Max(0, delta) * 1000.0;
         var fps = frameMilliseconds > 0 ? 1000.0 / frameMilliseconds : 0;
         EngineDebugger.SendMessage(MetricsMessage, new Godot.Collections.Array
         {
             (double)fps, frameMilliseconds, _runtimeFrame
         });
-        _coordinator?.Flush();
+        if (_coordinator is null) return;
+        _associatingFlush = elapsedNanoseconds > 0;
+        _flushFrameElapsedNanoseconds = elapsedNanoseconds;
+        try { _coordinator.Flush(); }
+        finally { _associatingFlush = false; }
     }
 
     private void TryRegisterCapture()
@@ -114,7 +128,17 @@ public partial class CsProfilerBridge : Node
         _captureRegistered = true;
         _coordinator = new RuntimeCaptureCoordinator(_runtimeToken,
             new GodotDebuggerTransport(ProtocolMessage), new ProductionRuntimeCaptureBackend());
+        _coordinator.BatchEmitted += OnBatchEmitted;
         _coordinator.Connect();
         SendReady();
+    }
+
+    private void OnBatchEmitted(long generation, long sequence)
+    {
+        if (!_associatingFlush || generation <= 0 || sequence <= 0 || _flushFrameElapsedNanoseconds <= 0) return;
+        EngineDebugger.SendMessage(BatchFrameMessage, new Godot.Collections.Array
+        {
+            generation, sequence, _runtimeFrame, _flushFrameElapsedNanoseconds
+        });
     }
 }

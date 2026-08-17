@@ -80,6 +80,25 @@ public sealed class RuntimeCaptureCoordinatorTests
     }
 
     [Fact]
+    public void EveryFlushEmittedChunkReportsItsGenerationAndSequence()
+    {
+        var (runtime, transport, backend) = Runtime();
+        backend.Pending.Add(new(CaptureSource.ManualSpans, true, false, QualityCounters.Zero,
+            Enumerable.Range(0, 9).Select(i => new MethodSample(i, $"Method{i}", i, 1)).ToArray()));
+        var emitted = new List<(long Generation, long Sequence)>();
+        runtime.BatchEmitted += (generation, sequence) => emitted.Add((generation, sequence));
+        runtime.Connect();
+        Assert.True(runtime.Receive(Configure(1, CaptureModes.ManualScopes, maxMethods: 2), "owner"));
+        Assert.True(runtime.Receive(Start(1), "owner"));
+
+        runtime.Flush();
+
+        var batches = transport.Parsed.OfType<BatchMessage>().ToArray();
+        Assert.Equal(batches.Select(batch => (batch.Generation, batch.Sequence)), emitted);
+        Assert.Equal(5, emitted.Count);
+    }
+
+    [Fact]
     public void ConfigureTransportsSamplingFiltersAndManualPrefixToBackend()
     {
         var (runtime, _, backend) = Runtime();
