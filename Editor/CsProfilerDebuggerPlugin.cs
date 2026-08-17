@@ -206,7 +206,12 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
         if (!change.Changed) return;
         if (change.PreviousSessionId >= 0 && change.PreviousSessionId != change.SelectedSessionId &&
             _protocol.TryGetValue(change.PreviousSessionId, out var previous)) previous.Stop();
-        if (change.SelectedSessionId < 0 || change.Identity == null) { _panel?.OnSessionStopped(); return; }
+        if (change.SelectedSessionId < 0 || change.Identity == null)
+        {
+            if (change.PreviousSessionId >= 0) _pendingCapture.Cancel();
+            _panel?.OnSessionStopped();
+            return;
+        }
         _panel?.OnBridgeReady(change.Identity);
         if (_protocol.TryGetValue(change.SelectedSessionId, out var endpoint))
             _panel?.ApplyProtocolSnapshot(endpoint.Snapshot, change.Identity);

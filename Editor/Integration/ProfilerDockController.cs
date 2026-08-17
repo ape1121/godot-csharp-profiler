@@ -302,7 +302,8 @@ public sealed class ProfilerDockController
             ],
             Segment("Include Manual", config.IncludeManual, presentation.Modes.Manual),
             new CommandViewState(waitingForTarget ? false :
-                    snapshot.State == CaptureState.Disconnected || presentation.Commands.Start.Enabled,
+                    snapshot.State is CaptureState.Disconnected or CaptureState.Negotiating ||
+                    presentation.Commands.Start.Enabled,
                 waitingForTarget || presentation.Commands.Stop.Enabled,
                 presentation.Commands.Clear.Enabled, presentation.Commands.Copy.Enabled,
                 presentation.Commands.Export.Enabled),
