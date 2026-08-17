@@ -94,6 +94,9 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private int _selectedIndex = -1;
     private bool _liveFollow = true;
     private bool _updatingSelector;
+    private int _startSignalInvocations;
+    private int _stopSignalInvocations;
+    private int _optionsSignalInvocations;
     private bool _rebuildingTree;
     private readonly List<string> _displayedRowsForTests = new();
     private int _protocolResultRowsForTests;
@@ -113,6 +116,17 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     internal int SelectedBatchRowsForTests => _selectedBatchTree?.GetRoot()?.GetChildCount() ?? 0;
     internal bool SettingsVisibleForTests => _settingsPopup?.Visible == true;
     internal void OpenSettingsForTests() => ShowSettings();
+    internal bool RunNativeSignalUiProbeForTests()
+    {
+        _startButton.Disabled = false;
+        _stopButton.Disabled = false;
+        _startButton.EmitSignal(BaseButton.SignalName.Pressed);
+        _stopButton.EmitSignal(BaseButton.SignalName.Pressed);
+        _settingsButton.EmitSignal(BaseButton.SignalName.Pressed);
+        return _startSignalInvocations == 1 && _stopSignalInvocations == 1 &&
+               _optionsSignalInvocations == 1 && _settingsPopup.Visible &&
+               _settingsPopup.FindChildren("*", "Control", recursive: true, owned: false).Count >= 10;
+    }
     internal int TimelinePointCountForTests => _protocolTimeline.Points.Count;
     internal int SelectedIndexForTests => _selectedIndex;
     internal bool BridgeReadyForTests => _discovery.BridgeReady;
@@ -148,36 +162,30 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         var toolbar = new HBoxContainer();
         AddChild(toolbar);
         _startButton = new Button { Text = "Start", TooltipText = "Start statistical sampling" };
-        _startButton.Pressed += () =>
-        {
-            if (_controller.RequestStart()) _profilingRequested = true;
-        };
+        _startButton.Connect(BaseButton.SignalName.Pressed, new Callable(this, nameof(OnStartPressed)));
         toolbar.AddChild(_startButton);
         _stopButton = new Button { Text = "Stop" };
-        _stopButton.Pressed += () =>
-        {
-            if (_controller.Stop()) _profilingRequested = false;
-        };
+        _stopButton.Connect(BaseButton.SignalName.Pressed, new Callable(this, nameof(OnStopPressed)));
         toolbar.AddChild(_stopButton);
 
         var clearButton = new Button { Text = "Clear" };
-        clearButton.Pressed += ClearAllResults;
+        clearButton.Connect(BaseButton.SignalName.Pressed, new Callable(this, nameof(ClearAllResults)));
         toolbar.AddChild(clearButton);
         _settingsButton = new Button
         {
             Text = "Options",
             TooltipText = "Profiler settings, advanced modes, export, and diagnostics"
         };
-        _settingsButton.Pressed += ShowSettings;
+        _settingsButton.Connect(BaseButton.SignalName.Pressed, new Callable(this, nameof(ShowSettings)));
         toolbar.AddChild(_settingsButton);
 
         // Copy/export are advanced actions and belong in the compact settings popup.
         _copyButton = new Button { Text = "Copy Results", Disabled = true,
             TooltipText = "Copy visible source-separated results" };
-        _copyButton.Pressed += () => _controller.Copy(ExportFormat.VisibleCsv);
+        _copyButton.Connect(BaseButton.SignalName.Pressed, new Callable(this, nameof(OnCopyPressed)));
         _exportButton = new Button { Text = "Export Results", Disabled = true,
             TooltipText = "Export lossless source-separated JSON" };
-        _exportButton.Pressed += () => _controller.Export(ExportFormat.LosslessJson);
+        _exportButton.Connect(BaseButton.SignalName.Pressed, new Callable(this, nameof(OnExportPressed)));
 
         toolbar.AddChild(new VSeparator());
         _targetLabel = new Label
@@ -202,15 +210,13 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             Rounded = true,
             CustomMinimumSize = new Vector2(72, 0)
         };
-        _frameSelector.ValueChanged += OnFrameSelectorChanged;
+        _frameSelector.Connect(Godot.Range.SignalName.ValueChanged,
+            new Callable(this, nameof(OnFrameSelectorChanged)));
         toolbar.AddChild(_frameSelector);
 
         _graph = new CsProfilerFrameGraph { SizeFlagsVertical = SizeFlags.ShrinkBegin };
-        _graph.FrameClicked += index =>
-        {
-            _liveFollow = false;
-            SelectFrame(index);
-        };
+        _graph.Connect(CsProfilerFrameGraph.SignalName.FrameClicked,
+            new Callable(this, nameof(OnGraphFrameClicked)));
         AddChild(_graph);
 
         _resultTabs = new TabContainer
@@ -239,8 +245,8 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             _tree.SetColumnExpand(column, false);
             _tree.SetColumnCustomMinimumWidth(column, 72);
         }
-        _tree.ItemCollapsed += OnItemCollapsed;
-        _tree.GuiInput += OnTreeGuiInput;
+        _tree.Connect(Tree.SignalName.ItemCollapsed, new Callable(this, nameof(OnItemCollapsed)));
+        _tree.Connect(Control.SignalName.GuiInput, new Callable(this, nameof(OnTreeGuiInput)));
         _resultTabs.AddChild(_tree);
         _selectedBatchTree = new Tree
         {
@@ -259,7 +265,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _resultTabs.AddChild(_selectedBatchTree);
 
         BuildSettingsUi();
-        Resized += ApplyResponsiveLayout;
+        Connect(Control.SignalName.Resized, new Callable(this, nameof(ApplyResponsiveLayout)));
         ApplyResponsiveLayout();
 
         if (_discovery.BridgeReady)
@@ -292,10 +298,15 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         var scroll = new ScrollContainer
         {
             SizeFlagsHorizontal = SizeFlags.ExpandFill,
-            SizeFlagsVertical = SizeFlags.ExpandFill
+            SizeFlagsVertical = SizeFlags.ExpandFill,
+            CustomMinimumSize = new Vector2(500, 500)
         };
         _settingsPopup.AddChild(scroll);
-        var settingsRoot = new VBoxContainer { SizeFlagsHorizontal = SizeFlags.ExpandFill };
+        var settingsRoot = new VBoxContainer
+        {
+            SizeFlagsHorizontal = SizeFlags.ExpandFill,
+            CustomMinimumSize = new Vector2(480, 0)
+        };
         scroll.AddChild(settingsRoot);
 
         var outputCommands = new HBoxContainer();
@@ -306,14 +317,15 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         settingsRoot.AddChild(new Label { Text = "Capture mode" });
         var modeBar = new HBoxContainer();
         settingsRoot.AddChild(modeBar);
-        _samplingModeButton = ModeButton("Sampling", () => _controller.SelectMode(PrimaryMode.Sampling));
-        _automaticModeButton = ModeButton("Automatic", () => _controller.SelectMode(PrimaryMode.AutomaticInstrumentation));
-        _manualModeButton = ModeButton("Manual only", _controller.SelectManualOnly);
+        _samplingModeButton = ModeButton("Sampling", nameof(OnSamplingModePressed));
+        _automaticModeButton = ModeButton("Automatic", nameof(OnAutomaticModePressed));
+        _manualModeButton = ModeButton("Manual only", nameof(OnManualModePressed));
         modeBar.AddChild(_samplingModeButton);
         modeBar.AddChild(_automaticModeButton);
         modeBar.AddChild(_manualModeButton);
         _includeManualButton = new CheckButton { Text = "Include manual semantic scopes" };
-        _includeManualButton.Toggled += _controller.SetManualOverlay;
+        _includeManualButton.Connect(BaseButton.SignalName.Toggled,
+            new Callable(this, nameof(OnManualOverlayToggled)));
         settingsRoot.AddChild(_includeManualButton);
         _settingsLabel = new Label
         {
@@ -325,12 +337,11 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _samplingSettings = new VBoxContainer();
         settingsRoot.AddChild(_samplingSettings);
         _samplingIncludes = AddLineSetting(_samplingSettings, "Include assemblies", "",
-            text => _controller.UpdateSampling(CurrentSampling() with { IncludeAssemblies = text }));
+            nameof(OnSamplingIncludesChanged));
         _samplingExcludes = AddLineSetting(_samplingSettings, "Exclude assemblies", "",
-            text => _controller.UpdateSampling(CurrentSampling() with { ExcludeAssemblies = text }));
+            nameof(OnSamplingExcludesChanged));
         _samplingInterval = AddSpinSetting(_samplingSettings, "Interval (ns, startup-only)", 100_000, 1_000_000_000,
-            2_000_000, value => _controller.UpdateSampling(CurrentSampling() with
-                { RequestedIntervalNanoseconds = (long)value }));
+            2_000_000, nameof(OnSamplingIntervalChanged));
 
         _automaticSettings = new VBoxContainer();
         settingsRoot.AddChild(_automaticSettings);
@@ -340,22 +351,25 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             AutowrapMode = TextServer.AutowrapMode.WordSmart
         });
         _automaticIncludes = AddLineSetting(_automaticSettings, "Include patterns", "Game",
-            text => _controller.UpdateAutomatic(CurrentAutomatic() with { IncludePatterns = text }));
+            nameof(OnAutomaticIncludesChanged));
         _automaticExcludes = AddLineSetting(_automaticSettings, "Exclude patterns", "",
-            text => _controller.UpdateAutomatic(CurrentAutomatic() with { ExcludePatterns = text }));
+            nameof(OnAutomaticExcludesChanged));
         _automaticMaximum = AddSpinSetting(_automaticSettings, "Maximum methods", 1, 1_000_000, 4096,
-            value => _controller.UpdateAutomatic(CurrentAutomatic() with { MaxMethods = (int)value }));
+            nameof(OnAutomaticMaximumChanged));
         var installCommands = new HBoxContainer();
         _automaticSettings.AddChild(installCommands);
         _previewInstallButton = new Button { Text = "Preview Install" };
-        _previewInstallButton.Pressed += PreviewAutomaticInstall;
+        _previewInstallButton.Connect(BaseButton.SignalName.Pressed,
+            new Callable(this, nameof(PreviewAutomaticInstall)));
         installCommands.AddChild(_previewInstallButton);
         _previewUninstallButton = new Button { Text = "Preview Uninstall" };
-        _previewUninstallButton.Pressed += PreviewAutomaticUninstall;
+        _previewUninstallButton.Connect(BaseButton.SignalName.Pressed,
+            new Callable(this, nameof(PreviewAutomaticUninstall)));
         installCommands.AddChild(_previewUninstallButton);
         _applyInstallButton = new Button { Text = "Apply Confirmed", Disabled = true,
             TooltipText = "Review the diff, then click to explicitly confirm Apply." };
-        _applyInstallButton.Pressed += ApplyAutomaticInstall;
+        _applyInstallButton.Connect(BaseButton.SignalName.Pressed,
+            new Callable(this, nameof(ApplyAutomaticInstall)));
         installCommands.AddChild(_applyInstallButton);
         _previewDiff = new TextEdit { Editable = false, CustomMinimumSize = new Vector2(0, 120) };
         _automaticSettings.AddChild(_previewDiff);
@@ -363,7 +377,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _manualSettings = new VBoxContainer();
         settingsRoot.AddChild(_manualSettings);
         _manualPrefix = AddLineSetting(_manualSettings, "Manual label prefix", "",
-            text => _controller.UpdateManual(new ManualSettings(text)));
+            nameof(OnManualPrefixChanged));
         _qualityLabel = new Label
         {
             Text = "Complete capture · no observations",
@@ -372,8 +386,50 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         settingsRoot.AddChild(_qualityLabel);
     }
 
+    private void OnStartPressed()
+    {
+        _startSignalInvocations++;
+        if (_controller.RequestStart()) _profilingRequested = true;
+    }
+
+    private void OnStopPressed()
+    {
+        _stopSignalInvocations++;
+        if (_controller.Stop()) _profilingRequested = false;
+    }
+
+    private void OnCopyPressed() => _controller.Copy(ExportFormat.VisibleCsv);
+    private void OnExportPressed() => _controller.Export(ExportFormat.LosslessJson);
+
+    private void OnGraphFrameClicked(int index)
+    {
+        _liveFollow = false;
+        SelectFrame(index);
+    }
+
+    private void OnSamplingModePressed() => _controller.SelectMode(PrimaryMode.Sampling);
+    private void OnAutomaticModePressed() => _controller.SelectMode(PrimaryMode.AutomaticInstrumentation);
+    private void OnManualModePressed() => _controller.SelectManualOnly();
+    private void OnManualOverlayToggled(bool included) => _controller.SetManualOverlay(included);
+
+    private void OnSamplingIncludesChanged(string text) =>
+        _controller.UpdateSampling(CurrentSampling() with { IncludeAssemblies = text });
+    private void OnSamplingExcludesChanged(string text) =>
+        _controller.UpdateSampling(CurrentSampling() with { ExcludeAssemblies = text });
+    private void OnSamplingIntervalChanged(double value) =>
+        _controller.UpdateSampling(CurrentSampling() with { RequestedIntervalNanoseconds = (long)value });
+    private void OnAutomaticIncludesChanged(string text) =>
+        _controller.UpdateAutomatic(CurrentAutomatic() with { IncludePatterns = text });
+    private void OnAutomaticExcludesChanged(string text) =>
+        _controller.UpdateAutomatic(CurrentAutomatic() with { ExcludePatterns = text });
+    private void OnAutomaticMaximumChanged(double value) =>
+        _controller.UpdateAutomatic(CurrentAutomatic() with { MaxMethods = (int)value });
+    private void OnManualPrefixChanged(string text) =>
+        _controller.UpdateManual(new ManualSettings(text));
+
     private void ShowSettings()
     {
+        _optionsSignalInvocations++;
         if (_settingsPopup == null || _settingsButton == null) return;
         var usable = DisplayServer.ScreenGetUsableRect();
         var size = new Vector2I(Math.Min(520, usable.Size.X - 32), Math.Min(520, usable.Size.Y - 32));
@@ -395,26 +451,25 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         if (_qualityLabel != null) _qualityLabel.Visible = layout.ShowQualityDetails;
     }
 
-    private static LineEdit AddLineSetting(Control parent, string label, string value,
-        Action<string> changed)
+    private LineEdit AddLineSetting(Control parent, string label, string value, string method)
     {
         var row = new HBoxContainer();
         parent.AddChild(row);
         row.AddChild(new Label { Text = label });
         var edit = new LineEdit { Text = value, SizeFlagsHorizontal = SizeFlags.ExpandFill };
-        edit.TextChanged += text => changed(text);
+        edit.Connect(LineEdit.SignalName.TextChanged, new Callable(this, method));
         row.AddChild(edit);
         return edit;
     }
 
-    private static SpinBox AddSpinSetting(Control parent, string label, double minimum,
-        double maximum, double value, Action<double> changed)
+    private SpinBox AddSpinSetting(Control parent, string label, double minimum,
+        double maximum, double value, string method)
     {
         var row = new HBoxContainer();
         parent.AddChild(row);
         row.AddChild(new Label { Text = label });
         var spin = new SpinBox { MinValue = minimum, MaxValue = maximum, Value = value, Rounded = true };
-        spin.ValueChanged += newValue => changed(newValue);
+        spin.Connect(Godot.Range.SignalName.ValueChanged, new Callable(this, method));
         row.AddChild(spin);
         return spin;
     }
@@ -453,10 +508,10 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _applyInstallButton.Disabled = true;
     }
 
-    private static Button ModeButton(string text, Action pressed)
+    private Button ModeButton(string text, string method)
     {
         var button = new Button { Text = text, ToggleMode = true };
-        button.Pressed += pressed;
+        button.Connect(BaseButton.SignalName.Pressed, new Callable(this, method));
         return button;
     }
 

@@ -50,6 +50,11 @@ public partial class CsProfilerPlugin : EditorPlugin
         {
             CallDeferred(nameof(StartEditorAttachedProbe));
         }
+        else if (OS.GetCmdlineUserArgs().Contains(
+                     "--cs-profiler-ui-probe", StringComparer.Ordinal))
+        {
+            CallDeferred(nameof(RunUiProbe));
+        }
     }
 
     public override void _ExitTree()
@@ -229,6 +234,18 @@ public partial class CsProfilerPlugin : EditorPlugin
         if (EditorInterface.Singleton.IsPlayingScene())
             EditorInterface.Singleton.StopPlayingScene();
         GetTree().Quit(exitCode);
+    }
+
+    private void RunUiProbe()
+    {
+        if (_panel?.RunNativeSignalUiProbeForTests() == true)
+        {
+            GD.Print("CS_PROFILER_UI_ASSERTIONS_OK native_signals=true options_content=true");
+            GetTree().Quit(0);
+            return;
+        }
+        GD.PushError("CS_PROFILER_UI_ASSERTIONS_FAILED native signals or options content");
+        GetTree().Quit(1);
     }
 }
 #else

@@ -13,7 +13,8 @@ using System.Collections.Generic;
 [Tool]
 public partial class CsProfilerFrameGraph : Control
 {
-    public event Action<int> FrameClicked;
+    [Signal]
+    public delegate void FrameClickedEventHandler(int index);
 
     private const double MinVisibleFrames = 8.0;
     private const double ZoomStep = 1.25;
@@ -168,7 +169,7 @@ public partial class CsProfilerFrameGraph : Control
             return;
         var (start, count) = VisibleWindow();
         var index = (int)(start + x / Mathf.Max(1.0f, Size.X) * count);
-        FrameClicked?.Invoke(Mathf.Clamp(index, 0, ItemCount - 1));
+        EmitSignal(SignalName.FrameClicked, Mathf.Clamp(index, 0, ItemCount - 1));
     }
 
     public override void _Draw()
