@@ -64,9 +64,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private Button _copyButton;
     private Button _exportButton;
     private Button _settingsButton;
-    private Button _samplingModeButton;
-    private Button _automaticModeButton;
-    private Button _manualModeButton;
+    private CheckButton _automaticCaptureButton;
     private CheckButton _includeManualButton;
     private CheckButton _includeProfilerInternals;
     private SpinBox _frameSelector;
@@ -130,13 +128,18 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _startButton.EmitSignal(BaseButton.SignalName.Pressed);
         _stopButton.EmitSignal(BaseButton.SignalName.Pressed);
         _settingsButton.EmitSignal(BaseButton.SignalName.Pressed);
+        _automaticCaptureButton.EmitSignal(BaseButton.SignalName.Toggled, true);
+        var automaticSelected = _controller.Configuration.Primary == PrimaryMode.AutomaticInstrumentation;
+        _automaticCaptureButton.EmitSignal(BaseButton.SignalName.Toggled, false);
+        var samplingSelected = _controller.Configuration.Primary == PrimaryMode.Sampling;
         _samplingFilter.EmitSignal(OptionButton.SignalName.ItemSelected, 2L);
         var allManaged = string.IsNullOrEmpty(_controller.Configuration.Sampling.IncludeAssemblies);
         _samplingFilter.EmitSignal(OptionButton.SignalName.ItemSelected, 0L);
         var projectOnly = _controller.Configuration.Sampling.IncludeAssemblies == ProjectAssemblyName();
         ApplyRuntimeMetrics(42, 60, 1000.0 / 60.0);
         return _startSignalInvocations == 1 && _stopSignalInvocations == 1 &&
-               _optionsSignalInvocations == 1 && _settingsPopup.Visible && allManaged && projectOnly &&
+               _optionsSignalInvocations == 1 && _settingsPopup.Visible && automaticSelected && samplingSelected &&
+               allManaged && projectOnly &&
                _performanceLabel.Text == "Frame 42 · 16.67 ms · 60 FPS" &&
                _settingsPopup.FindChildren("*", "Control", recursive: true, owned: false).Count >= 10;
     }
@@ -339,13 +342,13 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         {
             SizeFlagsHorizontal = SizeFlags.ExpandFill,
             SizeFlagsVertical = SizeFlags.ExpandFill,
-            CustomMinimumSize = new Vector2(680, 580)
+            CustomMinimumSize = new Vector2(560, 470)
         };
         _settingsPopup.AddChild(scroll);
         var settingsRoot = new VBoxContainer
         {
             SizeFlagsHorizontal = SizeFlags.ExpandFill,
-            CustomMinimumSize = new Vector2(650, 0)
+            CustomMinimumSize = new Vector2(530, 0)
         };
         scroll.AddChild(settingsRoot);
 
@@ -353,22 +356,27 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         outputCommands.AddChild(_exportButton);
         settingsRoot.AddChild(outputCommands);
 
-        settingsRoot.AddChild(new Label { Text = "Capture mode" });
-        var modeBar = new HBoxContainer();
-        settingsRoot.AddChild(modeBar);
-        _samplingModeButton = ModeButton("Sampling", nameof(OnSamplingModePressed));
-        _automaticModeButton = ModeButton("Automatic", nameof(OnAutomaticModePressed));
-        _manualModeButton = ModeButton("Manual only", nameof(OnManualModePressed));
-        modeBar.AddChild(_samplingModeButton);
-        modeBar.AddChild(_automaticModeButton);
-        modeBar.AddChild(_manualModeButton);
-        _includeManualButton = new CheckButton { Text = "Include manual semantic scopes" };
+        settingsRoot.AddChild(new Label { Text = "Capture" });
+        settingsRoot.AddChild(new Label
+        {
+            Text = "Start uses statistical sampling by default.",
+            Modulate = new Color(1, 1, 1, 0.7f)
+        });
+        _automaticCaptureButton = new CheckButton
+        {
+            Text = "Use exact method timing",
+            TooltipText = "Requires the setup below, then a clean rebuild and game restart."
+        };
+        _automaticCaptureButton.Connect(BaseButton.SignalName.Toggled,
+            new Callable(this, nameof(OnAutomaticCaptureToggled)));
+        settingsRoot.AddChild(_automaticCaptureButton);
+        _includeManualButton = new CheckButton { Text = "Include manual scopes" };
         _includeManualButton.Connect(BaseButton.SignalName.Toggled,
             new Callable(this, nameof(OnManualOverlayToggled)));
         settingsRoot.AddChild(_includeManualButton);
         _settingsLabel = new Label
         {
-            Text = "Sampling is the universal default. Add manual scopes only for named hotspots.",
+            Text = "",
             AutowrapMode = TextServer.AutowrapMode.WordSmart
         };
         settingsRoot.AddChild(_settingsLabel);
@@ -389,26 +397,20 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             nameof(OnSamplingExcludesChanged));
         _samplingIncludes.Editable = false;
         _samplingExcludes.Editable = false;
-        _samplingInterval = AddSpinSetting(_samplingSettings, "Interval (ns, startup-only)", 100_000, 1_000_000_000,
-            2_000_000, nameof(OnSamplingIntervalChanged));
-        _samplingSettings.AddChild(new Label
-        {
-            Text = "Sampling is statistical: Samples and Share estimate hot methods; per-call milliseconds require Automatic mode.",
-            AutowrapMode = TextServer.AutowrapMode.WordSmart
-        });
-
+        _samplingInterval = AddSpinSetting(_samplingSettings, "Sample every (ms)", 1, 1_000,
+            2, nameof(OnSamplingIntervalChanged));
         _automaticSettings = new VBoxContainer();
         settingsRoot.AddChild(_automaticSettings);
         _automaticSettings.AddChild(new Label
         {
-            Text = "Advanced: build-time exact spans. Preview project changes before applying.",
+            Text = "Exact timing setup (preview changes before applying)",
             AutowrapMode = TextServer.AutowrapMode.WordSmart
         });
-        _automaticIncludes = AddLineSetting(_automaticSettings, "Include patterns", "Game",
+        _automaticIncludes = AddLineSetting(_automaticSettings, "Include", "Game",
             nameof(OnAutomaticIncludesChanged));
-        _automaticExcludes = AddLineSetting(_automaticSettings, "Exclude patterns", "",
+        _automaticExcludes = AddLineSetting(_automaticSettings, "Exclude", "",
             nameof(OnAutomaticExcludesChanged));
-        _automaticMaximum = AddSpinSetting(_automaticSettings, "Maximum methods", 1, 1_000_000, 4096,
+        _automaticMaximum = AddSpinSetting(_automaticSettings, "Method limit", 1, 1_000_000, 4096,
             nameof(OnAutomaticMaximumChanged));
         var installCommands = new HBoxContainer();
         _automaticSettings.AddChild(installCommands);
@@ -430,7 +432,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
 
         _manualSettings = new VBoxContainer();
         settingsRoot.AddChild(_manualSettings);
-        _manualPrefix = AddLineSetting(_manualSettings, "Manual label prefix", "",
+        _manualPrefix = AddLineSetting(_manualSettings, "Manual scope prefix", "",
             nameof(OnManualPrefixChanged));
         _qualityLabel = new Label
         {
@@ -465,9 +467,8 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         SelectFrame(index);
     }
 
-    private void OnSamplingModePressed() => _controller.SelectMode(PrimaryMode.Sampling);
-    private void OnAutomaticModePressed() => _controller.SelectMode(PrimaryMode.AutomaticInstrumentation);
-    private void OnManualModePressed() => _controller.SelectManualOnly();
+    private void OnAutomaticCaptureToggled(bool enabled) =>
+        _controller.SelectMode(enabled ? PrimaryMode.AutomaticInstrumentation : PrimaryMode.Sampling);
     private void OnManualOverlayToggled(bool included) => _controller.SetManualOverlay(included);
 
     private void OnSamplingFilterSelected(long index)
@@ -588,7 +589,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     }
 
     private SamplingSettings CurrentSampling() => new(_samplingIncludes?.Text ?? "",
-        _samplingExcludes?.Text ?? "", (long)(_samplingInterval?.Value ?? 2_000_000));
+        _samplingExcludes?.Text ?? "", (long)((_samplingInterval?.Value ?? 2) * 1_000_000));
     private AutomaticSettings CurrentAutomatic() => new(_automaticIncludes?.Text ?? "Game",
         _automaticExcludes?.Text ?? "", (int)(_automaticMaximum?.Value ?? 4096));
 
@@ -621,30 +622,22 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _applyInstallButton.Disabled = true;
     }
 
-    private Button ModeButton(string text, string method)
-    {
-        var button = new Button { Text = text, ToggleMode = true };
-        button.Connect(BaseButton.SignalName.Pressed, new Callable(this, method));
-        return button;
-    }
-
         public void Render(ProfilerDockViewState state)
     {
         if (_targetLabel == null)
             return;
         _targetLabel.Text = state.Target;
         _statsLabel.Text = state.Status;
-        ApplyMode(_samplingModeButton, state.ModeSegments.ElementAtOrDefault(0));
-        ApplyMode(_automaticModeButton, state.ModeSegments.ElementAtOrDefault(1));
-        ApplyMode(_manualModeButton, state.ModeSegments.ElementAtOrDefault(2));
+        _automaticCaptureButton?.SetPressedNoSignal(
+            _controller.Configuration.Primary == PrimaryMode.AutomaticInstrumentation);
         ApplyMode(_includeManualButton, state.ManualOverlay);
         _startButton.Disabled = !state.Commands.Start;
         _stopButton.Disabled = !state.Commands.Stop;
         _copyButton.Disabled = !state.Commands.Copy;
         _exportButton.Disabled = !state.Commands.Export;
         _settingsLabel.Text = string.IsNullOrEmpty(state.InstallerStatus)
-            ? state.SettingsStatus
-            : state.SettingsStatus + " | " + state.InstallerStatus;
+            ? ""
+            : state.InstallerStatus;
         _qualityLabel.Text = state.QualityBanner;
         var primary = _controller.Configuration.Primary;
         _samplingSettings.Visible = primary == PrimaryMode.Sampling;

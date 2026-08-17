@@ -1,4 +1,5 @@
 * text=auto eol=lf
+*.nupkg binary
 
 # Asset Library archives retain only the distributable addon.
 /** export-ignore
