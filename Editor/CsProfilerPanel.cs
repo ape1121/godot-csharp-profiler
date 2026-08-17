@@ -10,6 +10,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.IO;
 using System.Text;
+using System.Text.Json;
 
 // The single "C# Profiler" bottom panel: Start/Stop toolbar, clickable frame-time graph, and the
 // selected frame's call tree with Total/Self/Calls columns. Frames arrive from
@@ -137,10 +138,36 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _samplingFilter.EmitSignal(OptionButton.SignalName.ItemSelected, 0L);
         var projectOnly = _controller.Configuration.Sampling.IncludeAssemblies == ProjectAssemblyName();
         ApplyRuntimeMetrics(42, 60, 1000.0 / 60.0);
+        var rows = new[]
+        {
+            new ResultRow("Game.Update", 12, 24.5, 0, 0, 0, 0),
+            new ResultRow("Game.Render", 5, 10.2, 0, 0, 0, 0)
+        };
+        _controller.UpdateTimeline(new CaptureTimeline([
+            new CaptureTimelinePoint(7, CaptureSource.Sampling, 17, 17, rows)
+        ]));
+        RenderSelectedBatch(_protocolTimeline.Points[0]);
+        var first = _selectedBatchTree.GetRoot()?.GetFirstChild();
+        var second = first?.GetNext();
+        first?.Select(0);
+        second?.Select(0);
+        var selected = SelectedTimelineNames();
+        var copied = BuildTimelineReport(_selectedTimelinePoint, selected);
+        var outputEnabled = !_copyButton.Disabled && !_exportButton.Disabled;
+        var simpleMultiCopy = selected.Count == 2 &&
+                              copied == "Game.Update | 12 samples | 24.5%\nGame.Render | 5 samples | 10.2%\n";
+        var exportPath = ProjectSettings.GlobalizePath("res://cs-profiler-timeline.json");
+        if (File.Exists(exportPath)) File.Delete(exportPath);
+        _exportButton.EmitSignal(BaseButton.SignalName.Pressed);
+        var timelineExported = File.Exists(exportPath) &&
+                               File.ReadAllText(exportPath).Contains("Game.Update", StringComparison.Ordinal);
+        if (File.Exists(exportPath)) File.Delete(exportPath);
+        var redundantTextRemoved = !_settingsPopup.FindChildren("*", "Label", recursive: true, owned: false)
+            .OfType<Label>().Any(label => label.Text.Contains("statistical sampling by default", StringComparison.Ordinal));
         return _startSignalInvocations == 1 && _stopSignalInvocations == 1 &&
                _optionsSignalInvocations == 1 && _settingsPopup.Visible && automaticSelected && samplingSelected &&
-               allManaged && projectOnly &&
-               _performanceLabel.Text == "Frame 42 · 16.67 ms · 60 FPS" &&
+               allManaged && projectOnly && outputEnabled && simpleMultiCopy && timelineExported && redundantTextRemoved &&
+               _performanceLabel.Text == "Flush-frame timing unavailable" &&
                _settingsPopup.FindChildren("*", "Control", recursive: true, owned: false).Count >= 10;
     }
     internal int TimelinePointCountForTests => _protocolTimeline.Points.Count;
@@ -292,7 +319,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             Columns = 3,
             ColumnTitlesVisible = true,
             HideRoot = true,
-            SelectMode = Tree.SelectModeEnum.Row
+            SelectMode = Tree.SelectModeEnum.Multi
         };
         _selectedBatchTree.SetColumnTitle(0, "Function");
         _selectedBatchTree.SetColumnTitle(1, "Samples");
@@ -357,11 +384,6 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         settingsRoot.AddChild(outputCommands);
 
         settingsRoot.AddChild(new Label { Text = "Capture" });
-        settingsRoot.AddChild(new Label
-        {
-            Text = "Start uses statistical sampling by default.",
-            Modulate = new Color(1, 1, 1, 0.7f)
-        });
         _automaticCaptureButton = new CheckButton
         {
             Text = "Use exact method timing",
@@ -456,10 +478,15 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
 
     private void OnCopyPressed()
     {
-        if (_selectedTimelinePoint != null) CopyTimelineReport(null);
+        if (_selectedTimelinePoint != null) CopyTimelineRows(SelectedTimelineNames());
         else _controller.Copy(ExportFormat.VisibleCsv);
     }
-    private void OnExportPressed() => _controller.Export(ExportFormat.LosslessJson);
+
+    private void OnExportPressed()
+    {
+        if (_protocolTimeline.Points.Count > 0) ExportTimeline();
+        else _controller.Export(ExportFormat.LosslessJson);
+    }
 
     private void OnGraphFrameClicked(int index)
     {
@@ -1063,63 +1090,65 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         else if (inputEvent is InputEventKey { Pressed: true, Echo: false, Keycode: Key.C } key &&
                  (key.CtrlPressed || key.MetaPressed))
         {
-            CopyTimelineReport(_selectedBatchTree.GetSelected()?.GetMetadata(0).AsString());
+            CopyTimelineRows(SelectedTimelineNames());
             _selectedBatchTree.AcceptEvent();
         }
     }
 
-    private void OnCallContextAction(long id) =>
-        CopyTimelineReport(_selectedBatchTree.GetSelected()?.GetMetadata(0).AsString());
+    private void OnCallContextAction(long id) => CopyTimelineRows(SelectedTimelineNames());
 
-    private void CopyTimelineReport(string selectedName)
+    private IReadOnlySet<string> SelectedTimelineNames()
     {
-        if (_selectedTimelinePoint == null) return;
-        var report = BuildTimelineReport(_selectedTimelinePoint, selectedName);
-        if (report.Length == 0) return;
-        DisplayServer.ClipboardSet(report);
-        _statsLabel.Text = RuntimeStatus(selectedName == null
-            ? $"Copied batch #{_selectedTimelinePoint.Sequence}"
-            : $"Copied {selectedName}");
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        if (_selectedBatchTree == null) return names;
+        TreeItem item = null;
+        while ((item = _selectedBatchTree.GetNextSelected(item)) != null)
+        {
+            var name = item.GetMetadata(0).AsString();
+            if (!string.IsNullOrEmpty(name)) names.Add(name);
+        }
+        return names;
     }
 
-    private static string BuildTimelineReport(CaptureTimelinePoint point, string selectedName)
+    private void CopyTimelineRows(IReadOnlySet<string> selectedNames)
     {
-        var rows = selectedName == null
+        if (_selectedTimelinePoint == null) return;
+        var report = BuildTimelineReport(_selectedTimelinePoint, selectedNames);
+        if (report.Length == 0) return;
+        DisplayServer.ClipboardSet(report);
+        _statsLabel.Text = RuntimeStatus(selectedNames.Count == 0
+            ? $"Copied batch #{_selectedTimelinePoint.Sequence}"
+            : $"Copied {selectedNames.Count} call{(selectedNames.Count == 1 ? "" : "s")}");
+    }
+
+    private static string BuildTimelineReport(CaptureTimelinePoint point, IReadOnlySet<string> selectedNames)
+    {
+        var rows = selectedNames.Count == 0
             ? point.Rows
-            : point.Rows.Where(row => row.Name == selectedName).ToArray();
+            : point.Rows.Where(row => selectedNames.Contains(row.Name)).ToArray();
         if (rows.Count == 0) return "";
         var sampling = point.Source == CaptureSource.Sampling;
-        var builder = new StringBuilder(512)
-            .AppendLine("# Godot C# Profiler capture")
-            .Append("- Source: ").AppendLine(sampling ? "statistical sampling" : "exact instrumentation")
-            .Append("- Batch: ").AppendLine(point.Sequence.ToString())
-            .Append("- Scope: ").AppendLine(selectedName ?? "complete selected batch");
-        if (point.FlushFrame is { } flush)
-            builder.Append("- Batch emission frame: ").Append(flush.ProcessFrame)
-                .Append(" (").Append((flush.ElapsedNanoseconds / 1_000_000.0).ToString("0.###")).AppendLine(" ms)")
-                .AppendLine("- Frame note: this batch was flushed during that frame; the batch is not a frame and may cover a wider interval.");
-        else
-            builder.AppendLine("- Batch emission frame: unavailable");
-        if (sampling)
-            builder.AppendLine("- Timing note: samples/share identify hotspots; they are not call durations.")
-                .AppendLine("| Function | Samples | Share |")
-                .AppendLine("|---|---:|---:|");
-        else
-            builder.AppendLine("| Function | Wall ms | Calls | Avg ms | Max ms |")
-                .AppendLine("|---|---:|---:|---:|---:|");
+        var builder = new StringBuilder(256);
         foreach (var row in rows)
         {
-            builder.Append("| ").Append(row.Name.Replace("|", "\\|"));
+            builder.Append(row.Name);
             if (sampling)
-                builder.Append(" | ").Append(row.Samples).Append(" | ")
-                    .Append(row.EstimatedStackFrameShare.ToString("0.##")).AppendLine("% |");
+                builder.Append(" | ").Append(row.Samples).Append(" samples | ")
+                    .Append(row.EstimatedStackFrameShare.ToString("0.##")).AppendLine("%");
             else
                 builder.Append(" | ").Append(row.ObservedWallTimeMilliseconds.ToString("0.###"))
-                    .Append(" | ").Append(row.Calls).Append(" | ")
-                    .Append(row.AverageWallTimeMilliseconds.ToString("0.###")).Append(" | ")
-                    .Append(row.MaximumWallTimeMilliseconds.ToString("0.###")).AppendLine(" |");
+                    .Append(" ms | ").Append(row.Calls).AppendLine(row.Calls == 1 ? " call" : " calls");
         }
         return builder.ToString();
+    }
+
+    private void ExportTimeline()
+    {
+        if (_protocolTimeline.Points.Count == 0) return;
+        var path = ProjectSettings.GlobalizePath("res://cs-profiler-timeline.json");
+        File.WriteAllText(path, JsonSerializer.Serialize(_protocolTimeline,
+            new JsonSerializerOptions { WriteIndented = true }));
+        _controller.ReportStatus("Exported captured timeline to " + path);
     }
 
     private sealed class DisplayNode

@@ -252,12 +252,13 @@ public sealed class ProfilerDockController
 
     private ModePresentation Presentation()
     {
+        var hasOutput = results.HasResults || timeline.Points.Count > 0;
         var sources = results.Groups.Select(group => group.Source).Distinct().ToArray();
         if (sources.Length == 0)
             sources = [snapshot.Source];
         var automatic = InstallerAutomaticFacts();
         var presentationSnapshot = snapshot;
-        if (snapshot.State == CaptureState.Disconnected && results.HasResults)
+        if (snapshot.State == CaptureState.Disconnected && hasOutput)
         {
             presentationSnapshot = snapshot with
             {
@@ -270,7 +271,7 @@ public sealed class ProfilerDockController
             };
         }
         return ModePresenter.Present(ModePresentationInput.FromSnapshot(presentationSnapshot,
-            modes.Configuration, results.HasResults, sources, results.Truncated, automatic));
+            modes.Configuration, hasOutput, sources, results.Truncated, automatic));
     }
 
     private AutomaticFacts InstallerAutomaticFacts()
