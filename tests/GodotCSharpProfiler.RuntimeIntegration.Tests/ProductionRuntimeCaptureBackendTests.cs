@@ -49,6 +49,7 @@ public sealed class ProductionRuntimeCaptureBackendTests
 
     private sealed class FakeSamplingLease(params SamplingSnapshot[] snapshots) : ProductionRuntimeCaptureBackend.IManagedSamplingLease
     {
+        public Exception? Fault => null;
         private readonly Queue<SamplingSnapshot> _snapshots = new(snapshots);
         public SamplingOptions? Options { get; set; }
         public void Start() { }

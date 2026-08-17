@@ -786,22 +786,10 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             _frameSelector.Value = index;
             _updatingSelector = false;
             var point = _protocolTimeline.Points[index];
-            var title = point.Source switch
-            {
-                CaptureSource.Sampling => "Sampling batch (estimated)",
-                CaptureSource.AutomaticSpans => "Automatic instrumentation batch (exact)",
-                CaptureSource.ManualSpans => "Manual scopes batch (exact)",
-                _ => "Capture batch"
-            };
             _statsLabel.Text = point.Source == CaptureSource.Sampling
                 ? RuntimeStatus($"{point.Value} samples | {point.Rows.Count} methods | batch #{point.Sequence}")
                 : RuntimeStatus($"{point.Value / 1_000_000.0:0.###} ms observed exact-span time | " +
                     $"{point.Observations} calls | batch #{point.Sequence}");
-            RenderResultGroups([new ResultGroupViewState(title, point.Source,
-                point.Source == CaptureSource.Sampling
-                    ? ["Name", "Samples", "Estimated stack-frame %"]
-                    : ["Name", "Wall time", "Calls", "Average wall time", "Maximum wall time"],
-                point.Rows)]);
             return;
         }
 

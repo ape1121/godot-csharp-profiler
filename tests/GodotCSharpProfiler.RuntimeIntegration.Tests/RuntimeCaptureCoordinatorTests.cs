@@ -142,6 +142,23 @@ public sealed class RuntimeCaptureCoordinatorTests
     }
 
     [Fact]
+    public void AsynchronousBackendFaultTerminatesCaptureAsRuntimeError()
+    {
+        var (runtime, transport, backend) = Runtime();
+        runtime.Connect();
+        Assert.True(runtime.Receive(Configure(1, CaptureModes.Sampling), "owner"));
+        Assert.True(runtime.Receive(Start(1), "owner"));
+        backend.DrainFailure = new InvalidOperationException("sampler fault");
+
+        runtime.Flush();
+
+        Assert.False(runtime.Capturing);
+        Assert.Contains(transport.Parsed, message => message is ErrorMessage { Fatal: true });
+        Assert.Contains(transport.Parsed, message => message is StateMessage
+            { State: CaptureState.Partial, PartialReason: PartialReason.RuntimeError });
+    }
+
+    [Fact]
     public void StrictAdapterRejectsObjectsNullAndExcessDepth()
     {
         Assert.False(StrictWireAdapter.TryConvert(new object(), out _));
@@ -186,9 +203,14 @@ public sealed class RuntimeCaptureCoordinatorTests
         public int Stops { get; private set; }
         public List<RuntimeSourceBatch> Pending { get; } = [];
         public RuntimeCaptureConfiguration? LastConfiguration { get; private set; }
+        public Exception? DrainFailure { get; set; }
         public bool TryStart(RuntimeCaptureConfiguration configuration, string owner, out string? error)
         { LastConfiguration = configuration; _ = owner; error = null; Starts++; IsActive = true; return true; }
-        public IReadOnlyList<RuntimeSourceBatch> Drain() { var value = Pending.ToArray(); Pending.Clear(); return value; }
+        public IReadOnlyList<RuntimeSourceBatch> Drain()
+        {
+            if (DrainFailure is not null) throw DrainFailure;
+            var value = Pending.ToArray(); Pending.Clear(); return value;
+        }
         public IReadOnlyList<RuntimeSourceBatch> Stop() { if (!IsActive) return []; Stops++; IsActive = false; return Drain(); }
         public void Dispose() { if (IsActive) Stop(); }
     }

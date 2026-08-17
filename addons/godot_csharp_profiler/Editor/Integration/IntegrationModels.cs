@@ -88,6 +88,7 @@ public sealed class EditorCaptureCoordinator
     private readonly CaptureProtocolParser parser = new();
     private readonly Dictionary<CaptureSource, Dictionary<long, Aggregate>> pending = new();
     private readonly List<CaptureTimelinePoint> timeline = new();
+    private bool stopRequestedWhileStarting;
     private int configuredMaxMethods = ProtocolLimits.MaxMethodsPerBatch;
     private CaptureSnapshot snapshot = new(CaptureState.Negotiating, null, 0, 0, null, null,
         CaptureModes.None, CaptureSource.Sampling, CaptureCompleteness.InProgress, PartialReason.None,
@@ -156,6 +157,7 @@ public sealed class EditorCaptureCoordinator
             Completeness = CaptureCompleteness.InProgress, PartialReason = PartialReason.None, Quality = QualityCounters.Zero };
         pending.Clear();
         timeline.Clear();
+        stopRequestedWhileStarting = false;
         configuredMaxMethods = maxMethods;
         TimelineChanged?.Invoke(CaptureTimeline.Empty);
         send(StrictWireAdapter.Serialize(new ConfigureMessage(ProtocolVersion.Major, ProtocolVersion.Minor,
@@ -172,9 +174,19 @@ public sealed class EditorCaptureCoordinator
     {
         if (snapshot.State is not (CaptureState.Starting or CaptureState.Capturing) ||
             snapshot.RuntimeToken is null || snapshot.Fingerprint is null || snapshot.LeaseOwner != owner) return false;
+        if (snapshot.State == CaptureState.Starting)
+        {
+            stopRequestedWhileStarting = true;
+            return true;
+        }
+        return SendStop();
+    }
+
+    private bool SendStop()
+    {
         var sequence = checked(snapshot.Sequence + 1);
         send(StrictWireAdapter.Serialize(new StopMessage(ProtocolVersion.Major, ProtocolVersion.Minor,
-            snapshot.RuntimeToken, snapshot.Generation, sequence, snapshot.Fingerprint)));
+            snapshot.RuntimeToken!, snapshot.Generation, sequence, snapshot.Fingerprint!)));
         snapshot = snapshot with { State = CaptureState.Stopping, Sequence = sequence };
         SnapshotChanged?.Invoke(snapshot);
         return true;
@@ -194,7 +206,12 @@ public sealed class EditorCaptureCoordinator
     {
         if (message.Major != ProtocolVersion.Major) return false;
         if (string.Equals(snapshot.RuntimeToken, message.RuntimeToken, StringComparison.Ordinal))
+        {
+            if (snapshot.State == CaptureState.Error)
+                snapshot = snapshot with { State = CaptureState.Ready, Fingerprint = null,
+                    LeaseOwner = null, Modes = CaptureModes.None };
             return snapshot.State is not (CaptureState.Disconnected or CaptureState.Negotiating);
+        }
 
         // Debugger session ids may be reused across game reruns. A new token starts a fresh negotiation.
         // Completed editor-owned results and timeline remain visible until the next capture starts.
@@ -282,14 +299,22 @@ public sealed class EditorCaptureCoordinator
         snapshot = snapshot with { State = message.State, Sequence = message.Sequence, Source = message.Source,
             Completeness = message.Completeness, PartialReason = message.PartialReason, Quality = quality,
             LeaseOwner = message.State is CaptureState.Complete or CaptureState.Partial or CaptureState.Error ? null : snapshot.LeaseOwner };
+        if (message.State == CaptureState.Capturing && stopRequestedWhileStarting)
+        {
+            stopRequestedWhileStarting = false;
+            SendStop();
+        }
         return true;
     }
 
     private bool AcceptError(ErrorMessage message)
     {
         if (!MatchesRuntime(message) || message.Generation != snapshot.Generation || message.Sequence != snapshot.Sequence + 1) return false;
-        snapshot = snapshot with { Sequence = message.Sequence, State = message.Fatal ? CaptureState.Error : snapshot.State,
-            LeaseOwner = message.Fatal ? null : snapshot.LeaseOwner };
+        snapshot = snapshot with { Sequence = message.Sequence, State = message.Fatal ? CaptureState.Ready : snapshot.State,
+            Fingerprint = message.Fatal ? null : snapshot.Fingerprint,
+            LeaseOwner = message.Fatal ? null : snapshot.LeaseOwner,
+            Modes = message.Fatal ? CaptureModes.None : snapshot.Modes };
+        if (message.Fatal) stopRequestedWhileStarting = false;
         return true;
     }
 

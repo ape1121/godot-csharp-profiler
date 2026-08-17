@@ -116,6 +116,40 @@ public sealed class EditorIntegrationTests
     }
 
     [Fact]
+    public void StopRequestedWhileStartingWaitsForCapturingSequenceThenStops()
+    {
+        var sent = new Queue<WireMap>();
+        var editor = ReadyEditor(sent);
+        Assert.True(editor.Start(TestConfiguration));
+        sent.Clear();
+
+        Assert.True(editor.Stop());
+        Assert.Empty(sent);
+        Assert.Equal(CaptureState.Starting, editor.Snapshot.State);
+
+        Assert.True(editor.Receive(State(CaptureState.Capturing, 1, QualityCounters.Zero)));
+        var stop = Assert.IsType<StopMessage>(Parse(sent.Dequeue()));
+        Assert.Equal(2, stop.Sequence);
+        Assert.Equal(CaptureState.Stopping, editor.Snapshot.State);
+    }
+
+    [Fact]
+    public void FatalStartErrorReturnsToReadyAndCanRetryWithoutRestartingTarget()
+    {
+        var sent = new Queue<WireMap>();
+        var editor = ReadyEditor(sent);
+        Assert.True(editor.Start(TestConfiguration));
+        sent.Clear();
+
+        Assert.True(editor.Receive(StrictWireAdapter.Serialize(new ErrorMessage(
+            ProtocolVersion.Major, ProtocolVersion.Minor, "runtime", 1, 1, 7,
+            "sampling busy", true))));
+
+        Assert.Equal(CaptureState.Ready, editor.Snapshot.State);
+        Assert.True(editor.Start(TestConfiguration));
+    }
+
+    [Fact]
     public void DuplicateNegotiationAndNewRuntimeTokenOnReusedSessionAreSafe()
     {
         var endpoint = new EditorCaptureCoordinator("owner", _ => { });
