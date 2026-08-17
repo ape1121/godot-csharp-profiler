@@ -74,7 +74,12 @@ public sealed class RuntimeCaptureCoordinator : IDisposable
     {
         ThrowIfDisposed();
         if (!_connected || _owner is null || !_backend.IsActive || _configuration is null) return;
-        EmitBatches(_backend.Drain());
+        try { EmitBatches(_backend.Drain()); }
+        catch (Exception exception)
+        {
+            SendError(3, exception.Message, fatal: true);
+            StopOwned(sendTerminal: true, PartialReason.RuntimeError);
+        }
     }
 
     public void Disconnect()

@@ -97,6 +97,8 @@ public sealed class ProductionRuntimeCaptureBackend : IRuntimeCaptureBackend
         var result = new List<RuntimeSourceBatch>(2);
         if (_sampler is not null)
         {
+            if (_sampler.Fault is not null)
+                throw new InvalidOperationException("Managed sampling stopped unexpectedly.", _sampler.Fault);
             var sampling = SamplingBatch(_sampler.Snapshot(reset: true));
             if (sampling.Methods.Count > 0 || sampling.Quality != QualityCounters.Zero)
                 result.Add(sampling);
@@ -239,6 +241,7 @@ public sealed class ProductionRuntimeCaptureBackend : IRuntimeCaptureBackend
 
     internal interface IManagedSamplingLease : IDisposable
     {
+        Exception? Fault { get; }
         void Start();
         void Stop();
         SamplingSnapshot Snapshot(bool reset);
@@ -248,6 +251,7 @@ public sealed class ProductionRuntimeCaptureBackend : IRuntimeCaptureBackend
     private sealed class ManagedSamplingLease(SamplingOptions options) : IManagedSamplingLease
     {
         private readonly ManagedSamplingSession _session = new(options);
+        public Exception? Fault => _session.Fault;
         public void Start() => _session.StartAsync().GetAwaiter().GetResult();
         public void Stop() => _session.StopAsync().GetAwaiter().GetResult();
         public SamplingSnapshot Snapshot(bool reset) => _session.GetSnapshot(reset);
