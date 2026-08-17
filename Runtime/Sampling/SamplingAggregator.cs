@@ -61,7 +61,7 @@ public sealed class SamplingAggregator
             var retainedFrames = 0;
             foreach (var frame in frames)
             {
-                if (!AssemblyIncluded(frame.AssemblyName))
+                if (!FrameIncluded(frame.AssemblyName, frame.MethodName))
                 {
                     _filteredFrames++;
                     continue;
@@ -156,13 +156,15 @@ public sealed class SamplingAggregator
         _filteredFrames = 0;
     }
 
-    private bool AssemblyIncluded(string? assemblyName)
+    private bool FrameIncluded(string? assemblyName, string? methodName)
     {
         assemblyName ??= "";
+        methodName ??= "";
         var included = _options.IncludeAssemblyPrefixes.Count == 0 ||
             _options.IncludeAssemblyPrefixes.Any(prefix => assemblyName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
-        return included && !_options.ExcludeAssemblyPrefixes.Any(
-            prefix => assemblyName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
+        return included && !_options.ExcludeAssemblyPrefixes.Any(prefix =>
+            assemblyName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) ||
+            methodName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
     }
 
     private string Truncate(string value)

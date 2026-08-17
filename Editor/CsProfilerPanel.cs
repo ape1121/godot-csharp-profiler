@@ -32,6 +32,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private const int MaxFrames = 3600;
     private const int MaxScopeNodes = 4096;
     private const int MaxScopeDepth = 32;
+    private const string ProfilerSelfFilter = "Apeworks.GodotCSharpProfiler";
 
     public event Action<bool> ProfilingToggled;
     public event Action DiscoveryRequested;
@@ -67,6 +68,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private Button _automaticModeButton;
     private Button _manualModeButton;
     private CheckButton _includeManualButton;
+    private CheckButton _includeProfilerInternals;
     private SpinBox _frameSelector;
     private Label _targetLabel;
     private Label _statsLabel;
@@ -91,6 +93,8 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private PopupPanel _settingsPopup;
     private TabContainer _resultTabs;
     private Tree _selectedBatchTree;
+    private PopupMenu _callContextMenu;
+    private CaptureTimelinePoint _selectedTimelinePoint;
     private CsProfilerFrameGraph _graph;
     private Tree _tree;
     private int _selectedIndex = -1;
@@ -167,23 +171,23 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         SizeFlagsVertical = SizeFlags.ExpandFill;
         CustomMinimumSize = Vector2.Zero;
         _controller = new ProfilerDockController(this, this, CreateInstallerSafely(), this);
-        _controller.UpdateSampling(new SamplingSettings(ProjectAssemblyName(), string.Empty, 2_000_000));
+        _controller.UpdateSampling(new SamplingSettings(ProjectAssemblyName(), ProfilerSelfFilter, 2_000_000));
 
         var toolbar = new HBoxContainer();
         AddChild(toolbar);
-        _startButton = new Button { Text = "Start", TooltipText = "Start statistical sampling" };
+        _startButton = new Button { Text = "▶", TooltipText = "Start profiling" };
         _startButton.Connect(BaseButton.SignalName.Pressed, new Callable(this, nameof(OnStartPressed)));
         toolbar.AddChild(_startButton);
-        _stopButton = new Button { Text = "Stop" };
+        _stopButton = new Button { Text = "■", TooltipText = "Stop profiling" };
         _stopButton.Connect(BaseButton.SignalName.Pressed, new Callable(this, nameof(OnStopPressed)));
         toolbar.AddChild(_stopButton);
 
-        var clearButton = new Button { Text = "Clear" };
+        var clearButton = new Button { Text = "⌫", TooltipText = "Clear captured results" };
         clearButton.Connect(BaseButton.SignalName.Pressed, new Callable(this, nameof(ClearAllResults)));
         toolbar.AddChild(clearButton);
         _settingsButton = new Button
         {
-            Text = "Options",
+            Text = "⚙",
             TooltipText = "Profiler settings, advanced modes, export, and diagnostics"
         };
         _settingsButton.Connect(BaseButton.SignalName.Pressed, new Callable(this, nameof(ShowSettings)));
@@ -203,8 +207,8 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         toolbar.AddChild(_samplingFilter);
 
         // Copy/export are advanced actions and belong in the compact settings popup.
-        _copyButton = new Button { Text = "Copy Results", Disabled = true,
-            TooltipText = "Copy visible source-separated results" };
+        _copyButton = new Button { Text = "⧉ Copy AI Batch", Disabled = true,
+            TooltipText = "Copy every call in the selected batch as an AI-ready report" };
         _copyButton.Connect(BaseButton.SignalName.Pressed, new Callable(this, nameof(OnCopyPressed)));
         _exportButton = new Button { Text = "Export Results", Disabled = true,
             TooltipText = "Export lossless source-separated JSON" };
@@ -291,7 +295,15 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _selectedBatchTree.SetColumnTitle(1, "Samples");
         _selectedBatchTree.SetColumnTitle(2, "Share");
         _selectedBatchTree.SetColumnExpand(0, true);
+        _selectedBatchTree.Connect(Control.SignalName.GuiInput,
+            new Callable(this, nameof(OnSelectedBatchGuiInput)));
         _resultTabs.AddChild(_selectedBatchTree);
+        _callContextMenu = new PopupMenu();
+        _callContextMenu.AddItem("Copy call for AI", 0);
+        _callContextMenu.AddItem("Copy complete batch for AI", 1);
+        _callContextMenu.Connect(PopupMenu.SignalName.IdPressed,
+            new Callable(this, nameof(OnCallContextAction)));
+        AddChild(_callContextMenu);
 
         BuildSettingsUi();
         Connect(Control.SignalName.Resized, new Callable(this, nameof(ApplyResponsiveLayout)));
@@ -328,13 +340,13 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         {
             SizeFlagsHorizontal = SizeFlags.ExpandFill,
             SizeFlagsVertical = SizeFlags.ExpandFill,
-            CustomMinimumSize = new Vector2(500, 500)
+            CustomMinimumSize = new Vector2(680, 580)
         };
         _settingsPopup.AddChild(scroll);
         var settingsRoot = new VBoxContainer
         {
             SizeFlagsHorizontal = SizeFlags.ExpandFill,
-            CustomMinimumSize = new Vector2(480, 0)
+            CustomMinimumSize = new Vector2(650, 0)
         };
         scroll.AddChild(settingsRoot);
 
@@ -365,9 +377,17 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
 
         _samplingSettings = new VBoxContainer();
         settingsRoot.AddChild(_samplingSettings);
+        _includeProfilerInternals = new CheckButton
+        {
+            Text = "Include profiler internals",
+            TooltipText = "Show profiler infrastructure calls. Off by default."
+        };
+        _includeProfilerInternals.Connect(BaseButton.SignalName.Toggled,
+            new Callable(this, nameof(OnProfilerInternalsToggled)));
+        _samplingSettings.AddChild(_includeProfilerInternals);
         _samplingIncludes = AddLineSetting(_samplingSettings, "Include assemblies", ProjectAssemblyName(),
             nameof(OnSamplingIncludesChanged));
-        _samplingExcludes = AddLineSetting(_samplingSettings, "Exclude assemblies", "",
+        _samplingExcludes = AddLineSetting(_samplingSettings, "Exclude assemblies", ProfilerSelfFilter,
             nameof(OnSamplingExcludesChanged));
         _samplingIncludes.Editable = false;
         _samplingExcludes.Editable = false;
@@ -434,7 +454,11 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         if (_controller.Stop()) _profilingRequested = false;
     }
 
-    private void OnCopyPressed() => _controller.Copy(ExportFormat.VisibleCsv);
+    private void OnCopyPressed()
+    {
+        if (_selectedTimelinePoint != null) CopyTimelineReport(null);
+        else _controller.Copy(ExportFormat.VisibleCsv);
+    }
     private void OnExportPressed() => _controller.Export(ExportFormat.LosslessJson);
 
     private void OnGraphFrameClicked(int index)
@@ -451,26 +475,41 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private void OnSamplingFilterSelected(long index)
     {
         var assembly = ProjectAssemblyName();
+        var exclusions = _includeProfilerInternals?.ButtonPressed == true ? string.Empty : ProfilerSelfFilter;
         switch (index)
         {
             case 0:
+                _samplingIncludes.Text = assembly;
+                _samplingExcludes.Text = exclusions;
                 _controller.UpdateSampling(CurrentSampling() with
-                    { IncludeAssemblies = assembly, ExcludeAssemblies = string.Empty });
+                    { IncludeAssemblies = assembly, ExcludeAssemblies = exclusions });
                 break;
             case 1:
                 _controller.UpdateSampling(CurrentSampling() with
-                    { IncludeAssemblies = $"{assembly};GodotSharp", ExcludeAssemblies = string.Empty });
+                    { IncludeAssemblies = $"{assembly};GodotSharp", ExcludeAssemblies = exclusions });
                 break;
             case 2:
+                _samplingIncludes.Text = string.Empty;
+                _samplingExcludes.Text = exclusions;
                 _controller.UpdateSampling(CurrentSampling() with
-                    { IncludeAssemblies = string.Empty, ExcludeAssemblies = string.Empty });
-                break;
-            case 3:
+                    { IncludeAssemblies = string.Empty, ExcludeAssemblies = exclusions });
                 break;
         }
         var custom = index == 3;
         if (_samplingIncludes != null) _samplingIncludes.Editable = custom;
         if (_samplingExcludes != null) _samplingExcludes.Editable = custom;
+    }
+
+    private void OnProfilerInternalsToggled(bool included)
+    {
+        var exclusions = CurrentSampling().ExcludeAssemblies.Split(';', StringSplitOptions.RemoveEmptyEntries)
+            .Select(value => value.Trim())
+            .Where(value => !value.Equals(ProfilerSelfFilter, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (!included) exclusions.Add(ProfilerSelfFilter);
+        var value = string.Join(';', exclusions);
+        _samplingExcludes.Text = value;
+        _controller.UpdateSampling(CurrentSampling() with { ExcludeAssemblies = value });
     }
 
     private void OnSamplingIncludesChanged(string text) =>
@@ -507,7 +546,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _optionsSignalInvocations++;
         if (_settingsPopup == null || _settingsButton == null) return;
         var usable = DisplayServer.ScreenGetUsableRect();
-        var size = new Vector2I(Math.Min(520, usable.Size.X - 32), Math.Min(520, usable.Size.Y - 32));
+        var size = new Vector2I(Math.Min(700, usable.Size.X - 32), Math.Min(620, usable.Size.Y - 32));
         var anchorPosition = _settingsButton.GetScreenPosition() + new Vector2(0, _settingsButton.Size.Y);
         var anchor = new Vector2I((int)anchorPosition.X, (int)anchorPosition.Y);
         var x = Math.Clamp(anchor.X, usable.Position.X + 8, usable.End.X - size.X - 8);
@@ -746,11 +785,15 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
 
     public void InitializeSessionState(bool active)
     {
-        _sessionActive = active;
         if (active)
+        {
+            _sessionActive = true;
             _discovery.OnSessionStarted();
+        }
         else
-            _discovery.OnSessionStopped();
+        {
+            OnSessionStopped();
+        }
     }
 
     public void OnSessionStarted()
@@ -769,6 +812,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     {
         // Keep completed history around for post-mortem scrubbing; disconnect never clears data.
         _sessionActive = false;
+        _profilingRequested = false;
         if (!_discovery.OnSessionStopped())
             return;
         _runtimeDescription = "";
@@ -971,6 +1015,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private void RenderSelectedBatch(CaptureTimelinePoint point)
     {
         if (_selectedBatchTree == null) return;
+        _selectedTimelinePoint = point;
         _selectedBatchTree.Clear();
         var sampling = point.Source == CaptureSource.Sampling;
         _selectedBatchTree.Columns = sampling ? 3 : 5;
@@ -987,6 +1032,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         {
             var item = _selectedBatchTree.CreateItem(root);
             item.SetText(0, row.Name);
+            item.SetMetadata(0, row.Name);
             if (sampling)
             {
                 item.SetText(1, row.Samples.ToString());
@@ -1002,6 +1048,73 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         }
         _selectedBatchTree.Visible = true;
         _resultTabs.CurrentTab = _selectedBatchTree.GetIndex();
+    }
+
+    private void OnSelectedBatchGuiInput(InputEvent inputEvent)
+    {
+        if (inputEvent is InputEventMouseButton { Pressed: true, ButtonIndex: MouseButton.Right } mouse)
+        {
+            var item = _selectedBatchTree.GetItemAtPosition(mouse.Position);
+            if (item != null) item.Select(0);
+            _callContextMenu.Position = DisplayServer.MouseGetPosition();
+            _callContextMenu.Popup();
+            _selectedBatchTree.AcceptEvent();
+        }
+        else if (inputEvent is InputEventKey { Pressed: true, Echo: false, Keycode: Key.C } key &&
+                 (key.CtrlPressed || key.MetaPressed))
+        {
+            CopyTimelineReport(_selectedBatchTree.GetSelected()?.GetMetadata(0).AsString());
+            _selectedBatchTree.AcceptEvent();
+        }
+    }
+
+    private void OnCallContextAction(long id) => CopyTimelineReport(id == 0
+        ? _selectedBatchTree.GetSelected()?.GetMetadata(0).AsString()
+        : null);
+
+    private void CopyTimelineReport(string selectedName)
+    {
+        if (_selectedTimelinePoint == null) return;
+        var report = BuildTimelineReport(_selectedTimelinePoint, selectedName);
+        if (report.Length == 0) return;
+        DisplayServer.ClipboardSet(report);
+        _statsLabel.Text = RuntimeStatus(selectedName == null
+            ? $"Copied batch #{_selectedTimelinePoint.Sequence} for AI"
+            : $"Copied {selectedName} for AI");
+    }
+
+    private static string BuildTimelineReport(CaptureTimelinePoint point, string selectedName)
+    {
+        var rows = selectedName == null
+            ? point.Rows
+            : point.Rows.Where(row => row.Name == selectedName).ToArray();
+        if (rows.Count == 0) return "";
+        var sampling = point.Source == CaptureSource.Sampling;
+        var builder = new StringBuilder(512)
+            .AppendLine("# Godot C# Profiler capture")
+            .Append("- Source: ").AppendLine(sampling ? "statistical sampling" : "exact instrumentation")
+            .Append("- Batch: ").AppendLine(point.Sequence.ToString())
+            .Append("- Scope: ").AppendLine(selectedName ?? "complete selected batch");
+        if (sampling)
+            builder.AppendLine("- Timing note: samples/share identify hotspots; they are not call durations.")
+                .AppendLine("| Function | Samples | Share |")
+                .AppendLine("|---|---:|---:|");
+        else
+            builder.AppendLine("| Function | Wall ms | Calls | Avg ms | Max ms |")
+                .AppendLine("|---|---:|---:|---:|---:|");
+        foreach (var row in rows)
+        {
+            builder.Append("| ").Append(row.Name.Replace("|", "\\|"));
+            if (sampling)
+                builder.Append(" | ").Append(row.Samples).Append(" | ")
+                    .Append(row.EstimatedStackFrameShare.ToString("0.##")).AppendLine("% |");
+            else
+                builder.Append(" | ").Append(row.ObservedWallTimeMilliseconds.ToString("0.###"))
+                    .Append(" | ").Append(row.Calls).Append(" | ")
+                    .Append(row.AverageWallTimeMilliseconds.ToString("0.###")).Append(" | ")
+                    .Append(row.MaximumWallTimeMilliseconds.ToString("0.###")).AppendLine(" |");
+        }
+        return builder.ToString();
     }
 
     private sealed class DisplayNode
