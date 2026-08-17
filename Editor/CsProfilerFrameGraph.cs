@@ -199,7 +199,7 @@ public partial class CsProfilerFrameGraph : Control
                 DrawRect(new Rect2(x, size.Y - height, barWidth, height), color);
             }
             var sampling = _timeline.Any(point => point.Source == CaptureSource.Sampling);
-            DrawString(font, new Vector2(4, 14), sampling ? "Samples per batch" : "Observed exact-span time per batch",
+            DrawString(font, new Vector2(4, 14), sampling ? "Statistical samples per batch (not frames)" : "Observed exact-span time per batch",
                 HorizontalAlignment.Left, -1, fontSize, GuideTextColor);
         }
         else

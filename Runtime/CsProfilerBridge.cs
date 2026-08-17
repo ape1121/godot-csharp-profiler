@@ -10,10 +10,12 @@ public partial class CsProfilerBridge : Node
     public const string ProtocolMessage = MessagePrefix + ":protocol";
     public const string ReadyMessage = MessagePrefix + ":ready";
     public const string HandshakeMessage = MessagePrefix + ":handshake";
+    public const string MetricsMessage = MessagePrefix + ":metrics";
 
     private bool _captureRegistered;
     private string _runtimeToken = "";
     private RuntimeCaptureCoordinator _coordinator;
+    private double _metricsElapsed;
 
     public override void _EnterTree()
     {
@@ -93,9 +95,19 @@ public partial class CsProfilerBridge : Node
 
     public override void _Process(double delta)
     {
-        _ = delta;
         if (!_captureRegistered) { TryRegisterCapture(); return; }
         _coordinator?.Flush();
+        _metricsElapsed += Math.Max(0, delta);
+        if (_metricsElapsed >= 0.25)
+        {
+            _metricsElapsed = 0;
+            var fps = Math.Max(0, Engine.GetFramesPerSecond());
+            var frameMilliseconds = fps > 0 ? 1000.0 / fps : Math.Max(0, delta) * 1000.0;
+            EngineDebugger.SendMessage(MetricsMessage, new Godot.Collections.Array
+            {
+                (double)fps, frameMilliseconds
+            });
+        }
     }
 
     private void TryRegisterCapture()

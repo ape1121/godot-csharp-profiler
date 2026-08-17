@@ -152,6 +152,18 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
                 new Godot.Collections.Array())).CallDeferred();
             return true;
         }
+        if (message == CsProfilerBridge.MetricsMessage)
+        {
+            if (_router.SelectedSessionId == sessionId && data.Count == 2)
+            {
+                var fps = data[0].AsDouble();
+                var frameMilliseconds = data[1].AsDouble();
+                if (double.IsFinite(fps) && fps >= 0 && double.IsFinite(frameMilliseconds) &&
+                    frameMilliseconds >= 0)
+                    _panel?.ApplyRuntimeMetrics(fps, frameMilliseconds);
+            }
+            return true;
+        }
         if (message != CsProfilerBridge.ProtocolMessage) return false;
         if (!GodotDebuggerTransport.TryRead(data, out var payload))
         {
