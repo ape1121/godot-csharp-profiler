@@ -22,6 +22,25 @@ public sealed class EditorIntegrationTests
     }
 
     [Fact]
+    public void TimelineGraphScalesWithDockHeightInsteadOfStayingAFixedSliver()
+    {
+        // Regression: a fixed 56px graph left the timeline squished between the toolbar and the
+        // results tab bar in tall docks. The strip must grow with the dock but never dominate it.
+        var tall = ProfilerDockLayoutPolicy.ForHeight(800);
+        Assert.InRange(tall.GraphMinimumHeight, 200, 300);
+        Assert.True(tall.GraphMinimumHeight < 800 / 2);
+
+        var medium = ProfilerDockLayoutPolicy.ForHeight(500);
+        Assert.InRange(medium.GraphMinimumHeight, 120, 200);
+
+        var huge = ProfilerDockLayoutPolicy.ForHeight(2000);
+        Assert.True(huge.GraphMinimumHeight <= 300); // capped: calls keep the majority
+
+        var shortDock = ProfilerDockLayoutPolicy.ForHeight(320);
+        Assert.True(shortDock.GraphMinimumHeight >= 72); // floored: bars stay readable
+    }
+
+    [Fact]
     public void SamplingIsUniversalDefaultAndManualHooksAreAnOptionalOverlay()
     {
         var controller = new ProfilerDockController(new FakeView(), new FakeTransport(), null);
