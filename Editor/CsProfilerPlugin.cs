@@ -145,8 +145,11 @@ public partial class CsProfilerPlugin : EditorPlugin
         if (!_editorAttachedProbeCaptureRequested && EditorInterface.Singleton.IsPlayingScene() &&
             _panel?.BridgeReadyForTests == true && _panel.IdentityForTests.EditorAttached)
         {
-            _editorAttachedProbeCaptureRequested = true;
-            _panel.RequestSamplingCapture();
+            // RequestStart is refused in transient states (capabilities mid-negotiation), so keep
+            // retrying every frame until the intent is actually recorded; a single unlucky attempt
+            // otherwise strands the probe at "Press Start to capture" until the deadline.
+            if (_panel.RequestSamplingCapture())
+                _editorAttachedProbeCaptureRequested = true;
         }
         if (!_editorAttachedProbeStopSent && _panel?.BridgeReadyForTests == true &&
             _panel.TimelinePointCountForTests >= 1 &&
@@ -192,7 +195,9 @@ public partial class CsProfilerPlugin : EditorPlugin
                 _editorAttachedProbeStopSent = false;
                 _editorAttachedProbeStartedAt = now;
                 _editorAttachedProbeDeadline = now + 30.0;
-                _panel.RequestSamplingCapture();
+                // Re-arm the retry loop above instead of firing once: the second capture request
+                // can also land in a transient state right after the first capture completed.
+                _editorAttachedProbeCaptureRequested = false;
                 return;
             }
             GD.Print("CS_PROFILER_EDITOR_ATTACHED_ASSERTIONS_OK reruns=2");

@@ -1,6 +1,7 @@
 #nullable enable
 using Apeworks.GodotCSharpProfiler.Editor.Modes;
 using Apeworks.GodotCSharpProfiler.Protocol;
+using System;
 
 namespace Apeworks.GodotCSharpProfiler.Editor.Integration;
 
@@ -18,13 +19,17 @@ public static class ProfilerDockLayoutPolicy
     public static ProfilerDockLayout ForHeight(float height)
     {
         var compact = height < 300;
+        // The timeline strip scales with the dock instead of staying a fixed sliver squeezed
+        // between the toolbar and the results tab bar: ~30% of dock height, floored so bars stay
+        // readable in short docks and capped so calls always keep the majority of the space.
+        var graphHeight = (int)Math.Clamp(height * 0.30f, compact ? 36 : 72, 260);
         return new ProfilerDockLayout(
             ShowPrimaryToolbar: true,
             ShowCalls: true,
             ShowSettingsButton: true,
             ShowInlineSettings: false,
             ShowQualityDetails: !compact,
-            GraphMinimumHeight: compact ? 36 : 56);
+            GraphMinimumHeight: graphHeight);
     }
 }
 
