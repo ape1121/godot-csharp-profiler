@@ -29,6 +29,7 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
         _panel.SessionActiveQuery = AnySessionActive;
         _panel.ProfilingToggled += SendControlMessage;
         _panel.DiscoveryRequested += SendDiscoveryMessages;
+        _panel.InstanceSelected += OnInstanceSelected;
     }
 
     public override void _SetupSession(int sessionId)
@@ -53,6 +54,7 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
         _activeSessionIds.UnionWith(active);
         ApplyRouteChange(_router.Reconcile(active.Contains));
         _panel.InitializeSessionState(active.Count > 0);
+        PublishInstances();
         var now = Time.GetTicksMsec() / 1000.0;
         if (active.Count == 0 || _router.SelectedSessionId >= 0 || now < _nextOwnedDiscoveryAtSeconds) return;
         _nextOwnedDiscoveryAtSeconds = now + 1;
@@ -66,6 +68,7 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
         StopSelectedOwner();
         _panel.ProfilingToggled -= SendControlMessage;
         _panel.DiscoveryRequested -= SendDiscoveryMessages;
+        _panel.InstanceSelected -= OnInstanceSelected;
         _panel.SessionActiveQuery = null;
         foreach (var endpoint in _protocol.Values) endpoint.Disconnect();
         _sessionIds.Clear();
@@ -92,6 +95,7 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
     private bool TryResolveSession(int sessionId, out EditorDebuggerSession session)
     {
         session = null;
+        if (!_sessionIds.Contains(sessionId)) return false;
         try { session = GetSession(sessionId); return session != null && IsInstanceValid(session); }
         catch (Exception error) when (error is ObjectDisposedException or InvalidOperationException or
                                       ArgumentOutOfRangeException or IndexOutOfRangeException) { return false; }
@@ -125,6 +129,24 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
             SendSessionMessage(sessionId, CsProfilerBridge.MessagePrefix + ":discover", new Godot.Collections.Array());
     }
 
+    private void OnInstanceSelected(int sessionId)
+    {
+        _router.Prefer(sessionId);
+        ApplyRouteChange(_router.Reconcile(IsSessionActive));
+        PublishInstances();
+    }
+
+    private void PublishInstances()
+    {
+        if (_panel == null) return;
+        var instances = _identities.Where(pair => IsSessionActive(pair.Key)).OrderBy(pair => pair.Key)
+            .Select(pair => new CsProfilerInstanceOption(pair.Key,
+                $"{pair.Value.DisplayName} · PID {pair.Value.ProcessId}" +
+                (pair.Value.EditorAttached ? " · editor" : "")))
+            .ToArray();
+        _panel.UpdateInstanceOptions(instances, _router.SelectedSessionId);
+    }
+
     private void SendProtocol(int sessionId, WireMap payload)
     {
         var data = new Godot.Collections.Array { GodotDebuggerTransport.ToGodotVariant(payload) };
@@ -151,6 +173,7 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
             }
             _identities[sessionId] = identity;
             ApplyRouteChange(_router.AcceptReady(sessionId, identity, IsSessionActive));
+            PublishInstances();
             Callable.From(() => SendSessionMessage(sessionId, CsProfilerBridge.HandshakeMessage,
                 new Godot.Collections.Array())).CallDeferred();
             return true;
@@ -254,10 +277,14 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
 
 internal readonly record struct CsProfilerRouteChange(bool Changed, int PreviousSessionId, int SelectedSessionId, CsProfilerRuntimeIdentity Identity);
 
+internal readonly record struct CsProfilerInstanceOption(int SessionId, string Label);
+
 internal sealed class CsProfilerSessionRouterState
 {
     private readonly Dictionary<int, CsProfilerRuntimeIdentity> _identities = new();
+    private int _preferredSessionId = -1;
     public int SelectedSessionId { get; private set; } = -1;
+    public void Prefer(int sessionId) => _preferredSessionId = sessionId;
     public CsProfilerRouteChange AcceptReady(int sessionId, CsProfilerRuntimeIdentity identity, Func<int, bool> isActive)
     {
         _identities.TryGetValue(sessionId, out var previousIdentity);
@@ -270,13 +297,16 @@ internal sealed class CsProfilerSessionRouterState
     public CsProfilerRouteChange Reconcile(Func<int, bool> isActive)
     {
         var previous = SelectedSessionId;
-        var next = _identities.Where(pair => isActive(pair.Key)).OrderByDescending(pair => pair.Value.EditorAttached)
-            .ThenBy(pair => pair.Key).Select(pair => pair.Key).FirstOrDefault(-1);
+        var next = _preferredSessionId >= 0 && isActive(_preferredSessionId) &&
+                   _identities.ContainsKey(_preferredSessionId)
+            ? _preferredSessionId
+            : _identities.Where(pair => isActive(pair.Key)).OrderByDescending(pair => pair.Value.EditorAttached)
+                .ThenBy(pair => pair.Key).Select(pair => pair.Key).FirstOrDefault(-1);
         SelectedSessionId = next;
         _identities.TryGetValue(next, out var identity);
         return new(previous != next, previous, next, identity);
     }
-    public void Clear() { _identities.Clear(); SelectedSessionId = -1; }
+    public void Clear() { _identities.Clear(); _preferredSessionId = -1; SelectedSessionId = -1; }
     public void Forget(int sessionId) => _identities.Remove(sessionId);
 }
 #else

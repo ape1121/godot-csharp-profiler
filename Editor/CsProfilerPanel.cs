@@ -37,6 +37,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
 
     public event Action<bool> ProfilingToggled;
     public event Action DiscoveryRequested;
+        public event Action<int> InstanceSelected;
     // Live session-state probe injected by the debugger plugin. Session lifecycle signals can be
     // missed around plugin/assembly reloads, so state shown to the user is queried, not cached.
     public Func<bool> SessionActiveQuery;
@@ -70,6 +71,11 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private CheckButton _includeProfilerInternals;
     private SpinBox _frameSelector;
     private Label _targetLabel;
+    private OptionButton _instanceSelector;
+    private bool _updatingInstanceSelector;
+    private Button _expandAllButton;
+    private Button _collapseAllButton;
+    private VBoxContainer _selectedBatchTab;
     private Label _statsLabel;
     private Label _performanceLabel;
     private OptionButton _samplingFilter;
@@ -147,15 +153,29 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             new CaptureTimelinePoint(7, CaptureSource.Sampling, 17, 17, rows)
         ]));
         RenderSelectedBatch(_protocolTimeline.Points[0]);
-        var first = _selectedBatchTree.GetRoot()?.GetFirstChild();
-        var second = first?.GetNext();
-        first?.Select(0);
-        second?.Select(0);
+        var group = _selectedBatchTree.GetRoot()?.GetFirstChild();
+        var groupedTree = group != null && group.GetMetadata(0).AsString() == "group:Game" &&
+                          group.GetText(1) == "17" && group.GetChildCount() == 2 &&
+                          group.GetFirstChild()?.GetText(0) == "Update";
+        OnCollapseAllPressed();
+        var collapsedAll = group is { Collapsed: true } && !_expandedGroups.Contains("Game");
+        OnExpandAllPressed();
+        var expandedAll = group is { Collapsed: false } && _expandedGroups.Contains("Game");
+        group?.Select(0);
         var selected = SelectedTimelineNames();
         var copied = BuildTimelineReport(_selectedTimelinePoint, selected);
         var outputEnabled = !_copyButton.Disabled && !_exportButton.Disabled;
         var simpleMultiCopy = selected.Count == 2 &&
                               copied == "Game.Update | 12 samples | 24.5%\nGame.Render | 5 samples | 10.2%\n";
+        var selectedInstanceId = -1;
+        InstanceSelected += id => selectedInstanceId = id;
+        UpdateInstanceOptions([new(3, "Game · PID 100 · editor"), new(7, "Game · PID 200")], 3);
+        var instanceListShown = _instanceSelector.Visible && _instanceSelector.ItemCount == 2 &&
+                                _instanceSelector.Selected == 0;
+        _instanceSelector.EmitSignal(OptionButton.SignalName.ItemSelected, 1L);
+        var instanceSwitchRequested = selectedInstanceId == 7;
+        UpdateInstanceOptions([new(7, "Game · PID 200")], 7);
+        var instanceListHidden = !_instanceSelector.Visible;
         var exportPath = ProjectSettings.GlobalizePath("res://cs-profiler-timeline.json");
         if (File.Exists(exportPath)) File.Delete(exportPath);
         _exportButton.EmitSignal(BaseButton.SignalName.Pressed);
@@ -166,7 +186,9 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             .OfType<Label>().Any(label => label.Text.Contains("statistical sampling by default", StringComparison.Ordinal));
         return _startSignalInvocations == 1 && _stopSignalInvocations == 1 &&
                _optionsSignalInvocations == 1 && _settingsPopup.Visible && automaticSelected && samplingSelected &&
-               allManaged && projectOnly && outputEnabled && simpleMultiCopy && timelineExported && redundantTextRemoved &&
+               allManaged && projectOnly && outputEnabled && groupedTree && collapsedAll && expandedAll &&
+               simpleMultiCopy && instanceListShown && instanceSwitchRequested && instanceListHidden &&
+               timelineExported && redundantTextRemoved &&
                _performanceLabel.Text == "Flush-frame timing unavailable" &&
                _settingsPopup.FindChildren("*", "Control", recursive: true, owned: false).Count >= 10;
     }
@@ -244,6 +266,15 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _exportButton.Connect(BaseButton.SignalName.Pressed, new Callable(this, nameof(OnExportPressed)));
 
         toolbar.AddChild(new VSeparator());
+        _instanceSelector = new OptionButton
+        {
+            Visible = false,
+            TooltipText = "Profiled game instance. Other running instances stay attached and can be selected here.",
+            CustomMinimumSize = new Vector2(150, 0)
+        };
+        _instanceSelector.Connect(OptionButton.SignalName.ItemSelected,
+            new Callable(this, nameof(OnInstanceSelectorChanged)));
+        toolbar.AddChild(_instanceSelector);
         _targetLabel = new Label
         {
             Text = "No target",
@@ -311,9 +342,23 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _tree.Connect(Tree.SignalName.ItemCollapsed, new Callable(this, nameof(OnItemCollapsed)));
         _tree.Connect(Control.SignalName.GuiInput, new Callable(this, nameof(OnTreeGuiInput)));
         _resultTabs.AddChild(_tree);
-        _selectedBatchTree = new Tree
+        _selectedBatchTab = new VBoxContainer
         {
             Name = "Selected batch",
+            SizeFlagsVertical = SizeFlags.ExpandFill,
+            CustomMinimumSize = Vector2.Zero
+        };
+        var batchToolbar = new HBoxContainer();
+        _expandAllButton = new Button { Text = "Expand all", TooltipText = "Expand every group" };
+        _expandAllButton.Connect(BaseButton.SignalName.Pressed, new Callable(this, nameof(OnExpandAllPressed)));
+        batchToolbar.AddChild(_expandAllButton);
+        _collapseAllButton = new Button { Text = "Collapse all", TooltipText = "Collapse every group" };
+        _collapseAllButton.Connect(BaseButton.SignalName.Pressed, new Callable(this, nameof(OnCollapseAllPressed)));
+        batchToolbar.AddChild(_collapseAllButton);
+        _selectedBatchTab.AddChild(batchToolbar);
+        _selectedBatchTree = new Tree
+        {
+            Name = "Selected batch calls",
             SizeFlagsVertical = SizeFlags.ExpandFill,
             CustomMinimumSize = Vector2.Zero,
             Columns = 3,
@@ -325,9 +370,12 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _selectedBatchTree.SetColumnTitle(1, "Samples");
         _selectedBatchTree.SetColumnTitle(2, "Share");
         _selectedBatchTree.SetColumnExpand(0, true);
+        _selectedBatchTree.Connect(Tree.SignalName.ItemCollapsed,
+            new Callable(this, nameof(OnBatchGroupCollapsedToggled)));
         _selectedBatchTree.Connect(Control.SignalName.GuiInput,
             new Callable(this, nameof(OnSelectedBatchGuiInput)));
-        _resultTabs.AddChild(_selectedBatchTree);
+        _selectedBatchTab.AddChild(_selectedBatchTree);
+        _resultTabs.AddChild(_selectedBatchTab);
         _callContextMenu = new PopupMenu();
         _callContextMenu.AddItem("Copy call", 0);
         _callContextMenu.Connect(PopupMenu.SignalName.IdPressed,
@@ -706,9 +754,9 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _samplingResultRowsForTests = groups.Where(item => !item.IsCrossSourceTotal &&
             item.Source == CaptureSource.Sampling).Sum(item => item.Rows.Count);
         foreach (var child in _resultTabs.GetChildren())
-            if (!ReferenceEquals(child, _tree) && !ReferenceEquals(child, _selectedBatchTree)) child.QueueFree();
+            if (!ReferenceEquals(child, _tree) && !ReferenceEquals(child, _selectedBatchTab)) child.QueueFree();
         _tree.Visible = _frames.Count > 0;
-        _selectedBatchTree.Visible = _protocolTimeline.Points.Count > 0;
+        _selectedBatchTab.Visible = _protocolTimeline.Points.Count > 0;
         foreach (var group in groups.Where(item => !item.IsCrossSourceTotal))
         {
             var tree = new Tree { Name = group.Title, Columns = group.Columns.Count,
@@ -1055,26 +1103,45 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             _selectedBatchTree.SetColumnTitle(4, "Maximum");
         }
         var root = _selectedBatchTree.CreateItem();
-        foreach (var row in point.Rows)
+        foreach (var group in GroupTimelineRows(point.Rows))
         {
-            var item = _selectedBatchTree.CreateItem(root);
-            item.SetText(0, row.Name);
-            item.SetMetadata(0, row.Name);
+            var parent = _selectedBatchTree.CreateItem(root);
+            parent.SetText(0, group.Name);
+            parent.SetMetadata(0, GroupMetadataPrefix + group.Name);
+            parent.Collapsed = !_expandedGroups.Contains(group.Name);
             if (sampling)
             {
-                item.SetText(1, row.Samples.ToString());
-                item.SetText(2, $"{row.EstimatedStackFrameShare:0.##}%");
+                parent.SetText(1, group.Samples.ToString());
+                parent.SetText(2, $"{group.Share:0.##}%");
             }
             else
             {
-                item.SetText(1, $"{row.ObservedWallTimeMilliseconds:0.###} ms");
-                item.SetText(2, row.Calls.ToString());
-                item.SetText(3, $"{row.AverageWallTimeMilliseconds:0.###} ms");
-                item.SetText(4, $"{row.MaximumWallTimeMilliseconds:0.###} ms");
+                parent.SetText(1, $"{group.WallMilliseconds:0.###} ms");
+                parent.SetText(2, group.Calls.ToString());
+                parent.SetText(3, group.Calls > 0 ? $"{group.WallMilliseconds / group.Calls:0.###} ms" : "");
+                parent.SetText(4, $"{group.MaximumMilliseconds:0.###} ms");
+            }
+            foreach (var row in group.Rows)
+            {
+                var item = _selectedBatchTree.CreateItem(parent);
+                item.SetText(0, MemberDisplayName(group.Name, row.Name));
+                item.SetMetadata(0, row.Name);
+                if (sampling)
+                {
+                    item.SetText(1, row.Samples.ToString());
+                    item.SetText(2, $"{row.EstimatedStackFrameShare:0.##}%");
+                }
+                else
+                {
+                    item.SetText(1, $"{row.ObservedWallTimeMilliseconds:0.###} ms");
+                    item.SetText(2, row.Calls.ToString());
+                    item.SetText(3, $"{row.AverageWallTimeMilliseconds:0.###} ms");
+                    item.SetText(4, $"{row.MaximumWallTimeMilliseconds:0.###} ms");
+                }
             }
         }
-        _selectedBatchTree.Visible = true;
-        _resultTabs.CurrentTab = _selectedBatchTree.GetIndex();
+        _selectedBatchTab.Visible = true;
+        _resultTabs.CurrentTab = _selectedBatchTab.GetIndex();
     }
 
     private void OnSelectedBatchGuiInput(InputEvent inputEvent)
@@ -1105,9 +1172,102 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         while ((item = _selectedBatchTree.GetNextSelected(item)) != null)
         {
             var name = item.GetMetadata(0).AsString();
-            if (!string.IsNullOrEmpty(name)) names.Add(name);
+            if (string.IsNullOrEmpty(name)) continue;
+            if (name.StartsWith(GroupMetadataPrefix, StringComparison.Ordinal))
+            {
+                for (var child = item.GetFirstChild(); child != null; child = child.GetNext())
+                {
+                    var member = child.GetMetadata(0).AsString();
+                    if (!string.IsNullOrEmpty(member)) names.Add(member);
+                }
+            }
+            else names.Add(name);
         }
         return names;
+    }
+
+    private const string GroupMetadataPrefix = "group:";
+    private readonly HashSet<string> _expandedGroups = new(StringComparer.Ordinal);
+
+    private sealed record TimelineRowGroup(string Name, long Samples, double Share, long Calls,
+        double WallMilliseconds, double MaximumMilliseconds, IReadOnlyList<ResultRow> Rows);
+
+    internal static string GroupNameForCall(string callName)
+    {
+        var open = callName.IndexOf('(');
+        var scope = open >= 0 ? callName[..open] : callName;
+        var split = scope.LastIndexOf('.');
+        return split > 0 ? scope[..split] : callName;
+    }
+
+    private static string MemberDisplayName(string groupName, string callName) =>
+        callName.Length > groupName.Length + 1 &&
+        callName.StartsWith(groupName + ".", StringComparison.Ordinal)
+            ? callName[(groupName.Length + 1)..]
+            : callName;
+
+    private static IReadOnlyList<TimelineRowGroup> GroupTimelineRows(IReadOnlyList<ResultRow> rows) =>
+        rows.Select((row, order) => (Row: row, Order: order))
+            .GroupBy(entry => GroupNameForCall(entry.Row.Name), StringComparer.Ordinal)
+            .OrderBy(group => group.Min(entry => entry.Order))
+            .Select(group => new TimelineRowGroup(group.Key,
+                group.Sum(entry => entry.Row.Samples),
+                group.Sum(entry => entry.Row.EstimatedStackFrameShare),
+                group.Sum(entry => entry.Row.Calls),
+                group.Sum(entry => entry.Row.ObservedWallTimeMilliseconds),
+                group.Max(entry => entry.Row.MaximumWallTimeMilliseconds),
+                group.Select(entry => entry.Row).ToArray()))
+            .ToArray();
+
+    private void SetAllGroupsCollapsed(bool collapsed)
+    {
+        var root = _selectedBatchTree?.GetRoot();
+        if (root == null) return;
+        for (var group = root.GetFirstChild(); group != null; group = group.GetNext())
+        {
+            group.Collapsed = collapsed;
+            var name = group.GetMetadata(0).AsString();
+            if (!name.StartsWith(GroupMetadataPrefix, StringComparison.Ordinal)) continue;
+            var groupName = name[GroupMetadataPrefix.Length..];
+            if (collapsed) _expandedGroups.Remove(groupName);
+            else _expandedGroups.Add(groupName);
+        }
+    }
+
+    private void OnExpandAllPressed() => SetAllGroupsCollapsed(false);
+
+    private void OnCollapseAllPressed() => SetAllGroupsCollapsed(true);
+
+    private void OnBatchGroupCollapsedToggled(TreeItem item)
+    {
+        var name = item?.GetMetadata(0).AsString() ?? "";
+        if (!name.StartsWith(GroupMetadataPrefix, StringComparison.Ordinal)) return;
+        var groupName = name[GroupMetadataPrefix.Length..];
+        if (item.Collapsed) _expandedGroups.Remove(groupName);
+        else _expandedGroups.Add(groupName);
+    }
+
+    internal void UpdateInstanceOptions(IReadOnlyList<CsProfilerInstanceOption> instances, int selectedSessionId)
+    {
+        if (_instanceSelector == null) return;
+        _updatingInstanceSelector = true;
+        _instanceSelector.Clear();
+        var selectedIndex = -1;
+        for (var index = 0; index < instances.Count; index++)
+        {
+            _instanceSelector.AddItem(instances[index].Label, instances[index].SessionId);
+            _instanceSelector.SetItemMetadata(index, instances[index].SessionId);
+            if (instances[index].SessionId == selectedSessionId) selectedIndex = index;
+        }
+        if (selectedIndex >= 0) _instanceSelector.Selected = selectedIndex;
+        _instanceSelector.Visible = instances.Count > 1;
+        _updatingInstanceSelector = false;
+    }
+
+    private void OnInstanceSelectorChanged(long index)
+    {
+        if (_updatingInstanceSelector || _instanceSelector == null || index < 0) return;
+        InstanceSelected?.Invoke(_instanceSelector.GetItemMetadata((int)index).AsInt32());
     }
 
     private void CopyTimelineRows(IReadOnlySet<string> selectedNames)

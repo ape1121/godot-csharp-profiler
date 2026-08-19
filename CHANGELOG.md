@@ -2,6 +2,21 @@
 
 All notable changes use [Keep a Changelog](https://keepachangelog.com/) conventions.
 
+## [0.2.0] - 2026-08-19
+
+### Added
+
+- Instance selector in the toolbar: when Run Multiple Instances (or any extra debugger-attached
+  game process) is active, a dropdown lists every attached instance (name, PID, editor marker)
+  and switches the profiled target; selection survives session churn and falls back automatically
+  when the chosen instance exits.
+- Selected-batch calls are grouped under their declaring type (for example `SaveManager`,
+  `SaveSlotRepository`) with aggregated samples/share or wall time/calls/max on the group row,
+  collapsible arrows, and Expand all / Collapse all buttons. Expansion state persists across
+  batch re-renders.
+- Selecting a group row copies all of its member calls; individual member rows keep the concise
+  plain-line copy format.
+
 ## [0.1.1] - 2026-08-17
 
 ### Fixed
@@ -37,5 +52,6 @@ All notable changes use [Keep a Changelog](https://keepachangelog.com/) conventi
 - Setup edits only an ownership-marked top-level project import, rejects unsafe path indirection, preserves unrelated project content, and never edits `NuGet.Config`.
 - Automatic installation requires a fresh reviewed preview and explicit confirmation; disable/uninstall remove only addon-owned configuration.
 
+[0.2.0]: https://github.com/ape1121/godot-csharp-profiler/releases/tag/v0.2.0
 [0.1.1]: https://github.com/ape1121/godot-csharp-profiler/releases/tag/v0.1.1
 [0.1.0]: https://github.com/ape1121/godot-csharp-profiler/releases/tag/v0.1.0
