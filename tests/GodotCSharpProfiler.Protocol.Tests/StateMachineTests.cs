@@ -28,7 +28,7 @@ public sealed class StateMachineTests
         Assert.True(machine.AcceptBatch(Batch(1, 2)));
         Assert.True(machine.Stop(new StopMessage(ProtocolVersion.Major, ProtocolVersion.Minor, Token, 1, 3, Fingerprint), "editor-A"));
         Assert.Equal(CaptureState.Stopping, machine.State);
-        Assert.True(machine.AcceptState(State(1, CaptureState.Complete, 4, CaptureCompleteness.Complete)));
+        Assert.True(machine.AcceptState(State(1, CaptureState.Complete, 3, CaptureCompleteness.Complete)));
         Assert.Equal(CaptureState.Complete, machine.State);
         Assert.Null(machine.LeaseOwner);
     }
@@ -87,7 +87,7 @@ public sealed class StateMachineTests
         Assert.True(machine.AcceptBatch(Batch(1, 2, Fingerprint, 10, 2, 1, 3)));
         Assert.Equal(new QualityCounters(10, 2, 1, 3), machine.Quality);
         Assert.True(machine.Stop(new StopMessage(ProtocolVersion.Major, ProtocolVersion.Minor, Token, 1, 3, Fingerprint), "owner"));
-        Assert.True(machine.AcceptState(State(1, CaptureState.Partial, 4,
+        Assert.True(machine.AcceptState(State(1, CaptureState.Partial, 3,
             CaptureCompleteness.Partial, PartialReason.BufferOverflow, new QualityCounters(10, 2, 1, 3))));
         Assert.Equal(CaptureState.Partial, machine.State);
         Assert.Equal(PartialReason.BufferOverflow, machine.PartialReason);

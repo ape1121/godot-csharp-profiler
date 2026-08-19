@@ -115,9 +115,10 @@ public sealed class CaptureStateMachine
             if (LeaseOwner is not null) State = CaptureState.Busy;
             return false;
         }
-        if (State != CaptureState.Capturing || !MatchesCapture(message) || message.Sequence != Sequence + 1)
+        // Stop is sequence-tolerant (generation/fingerprint/owner scoped) and does not consume a
+        // sequence slot, so in-flight batches stay contiguous for the receiving editor.
+        if (State != CaptureState.Capturing || !MatchesCapture(message))
             return false;
-        Sequence = message.Sequence;
         State = CaptureState.Stopping;
         return true;
     }

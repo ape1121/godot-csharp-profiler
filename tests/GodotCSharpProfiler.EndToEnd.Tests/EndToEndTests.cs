@@ -147,6 +147,34 @@ public sealed class EndToEndTests
     }
 
     [Fact]
+    public void Stop_sent_while_batches_are_in_flight_still_stops_the_runtime_immediately()
+    {
+        using var loop = new Loop();
+        loop.Handshake();
+        Assert.True(loop.Editor.Start(ModeConfiguration.Default));
+        loop.Pump();
+        Assert.Equal(CaptureState.Capturing, loop.Editor.Snapshot.State);
+
+        // The runtime emits a batch that the editor has NOT consumed yet, so the editor's
+        // sequence view is stale at the moment the user presses Stop.
+        loop.Backend.Pending.Add(new(CaptureSource.Sampling, false, false,
+            new QualityCounters(1, 0, 0, 0), [new(7, "Game.Tick", 4, 0)]));
+        loop.Runtime.Flush();
+        Assert.True(loop.Editor.Stop());
+        Assert.True(loop.Backend.IsActive);
+
+        // Deliver the stale-sequenced stop command first: the runtime must accept it and stop
+        // capturing right away instead of waiting for game exit or Clear.
+        while (loop.EditorOutput.TryDequeue(out var command))
+            Assert.True(loop.Runtime.Receive(command, "editor-owner"));
+        Assert.False(loop.Backend.IsActive);
+
+        loop.Pump();
+        Assert.Equal(CaptureState.Complete, loop.Editor.Snapshot.State);
+        Assert.Equal("Game.Tick", loop.Editor.CompletedResults.Groups.Single().Rows.Single().Name);
+    }
+
+    [Fact]
     public void Production_source_has_no_legacy_control_or_frame_messages()
     {
         var root = FindRepositoryRoot();

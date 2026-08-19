@@ -107,7 +107,7 @@ public sealed class EditorIntegrationTests
         Assert.Equal(("Game.Tick", 4L, 100.0, 0.0),
             (pointRow.Name, pointRow.Samples, pointRow.EstimatedStackFrameShare, pointRow.ObservedWallTimeMilliseconds));
         Assert.True(editor.Stop());
-        Assert.True(editor.Receive(State(CaptureState.Complete, 4, QualityCounters.Zero)));
+        Assert.True(editor.Receive(State(CaptureState.Complete, 3, QualityCounters.Zero)));
         var row = Assert.Single(editor.CompletedResults.Groups.Single().Rows);
         Assert.Equal("Game.Tick", row.Name);
         Assert.Equal(4, row.Samples);
@@ -475,7 +475,7 @@ public sealed class EditorIntegrationTests
         Assert.True(editor.Receive(Batch(CaptureSource.Sampling, 2, [new(1, "Game.Tick", 3, 0)])));
         Assert.True(editor.Receive(Batch(CaptureSource.ManualSpans, 3, [new(1, "Gameplay/Tick", 2_000_000, 1)])));
         Assert.True(editor.Stop());
-        Assert.True(editor.Receive(State(CaptureState.Complete, 5, new QualityCounters(2, 0, 0, 0))));
+        Assert.True(editor.Receive(State(CaptureState.Complete, 4, new QualityCounters(2, 0, 0, 0))));
 
         Assert.Equal("Game.Tick", editor.CompletedResults.Groups.Single(x => x.Source == CaptureSource.Sampling).Rows.Single().Name);
         Assert.Equal("Gameplay/Tick", editor.CompletedResults.Groups.Single(x => x.Source == CaptureSource.ManualSpans).Rows.Single().Name);
@@ -500,7 +500,7 @@ public sealed class EditorIntegrationTests
         Assert.Equal(before, editor.Snapshot);
 
         Assert.True(editor.Stop());
-        Assert.True(editor.Receive(State(CaptureState.Complete, 4, before.Quality)));
+        Assert.True(editor.Receive(State(CaptureState.Complete, 3, before.Quality)));
         var rows = editor.CompletedResults.Groups.Single().Rows;
         Assert.Single(rows);
         Assert.Equal("Game.Tick", rows[0].Name);
@@ -518,7 +518,7 @@ public sealed class EditorIntegrationTests
         var quality = new QualityCounters(10, 2, 3, 4);
         Assert.True(editor.Receive(Batch(CaptureSource.Sampling, 2, [new(1, "Game.Tick", 5, 0)], quality)));
         Assert.True(editor.Stop());
-        Assert.True(editor.Receive(State(CaptureState.Complete, 4, QualityCounters.Zero)));
+        Assert.True(editor.Receive(State(CaptureState.Complete, 3, QualityCounters.Zero)));
         Assert.Equal(quality, editor.Snapshot.Quality);
         Assert.Equal(5, editor.CompletedResults.Truncated);
     }
