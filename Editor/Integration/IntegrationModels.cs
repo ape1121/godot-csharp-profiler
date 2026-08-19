@@ -198,10 +198,12 @@ public sealed class EditorCaptureCoordinator
 
     private bool SendStop()
     {
-        var sequence = checked(snapshot.Sequence + 1);
+        // Stop must not consume a shared-stream sequence slot: batches may be in flight, and the
+        // runtime validates Stop by generation/fingerprint/owner rather than exact sequence. Keeping
+        // the local sequence untouched keeps in-flight batches and the terminal state contiguous.
         send(StrictWireAdapter.Serialize(new StopMessage(ProtocolVersion.Major, ProtocolVersion.Minor,
-            snapshot.RuntimeToken!, snapshot.Generation, sequence, snapshot.Fingerprint!)));
-        snapshot = snapshot with { State = CaptureState.Stopping, Sequence = sequence };
+            snapshot.RuntimeToken!, snapshot.Generation, checked(snapshot.Sequence + 1), snapshot.Fingerprint!)));
+        snapshot = snapshot with { State = CaptureState.Stopping };
         SnapshotChanged?.Invoke(snapshot);
         return true;
     }

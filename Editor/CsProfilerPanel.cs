@@ -75,7 +75,6 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private bool _updatingInstanceSelector;
     private Button _expandAllButton;
     private Button _collapseAllButton;
-    private VBoxContainer _selectedBatchTab;
     private Label _statsLabel;
     private Label _performanceLabel;
     private OptionButton _samplingFilter;
@@ -153,6 +152,10 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             new CaptureTimelinePoint(7, CaptureSource.Sampling, 17, 17, rows)
         ]));
         RenderSelectedBatch(_protocolTimeline.Points[0]);
+        var inlineGroupControls = _expandAllButton.GetParent() == _copyButton.GetParent() &&
+                                  _expandAllButton.GetParent() == _startButton.GetParent() &&
+                                  !_expandAllButton.Disabled && !_collapseAllButton.Disabled &&
+                                  _selectedBatchTree.GetParent() == _resultTabs;
         var group = _selectedBatchTree.GetRoot()?.GetFirstChild();
         var groupedTree = group != null && group.GetMetadata(0).AsString() == "group:Game" &&
                           group.GetText(1) == "17" && group.GetChildCount() == 2 &&
@@ -187,7 +190,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         return _startSignalInvocations == 1 && _stopSignalInvocations == 1 &&
                _optionsSignalInvocations == 1 && _settingsPopup.Visible && automaticSelected && samplingSelected &&
                allManaged && projectOnly && outputEnabled && groupedTree && collapsedAll && expandedAll &&
-               simpleMultiCopy && instanceListShown && instanceSwitchRequested && instanceListHidden &&
+               inlineGroupControls && simpleMultiCopy && instanceListShown && instanceSwitchRequested && instanceListHidden &&
                timelineExported && redundantTextRemoved &&
                _performanceLabel.Text == "Flush-frame timing unavailable" &&
                _settingsPopup.FindChildren("*", "Control", recursive: true, owned: false).Count >= 10;
@@ -307,6 +310,12 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             new Callable(this, nameof(OnFrameSelectorChanged)));
         toolbar.AddChild(_frameSelector);
         toolbar.AddChild(_copyButton);
+        _expandAllButton = new Button { Text = "⊞", Disabled = true, TooltipText = "Expand all call groups" };
+        _expandAllButton.Connect(BaseButton.SignalName.Pressed, new Callable(this, nameof(OnExpandAllPressed)));
+        toolbar.AddChild(_expandAllButton);
+        _collapseAllButton = new Button { Text = "⊟", Disabled = true, TooltipText = "Collapse all call groups" };
+        _collapseAllButton.Connect(BaseButton.SignalName.Pressed, new Callable(this, nameof(OnCollapseAllPressed)));
+        toolbar.AddChild(_collapseAllButton);
 
         _graph = new CsProfilerFrameGraph { SizeFlagsVertical = SizeFlags.ShrinkBegin };
         _graph.Connect(CsProfilerFrameGraph.SignalName.FrameClicked,
@@ -342,23 +351,9 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _tree.Connect(Tree.SignalName.ItemCollapsed, new Callable(this, nameof(OnItemCollapsed)));
         _tree.Connect(Control.SignalName.GuiInput, new Callable(this, nameof(OnTreeGuiInput)));
         _resultTabs.AddChild(_tree);
-        _selectedBatchTab = new VBoxContainer
-        {
-            Name = "Selected batch",
-            SizeFlagsVertical = SizeFlags.ExpandFill,
-            CustomMinimumSize = Vector2.Zero
-        };
-        var batchToolbar = new HBoxContainer();
-        _expandAllButton = new Button { Text = "Expand all", TooltipText = "Expand every group" };
-        _expandAllButton.Connect(BaseButton.SignalName.Pressed, new Callable(this, nameof(OnExpandAllPressed)));
-        batchToolbar.AddChild(_expandAllButton);
-        _collapseAllButton = new Button { Text = "Collapse all", TooltipText = "Collapse every group" };
-        _collapseAllButton.Connect(BaseButton.SignalName.Pressed, new Callable(this, nameof(OnCollapseAllPressed)));
-        batchToolbar.AddChild(_collapseAllButton);
-        _selectedBatchTab.AddChild(batchToolbar);
         _selectedBatchTree = new Tree
         {
-            Name = "Selected batch calls",
+            Name = "Selected batch",
             SizeFlagsVertical = SizeFlags.ExpandFill,
             CustomMinimumSize = Vector2.Zero,
             Columns = 3,
@@ -374,8 +369,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             new Callable(this, nameof(OnBatchGroupCollapsedToggled)));
         _selectedBatchTree.Connect(Control.SignalName.GuiInput,
             new Callable(this, nameof(OnSelectedBatchGuiInput)));
-        _selectedBatchTab.AddChild(_selectedBatchTree);
-        _resultTabs.AddChild(_selectedBatchTab);
+        _resultTabs.AddChild(_selectedBatchTree);
         _callContextMenu = new PopupMenu();
         _callContextMenu.AddItem("Copy call", 0);
         _callContextMenu.Connect(PopupMenu.SignalName.IdPressed,
@@ -754,9 +748,10 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _samplingResultRowsForTests = groups.Where(item => !item.IsCrossSourceTotal &&
             item.Source == CaptureSource.Sampling).Sum(item => item.Rows.Count);
         foreach (var child in _resultTabs.GetChildren())
-            if (!ReferenceEquals(child, _tree) && !ReferenceEquals(child, _selectedBatchTab)) child.QueueFree();
+            if (!ReferenceEquals(child, _tree) && !ReferenceEquals(child, _selectedBatchTree)) child.QueueFree();
         _tree.Visible = _frames.Count > 0;
-        _selectedBatchTab.Visible = _protocolTimeline.Points.Count > 0;
+        _selectedBatchTree.Visible = _protocolTimeline.Points.Count > 0;
+        SyncGroupControls();
         foreach (var group in groups.Where(item => !item.IsCrossSourceTotal))
         {
             var tree = new Tree { Name = group.Title, Columns = group.Columns.Count,
@@ -978,6 +973,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         _tree?.Clear();
         _selectedBatchTree?.Clear();
         if (_selectedBatchTree != null) _selectedBatchTree.Visible = false;
+        SyncGroupControls();
         if (_copyButton != null)
             _copyButton.Disabled = true;
         _updatingSelector = true;
@@ -1140,8 +1136,18 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
                 }
             }
         }
-        _selectedBatchTab.Visible = true;
-        _resultTabs.CurrentTab = _selectedBatchTab.GetIndex();
+        _selectedBatchTree.Visible = true;
+        _resultTabs.CurrentTab = _selectedBatchTree.GetIndex();
+        SyncGroupControls();
+    }
+
+    // Expand/collapse-all only act on the grouped batch tree; keep them inert (not hidden, to avoid
+    // toolbar reflow) whenever no grouped rows exist.
+    private void SyncGroupControls()
+    {
+        var hasGroups = _selectedBatchTree?.GetRoot()?.GetChildCount() > 0;
+        if (_expandAllButton != null) _expandAllButton.Disabled = !hasGroups;
+        if (_collapseAllButton != null) _collapseAllButton.Disabled = !hasGroups;
     }
 
     private void OnSelectedBatchGuiInput(InputEvent inputEvent)

@@ -2,6 +2,25 @@
 
 All notable changes use [Keep a Changelog](https://keepachangelog.com/) conventions.
 
+## [0.2.1] - 2026-08-19
+
+### Fixed
+
+- Stop now takes effect immediately while the game is still running. Previously the stop command
+  was rejected by the runtime whenever result batches were in flight (its sequence number went
+  stale), so capture continued until the game exited or Clear was pressed. Stop commands are now
+  validated by generation, fingerprint, and lease owner with a lag-tolerant sequence bound, and no
+  longer consume a protocol sequence slot.
+- Switching back to a single instance after profiling multiple instances no longer leaves the
+  panel bound to a dead instance preference; a preference that can no longer be honored is
+  dropped instead of sticking until an editor restart.
+
+### Changed
+
+- Expand all / Collapse all moved from a separate row above the batch tree into the main toolbar
+  as compact icon buttons (⊞/⊟) at the right of Copy, so the timeline no longer gets pushed up.
+  The buttons disable when no grouped batch is shown.
+
 ## [0.2.0] - 2026-08-19
 
 ### Added
@@ -52,6 +71,7 @@ All notable changes use [Keep a Changelog](https://keepachangelog.com/) conventi
 - Setup edits only an ownership-marked top-level project import, rejects unsafe path indirection, preserves unrelated project content, and never edits `NuGet.Config`.
 - Automatic installation requires a fresh reviewed preview and explicit confirmation; disable/uninstall remove only addon-owned configuration.
 
+[0.2.1]: https://github.com/ape1121/godot-csharp-profiler/releases/tag/v0.2.1
 [0.2.0]: https://github.com/ape1121/godot-csharp-profiler/releases/tag/v0.2.0
 [0.1.1]: https://github.com/ape1121/godot-csharp-profiler/releases/tag/v0.1.1
 [0.1.0]: https://github.com/ape1121/godot-csharp-profiler/releases/tag/v0.1.0

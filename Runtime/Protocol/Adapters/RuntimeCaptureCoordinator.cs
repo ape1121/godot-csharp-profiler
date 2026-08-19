@@ -133,10 +133,13 @@ public sealed class RuntimeCaptureCoordinator : IDisposable
     private bool Stop(StopMessage message, string owner)
     {
         if (_configuration is null || _owner is null || !string.Equals(_owner, owner, StringComparison.Ordinal) ||
-            message.Generation != _generation || message.Sequence != _sequence + 1 ||
+            message.Generation != _generation ||
             !string.Equals(message.Fingerprint, _configuration.Fingerprint, StringComparison.Ordinal)) return false;
-        // The stop command consumes its sequence; emitted final batches continue after it.
-        _sequence = message.Sequence;
+        // Stop is lag-tolerant: batches emitted after the editor sent the command make its sequence
+        // view stale, so any sequence in [2, _sequence + 1] is a valid stop for this capture (the
+        // editor has at least seen the Capturing state, sequence 1). Sequences ahead of the stream
+        // are still rejected, and Stop does not consume a slot; final batches continue the stream.
+        if (message.Sequence < 2 || message.Sequence > _sequence + 1) return false;
         StopOwned(sendTerminal: true, PartialReason.None);
         return true;
     }

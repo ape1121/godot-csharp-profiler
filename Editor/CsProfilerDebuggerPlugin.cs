@@ -297,8 +297,12 @@ internal sealed class CsProfilerSessionRouterState
     public CsProfilerRouteChange Reconcile(Func<int, bool> isActive)
     {
         var previous = SelectedSessionId;
-        var next = _preferredSessionId >= 0 && isActive(_preferredSessionId) &&
-                   _identities.ContainsKey(_preferredSessionId)
+        // A preference that can no longer be honored is dropped permanently: debugger session ids
+        // are reused across play-mode reruns, so a stale preference could silently bind a future
+        // unrelated instance (or keep routing at a dead session and blank the panel).
+        if (_preferredSessionId >= 0 && (!isActive(_preferredSessionId) || !_identities.ContainsKey(_preferredSessionId)))
+            _preferredSessionId = -1;
+        var next = _preferredSessionId >= 0
             ? _preferredSessionId
             : _identities.Where(pair => isActive(pair.Key)).OrderByDescending(pair => pair.Value.EditorAttached)
                 .ThenBy(pair => pair.Key).Select(pair => pair.Key).FirstOrDefault(-1);
@@ -307,7 +311,11 @@ internal sealed class CsProfilerSessionRouterState
         return new(previous != next, previous, next, identity);
     }
     public void Clear() { _identities.Clear(); _preferredSessionId = -1; SelectedSessionId = -1; }
-    public void Forget(int sessionId) => _identities.Remove(sessionId);
+    public void Forget(int sessionId)
+    {
+        _identities.Remove(sessionId);
+        if (sessionId == _preferredSessionId) _preferredSessionId = -1;
+    }
 }
 #else
 public partial class CsProfilerDebuggerPlugin : Godot.Node { }
