@@ -172,12 +172,37 @@ public sealed class RuntimeCaptureCoordinatorTests
         await backend.StopEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
         backend.StopRelease.Set();
         await backend.StopExited.Task.WaitAsync(TimeSpan.FromSeconds(2));
-        await Task.Delay(10);
+        await WaitUntilAsync(() => backend.LastStopTask?.IsCompleted == true, TimeSpan.FromSeconds(2));
 
         Assert.True(runtime.Receive(Reset(4, requestId), "owner"));
         Assert.Single(transport.Parsed.OfType<ResetAckMessage>());
         Assert.True(runtime.Receive(Reset(4, requestId), "owner"));
         Assert.Equal(2, transport.Parsed.OfType<ResetAckMessage>().Count());
+    }
+
+    [Fact]
+    public async Task FaultedInactiveResetCompletionObservedByExactRetryEmitsOneAcknowledgement()
+    {
+        var (runtime, transport, backend) = Runtime();
+        runtime.Connect();
+        Assert.True(runtime.Receive(Configure(4, CaptureModes.Sampling), "owner"));
+        Assert.True(runtime.Receive(Start(4), "owner"));
+        backend.BlockStop = true;
+        backend.StopFailure = new InvalidOperationException("inactive cleanup failure");
+        backend.BecomeInactiveOnStopFailure = true;
+        const string requestId = "11111111111111111111111111111111";
+
+        Assert.True(runtime.Receive(Reset(4, requestId), "owner"));
+        await backend.StopEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        backend.StopRelease.Set();
+        await backend.StopExited.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await WaitUntilAsync(() => backend.LastStopTask?.IsCompleted == true, TimeSpan.FromSeconds(2));
+
+        Assert.True(runtime.Receive(Reset(4, requestId), "owner"));
+        Assert.Single(transport.Parsed.OfType<ResetAckMessage>());
+        Assert.True(runtime.Receive(Reset(4, requestId), "owner"));
+        Assert.Equal(2, transport.Parsed.OfType<ResetAckMessage>().Count());
+        Assert.Equal(1, backend.StopAttempts);
     }
 
     [Fact]
@@ -344,7 +369,35 @@ public sealed class RuntimeCaptureCoordinatorTests
         var batches = transport.Parsed.OfType<BatchMessage>().ToArray();
         Assert.Equal(7, batches.Length);
         Assert.All(batches, batch => Assert.InRange(batch.Methods.Count, 1, 4));
-        Assert.All(transport.Messages, message => Assert.True(StrictWireAdapter.MeasureBytes(message) <= ProtocolLimits.MaxPayloadBytes));
+        Assert.All(transport.Messages, message =>
+            Assert.True(WireJsonEnvelope.MeasureEncodedBytes(message) <= ProtocolLimits.MaxPayloadBytes));
+    }
+
+    [Fact]
+    public void EscapeHeavyBatchesObeyActualJsonEncodedBatchLimit()
+    {
+        var (runtime, transport, backend) = Runtime();
+        var escapeHeavy = string.Concat(Enumerable.Repeat("\"\\<>é", 100));
+        var quality = new QualityCounters(9_000_000_000_000_000_000, 8_000_000_000_000_000_000,
+            7_000_000_000_000_000_000, 6_000_000_000_000_000_000);
+        backend.Pending.Add(new(CaptureSource.ManualSpans, true, false, quality,
+            Enumerable.Range(0, 128).Select(i => new MethodSample(i, escapeHeavy, i, 1)).ToArray()));
+        runtime.Connect();
+        Assert.True(runtime.Receive(Configure(1, CaptureModes.ManualScopes, maxMethods: 128), "owner"));
+        Assert.True(runtime.Receive(Start(1), "owner"));
+
+        runtime.Flush();
+
+        var batches = transport.Messages.Where(message =>
+                new CaptureProtocolParser().TryParse(message, out var parsed, out _) && parsed is BatchMessage)
+            .ToArray();
+        var encoded = batches.Select(WireJsonEnvelope.MeasureEncodedBytes).ToArray();
+        Assert.True(encoded.Length > 1);
+        Assert.Contains(encoded, bytes => bytes > ProtocolLimits.MaxBatchBytes / 2);
+        Assert.All(encoded, bytes => Assert.InRange(bytes, 1, ProtocolLimits.MaxBatchBytes));
+        Assert.Equal(quality, transport.Parsed.OfType<BatchMessage>()
+            .Select(batch => batch.Quality)
+            .Aggregate(QualityCounters.Zero, (sum, delta) => sum.Add(delta)));
     }
 
     [Fact]
@@ -518,6 +571,16 @@ public sealed class RuntimeCaptureCoordinatorTests
     private static WireMap Reset(long generation, string requestId) =>
         StrictWireAdapter.Serialize(new ResetMessage(ProtocolVersion.Major, ProtocolVersion.Minor, Token, generation, requestId));
 
+    private static async Task WaitUntilAsync(Func<bool> predicate, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (!predicate())
+        {
+            Assert.True(DateTime.UtcNow < deadline, "Timed out waiting for asynchronous completion.");
+            await Task.Delay(1);
+        }
+    }
+
     private sealed class FakeTransport : IRuntimeCaptureTransport
     {
         public List<WireMap> Messages { get; } = [];
@@ -542,7 +605,9 @@ public sealed class RuntimeCaptureCoordinatorTests
         public Exception? StopFailure { get; set; }
         public bool StopDataIncomplete { get; set; }
         public bool RemainActiveAfterStop { get; set; }
+        public bool BecomeInactiveOnStopFailure { get; set; }
         public bool BlockStop { get; set; }
+        public Task<RuntimeCaptureStopResult>? LastStopTask { get; private set; }
         public TaskCompletionSource<bool> StopEntered { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         public ManualResetEventSlim StopRelease { get; } = new(false);
@@ -555,7 +620,7 @@ public sealed class RuntimeCaptureCoordinatorTests
             if (DrainFailure is not null) throw DrainFailure;
             var value = Pending.ToArray(); Pending.Clear(); return value;
         }
-        public Task<RuntimeCaptureStopResult> StopAsync() => BlockStop
+        public Task<RuntimeCaptureStopResult> StopAsync() => LastStopTask = BlockStop
             ? Task.Run(() => new RuntimeCaptureStopResult(Stop(), StopDataIncomplete))
             : Task.FromResult(new RuntimeCaptureStopResult(Stop(), StopDataIncomplete));
 
@@ -570,6 +635,7 @@ public sealed class RuntimeCaptureCoordinatorTests
             }
             if (StopFailure is not null)
             {
+                if (BecomeInactiveOnStopFailure) IsActive = false;
                 StopExited.TrySetResult(true);
                 throw StopFailure;
             }

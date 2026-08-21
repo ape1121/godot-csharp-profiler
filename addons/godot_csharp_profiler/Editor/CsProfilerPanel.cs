@@ -954,7 +954,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
                     item.SetText(1, $"{row.ObservedWallTimeMilliseconds:0.###} ms");
                     item.SetText(2, row.Calls.ToString());
                     item.SetText(3, $"{row.AverageWallTimeMilliseconds:0.###} ms");
-                    item.SetText(4, $"{row.MaximumWallTimeMilliseconds:0.###} ms");
+                    item.SetText(4, $"{row.LargestBatchAverageWallTimeMilliseconds:0.###} ms");
                 }
             }
             _resultTabs.AddChild(tree);
@@ -994,7 +994,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             builder.AppendLine(group.Source.ToString());
             builder.AppendLine(group.Source == CaptureSource.Sampling
                 ? "Name,Samples,Estimated stack-frame %"
-                : "Name,Wall time ms,Calls,Average wall time ms,Maximum wall time ms");
+                : "Name,Wall time ms,Calls,Average wall time ms,Largest batch average ms");
             foreach (var row in group.Rows)
             {
                 builder.Append(row.Name.Replace(',', ';')).Append(',');
@@ -1003,7 +1003,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
                 else
                     builder.Append(row.ObservedWallTimeMilliseconds).Append(',').Append(row.Calls)
                         .Append(',').Append(row.AverageWallTimeMilliseconds).Append(',')
-                        .Append(row.MaximumWallTimeMilliseconds);
+                        .Append(row.LargestBatchAverageWallTimeMilliseconds);
                 builder.AppendLine();
             }
         }
@@ -1217,7 +1217,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             var point = _protocolTimeline.Points[index];
             RenderSelectedBatch(point);
             _statsLabel.Text = point.Source == CaptureSource.Sampling
-                ? RuntimeStatus($"{point.Value} statistical samples | {point.Rows.Count} methods | batch #{point.Sequence}")
+                ? RuntimeStatus($"{point.Value} stack-frame observations | {point.Rows.Count} methods | batch #{point.Sequence}")
                 : RuntimeStatus($"{point.Value / 1_000_000.0:0.###} ms observed exact-span time | " +
                     $"{point.Observations} calls | batch #{point.Sequence}");
             return;
@@ -1310,7 +1310,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
                     item.SetText(1, $"{row.ObservedWallTimeMilliseconds:0.###} ms");
                     item.SetText(2, row.Calls.ToString());
                     item.SetText(3, $"{row.AverageWallTimeMilliseconds:0.###} ms");
-                    item.SetText(4, $"{row.MaximumWallTimeMilliseconds:0.###} ms");
+                    item.SetText(4, $"{row.LargestBatchAverageWallTimeMilliseconds:0.###} ms");
                 }
             }
         }
@@ -1399,7 +1399,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
                 group.Sum(entry => entry.Row.EstimatedStackFrameShare),
                 group.Sum(entry => entry.Row.Calls),
                 group.Sum(entry => entry.Row.ObservedWallTimeMilliseconds),
-                group.Max(entry => entry.Row.MaximumWallTimeMilliseconds),
+                group.Max(entry => entry.Row.LargestBatchAverageWallTimeMilliseconds),
                 group.Select(entry => entry.Row).ToArray()))
             .ToArray();
 

@@ -330,10 +330,10 @@ public sealed class ProfilerDockController
         double.IsFinite(row.EstimatedStackFrameShare) && row.EstimatedStackFrameShare >= 0 &&
         double.IsFinite(row.ObservedWallTimeMilliseconds) && row.ObservedWallTimeMilliseconds >= 0 &&
         double.IsFinite(row.AverageWallTimeMilliseconds) && row.AverageWallTimeMilliseconds >= 0 &&
-        double.IsFinite(row.MaximumWallTimeMilliseconds) && row.MaximumWallTimeMilliseconds >= 0 &&
+        double.IsFinite(row.LargestBatchAverageWallTimeMilliseconds) && row.LargestBatchAverageWallTimeMilliseconds >= 0 &&
         (source == CaptureSource.Sampling
             ? row.Calls == 0 && row.ObservedWallTimeMilliseconds == 0 && row.AverageWallTimeMilliseconds == 0 &&
-              row.MaximumWallTimeMilliseconds == 0
+              row.LargestBatchAverageWallTimeMilliseconds == 0
             : row.Samples == 0 && row.EstimatedStackFrameShare == 0);
 
     private static bool ValidQuality(QualityCounters value) => value.Observed >= 0 && value.Dropped >= 0 &&
@@ -520,7 +520,7 @@ public sealed class ProfilerDockController
     {
         CaptureSource.Sampling => ["Name", "Samples", "Estimated stack-frame %"],
         CaptureSource.AutomaticSpans or CaptureSource.ManualSpans =>
-            ["Name", "Wall time", "Calls", "Average wall time", "Maximum wall time"],
+            ["Name", "Wall time", "Calls", "Average wall time", "Largest batch average"],
         _ => ["Name"]
     };
 

@@ -82,6 +82,29 @@ public sealed class EditorIntegrationTests
     }
 
     [Fact]
+    public void SynchronousTerminalAcknowledgementDuringStopIsNotOverwrittenByStopping()
+    {
+        EditorCaptureCoordinator? editor = null;
+        editor = new EditorCaptureCoordinator("owner", payload =>
+        {
+            if (Parse(payload) is not StopMessage) return;
+            Assert.True(editor!.Receive(State(CaptureState.Complete, 2, QualityCounters.Zero)));
+        });
+        Assert.True(editor.Receive(StrictWireAdapter.Serialize(new HelloMessage(
+            ProtocolVersion.Major, ProtocolVersion.Minor, "runtime", "runtime", 4096))));
+        Assert.True(editor.Receive(StrictWireAdapter.Serialize(new CapabilitiesMessage(
+            ProtocolVersion.Major, ProtocolVersion.Minor, "runtime", 0,
+            CaptureModes.Sampling | CaptureModes.ManualScopes, false, 2_000_000, 4096, 4096, 8))));
+        Assert.True(editor.Start(TestConfiguration));
+        Assert.True(editor.Receive(State(CaptureState.Capturing, 1, QualityCounters.Zero)));
+
+        Assert.True(editor.Stop());
+
+        Assert.Equal(CaptureState.Complete, editor.Snapshot.State);
+        Assert.Null(editor.Snapshot.LeaseOwner);
+    }
+
+    [Fact]
     public void OrphanRecoveryPolicyIsSelectedRouteScopedAndResetBarriered()
     {
         var readyAtFour = Snapshot(CaptureState.Ready) with
@@ -567,7 +590,7 @@ public sealed class EditorIntegrationTests
         Assert.DoesNotContain("Samples", view.Last.ResultGroups[1].Columns);
         Assert.All(view.Last.ResultGroups, group => Assert.False(group.IsCrossSourceTotal));
         Assert.Equal(3.125, view.Last.ResultGroups[1].Rows[0].AverageWallTimeMilliseconds);
-        Assert.Equal(8.0, view.Last.ResultGroups[1].Rows[0].MaximumWallTimeMilliseconds);
+        Assert.Equal(8.0, view.Last.ResultGroups[1].Rows[0].LargestBatchAverageWallTimeMilliseconds);
     }
 
     [Fact]

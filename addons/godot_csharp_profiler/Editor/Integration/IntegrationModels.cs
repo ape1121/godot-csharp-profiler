@@ -57,7 +57,7 @@ public enum InstallerGate { Ready, PackageUnavailable, NeedsBuild, NeedsRestart,
 
 public sealed record ResultRow(string Name, long Samples, double EstimatedStackFrameShare, long Calls,
     double ObservedWallTimeMilliseconds, double AverageWallTimeMilliseconds,
-    double MaximumWallTimeMilliseconds);
+    double LargestBatchAverageWallTimeMilliseconds);
 public sealed record SourceResultGroup(CaptureSource Source, IReadOnlyList<ResultRow> Rows);
 public sealed record ProfilerResults(IReadOnlyList<SourceResultGroup> Groups, long Truncated)
 {
@@ -65,7 +65,10 @@ public sealed record ProfilerResults(IReadOnlyList<SourceResultGroup> Groups, lo
     public bool HasResults => Groups.Any(group => group.Rows.Count != 0);
 }
 
-/// <summary>A bounded recent-batch timeline. Values are samples for sampling and nanoseconds for exact spans.</summary>
+/// <summary>
+/// A bounded recent-batch timeline. Values are depth-weighted stack-frame observations for sampling
+/// and nanoseconds for exact spans.
+/// </summary>
 public sealed record CaptureTimelinePoint(
     long Sequence,
     CaptureSource Source,
@@ -308,10 +311,12 @@ public sealed class EditorCaptureCoordinator
         // Stop must not consume a shared-stream sequence slot: batches may be in flight, and the
         // runtime validates Stop by generation/fingerprint/owner rather than exact sequence. Keeping
         // the local sequence untouched keeps in-flight batches and the terminal state contiguous.
-        send(StrictWireAdapter.Serialize(new StopMessage(ProtocolVersion.Major, ProtocolVersion.Minor,
-            snapshot.RuntimeToken!, snapshot.Generation, checked(snapshot.Sequence + 1), snapshot.Fingerprint!)));
+        // Project Stopping before Send: in-process debugger transport can deliver and apply the
+        // terminal state reentrantly while the transport callback is still on this stack.
         snapshot = snapshot with { State = CaptureState.Stopping };
         SnapshotChanged?.Invoke(snapshot);
+        send(StrictWireAdapter.Serialize(new StopMessage(ProtocolVersion.Major, ProtocolVersion.Minor,
+            snapshot.RuntimeToken!, snapshot.Generation, checked(snapshot.Sequence + 1), snapshot.Fingerprint!)));
         return true;
     }
 

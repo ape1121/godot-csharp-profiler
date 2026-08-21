@@ -46,7 +46,29 @@ internal sealed class ManagedSamplingTraceEpoch : IDisposable
     internal Task<ManagedSamplingTraceEpochStopResult> StopAsync()
     {
         lock (_stopGate)
-            return _stopTask ??= StopCoreAsync();
+        {
+            if (_stopTask is not null) return _stopTask;
+            var completion = new TaskCompletionSource<ManagedSamplingTraceEpochStopResult>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            _stopTask = completion.Task;
+            _ = CompleteStopOperationAsync(completion);
+            return _stopTask;
+        }
+    }
+
+    // Publish the stable operation identity before RequestStopAsync can synchronously reenter.
+    private async Task CompleteStopOperationAsync(
+        TaskCompletionSource<ManagedSamplingTraceEpochStopResult> completion)
+    {
+        await Task.Yield();
+        try
+        {
+            completion.TrySetResult(await StopCoreAsync().ConfigureAwait(false));
+        }
+        catch (Exception exception)
+        {
+            completion.TrySetException(exception);
+        }
     }
 
     private async Task<ManagedSamplingTraceEpochStopResult> StopCoreAsync()
@@ -57,29 +79,38 @@ internal sealed class ManagedSamplingTraceEpoch : IDisposable
         catch (Exception exception)
         {
             stopFailure = exception;
-            AbortStreamOnce();
+            var abortFailure = AbortStreamOnce();
+            stopFailure ??= abortFailure;
         }
 
         if (acknowledged is not null)
         {
             if (await Task.WhenAny(acknowledged, Task.Delay(_gracePeriod)).ConfigureAwait(false) != acknowledged)
-                AbortStreamOnce();
+            {
+                var abortFailure = AbortStreamOnce();
+                stopFailure ??= abortFailure;
+            }
 
             try { await acknowledged.ConfigureAwait(false); }
             catch (Exception exception)
             {
-                stopFailure = exception;
-                AbortStreamOnce();
+                stopFailure ??= exception;
+                var abortFailure = AbortStreamOnce();
+                stopFailure ??= abortFailure;
             }
         }
 
         if (await Task.WhenAny(_processingTask, Task.Delay(_gracePeriod)).ConfigureAwait(false) != _processingTask)
-            AbortStreamOnce();
+        {
+            var abortFailure = AbortStreamOnce();
+            stopFailure ??= abortFailure;
+        }
 
         var processingFaulted = false;
         try { await _processingTask.ConfigureAwait(false); }
         catch { processingFaulted = true; }
-        DisposeControlOnce();
+        var disposeFailure = DisposeControlOnce();
+        stopFailure ??= disposeFailure;
         if (stopFailure is not null)
             System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(stopFailure).Throw();
         return new ManagedSamplingTraceEpochStopResult(
@@ -87,22 +118,29 @@ internal sealed class ManagedSamplingTraceEpoch : IDisposable
             processingFaulted);
     }
 
-    private void AbortStreamOnce()
+    private Exception? AbortStreamOnce()
     {
-        if (Interlocked.Exchange(ref _streamAborted, 1) == 0)
-            _control.AbortStream();
+        if (Interlocked.Exchange(ref _streamAborted, 1) != 0) return null;
+        try { _control.AbortStream(); }
+        catch (Exception exception) { return exception; }
+        return null;
     }
 
-    private void DisposeControlOnce()
+    private Exception? DisposeControlOnce()
     {
-        if (Interlocked.Exchange(ref _disposed, 1) == 0)
-            _control.Dispose();
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return null;
+        try { _control.Dispose(); }
+        catch (Exception exception) { return exception; }
+        return null;
     }
 
     public void Dispose()
     {
-        AbortStreamOnce();
-        DisposeControlOnce();
+        var failure = AbortStreamOnce();
+        var disposeFailure = DisposeControlOnce();
+        failure ??= disposeFailure;
+        if (failure is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
     }
 }
 

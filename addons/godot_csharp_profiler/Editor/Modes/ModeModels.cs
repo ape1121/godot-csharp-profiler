@@ -9,7 +9,7 @@ namespace Apeworks.GodotCSharpProfiler.Editor.Modes;
 public enum PrimaryMode { Sampling, AutomaticInstrumentation, None }
 public enum AutomaticBuildStatus { Ready, NeedsBuild, NeedsRestart, NoMatches, StaleBuild }
 public enum OverheadLevel { Low, Moderate, High }
-public enum ResultColumn { Name, Samples, EstimatedStackFrameShare, ObservedWallTime, Calls, AverageWallTime, MaximumWallTime, CpuTime }
+public enum ResultColumn { Name, Samples, EstimatedStackFrameShare, ObservedWallTime, Calls, AverageWallTime, LargestBatchAverageWallTime, CpuTime }
 
 public sealed record SamplingSettings(string IncludeAssemblies, string ExcludeAssemblies, long RequestedIntervalNanoseconds)
 {

@@ -35,6 +35,7 @@ public sealed class ManagedSamplingSession : IAsyncDisposable
     private readonly object _stopGate = new();
     private readonly Func<Action<ManagedSamplingTraceAcquisition>, ManagedSamplingTraceEpoch> _epochFactory;
     private readonly TimeSpan _startAdmissionTimeout;
+    private readonly Action? _beforeStartupTaskPublication;
     private readonly CancellationTokenSource _rotationCancellation = new();
     private ManagedSamplingTraceEpoch? _currentEpoch;
     private ManagedSamplingTraceAcquisition? _failedAcquisition;
@@ -68,12 +69,14 @@ public sealed class ManagedSamplingSession : IAsyncDisposable
     internal ManagedSamplingSession(
         SamplingOptions options,
         Func<Action<ManagedSamplingTraceAcquisition>, ManagedSamplingTraceEpoch>? epochFactory,
-        TimeSpan? startAdmissionTimeout = null)
+        TimeSpan? startAdmissionTimeout = null,
+        Action? beforeStartupTaskPublication = null)
     {
         _options = (options ?? throw new ArgumentNullException(nameof(options))).ValidateAndCopy();
         _aggregator = new SamplingAggregator(_options);
         _epochFactory = epochFactory ?? CreateProductionTraceEpoch;
         _startAdmissionTimeout = startAdmissionTimeout ?? StartAdmissionTimeout;
+        _beforeStartupTaskPublication = beforeStartupTaskPublication;
         if (_startAdmissionTimeout <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(startAdmissionTimeout));
     }
@@ -102,21 +105,25 @@ public sealed class ManagedSamplingSession : IAsyncDisposable
         await _lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            if (_hasStarted)
-                throw new InvalidOperationException("A managed sampling session instance can only be started once.");
-            Volatile.Write(ref _state, (int)ManagedSamplingSessionState.Starting);
-
-            if (Interlocked.CompareExchange(ref s_activeSession, this, null) is not null)
-                throw new InvalidOperationException("Another managed sampling session is already active.");
-            _processLease = ManagedSamplingProcessLease.TryAcquire();
-            if (_processLease is null)
+            lock (_stopGate)
             {
-                ReleaseGlobalOwnership();
-                throw new InvalidOperationException("Another managed sampling session is already active in this process.");
+                if (_hasStarted)
+                    throw new InvalidOperationException("A managed sampling session instance can only be started once.");
+                Volatile.Write(ref _state, (int)ManagedSamplingSessionState.Starting);
+
+                if (Interlocked.CompareExchange(ref s_activeSession, this, null) is not null)
+                    throw new InvalidOperationException("Another managed sampling session is already active.");
+                _processLease = ManagedSamplingProcessLease.TryAcquire();
+                if (_processLease is null)
+                {
+                    ReleaseGlobalOwnership();
+                    throw new InvalidOperationException("Another managed sampling session is already active in this process.");
+                }
+                _hasStarted = true;
+                _beforeStartupTaskPublication?.Invoke();
+                startupTask = Task.Run(() => AcquireTraceEpoch(cancellationToken), CancellationToken.None);
+                Volatile.Write(ref _startupTask, startupTask);
             }
-            _hasStarted = true;
-            startupTask = Task.Run(() => AcquireTraceEpoch(cancellationToken), CancellationToken.None);
-            Volatile.Write(ref _startupTask, startupTask);
         }
         catch
         {
@@ -161,19 +168,22 @@ public sealed class ManagedSamplingSession : IAsyncDisposable
         await _lifecycle.WaitAsync(CancellationToken.None).ConfigureAwait(false);
         try
         {
-            if (State != ManagedSamplingSessionState.Starting || cancellationToken.IsCancellationRequested)
+            lock (_stopGate)
             {
-                _ = BeginStartupCleanup(startupTask);
-                cancellationToken.ThrowIfCancellationRequested();
-                throw new InvalidOperationException("Managed sampling startup was stopped before completion.");
+                if (State != ManagedSamplingSessionState.Starting || cancellationToken.IsCancellationRequested)
+                {
+                    _ = BeginStartupCleanup(startupTask);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    throw new InvalidOperationException("Managed sampling startup was stopped before completion.");
+                }
+                _currentEpoch = epoch;
+                Volatile.Write(ref _startupTask, null);
+                Interlocked.Increment(ref _traceEpochCount);
+                Volatile.Write(ref _state, (int)ManagedSamplingSessionState.Running);
+                ScheduleRotation(epoch);
+                _cancellationRegistration = cancellationToken.Register(
+                    static state => _ = ((ManagedSamplingSession)state!).StopAsync(), this);
             }
-            _currentEpoch = epoch;
-            Volatile.Write(ref _startupTask, null);
-            Interlocked.Increment(ref _traceEpochCount);
-            Volatile.Write(ref _state, (int)ManagedSamplingSessionState.Running);
-            ScheduleRotation(epoch);
-            _cancellationRegistration = cancellationToken.Register(
-                static state => _ = ((ManagedSamplingSession)state!).StopAsync(), this);
         }
         finally
         {
@@ -188,8 +198,12 @@ public sealed class ManagedSamplingSession : IAsyncDisposable
             if (State == ManagedSamplingSessionState.Stopped) return Task.CompletedTask;
             var startupTask = Volatile.Read(ref _startupTask);
             if (startupTask is not null)
-                return _stopTask ??= CleanupStartupAsync(startupTask);
-            return _stopTask ??= StopCoreAsync();
+            {
+                if (State == ManagedSamplingSessionState.Starting)
+                    Volatile.Write(ref _state, (int)ManagedSamplingSessionState.Stopping);
+                return EnsureStopOperation(startupTask);
+            }
+            return EnsureStopOperation(null);
         }
     }
 
@@ -199,7 +213,37 @@ public sealed class ManagedSamplingSession : IAsyncDisposable
         {
             if (State == ManagedSamplingSessionState.Starting)
                 Volatile.Write(ref _state, (int)ManagedSamplingSessionState.Stopping);
-            return _stopTask ??= CleanupStartupAsync(startupTask);
+            return EnsureStopOperation(startupTask);
+        }
+    }
+
+    // Publish the stable stop identity before executing any cleanup that can synchronously
+    // reenter StopAsync through cancellation or a lease callback.
+    private Task EnsureStopOperation(Task<ManagedSamplingTraceEpoch>? startupTask)
+    {
+        if (_stopTask is not null) return _stopTask;
+        var completion = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _stopTask = completion.Task;
+        _ = CompleteStopOperationAsync(completion, startupTask);
+        return _stopTask;
+    }
+
+    private async Task CompleteStopOperationAsync(
+        TaskCompletionSource<object?> completion,
+        Task<ManagedSamplingTraceEpoch>? startupTask)
+    {
+        await Task.Yield();
+        try
+        {
+            if (startupTask is null)
+                await StopCoreAsync().ConfigureAwait(false);
+            else
+                await CleanupStartupAsync(startupTask).ConfigureAwait(false);
+            completion.TrySetResult(null);
+        }
+        catch (Exception exception)
+        {
+            completion.TrySetException(exception);
         }
     }
 
@@ -253,13 +297,15 @@ public sealed class ManagedSamplingSession : IAsyncDisposable
         ManagedSamplingTraceEpoch? epoch;
         ManagedSamplingTraceAcquisition? failedAcquisition;
         Task? failedAcquisitionCleanup;
+        CancellationTokenRegistration cancellationRegistration;
         await _lifecycle.WaitAsync().ConfigureAwait(false);
         try
         {
             if (State == ManagedSamplingSessionState.Stopped) return;
             Volatile.Write(ref _state, (int)ManagedSamplingSessionState.Stopping);
             _rotationCancellation.Cancel();
-            _cancellationRegistration.Dispose();
+            cancellationRegistration = _cancellationRegistration;
+            _cancellationRegistration = default;
             epoch = _currentEpoch;
             failedAcquisition = _failedAcquisition;
             failedAcquisitionCleanup = _failedAcquisitionCleanupTask;
@@ -268,6 +314,8 @@ public sealed class ManagedSamplingSession : IAsyncDisposable
         {
             _lifecycle.Release();
         }
+
+        await cancellationRegistration.DisposeAsync().ConfigureAwait(false);
 
         try
         {

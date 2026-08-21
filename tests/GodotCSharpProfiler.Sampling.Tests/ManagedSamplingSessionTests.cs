@@ -54,6 +54,23 @@ public sealed class ManagedSamplingSessionTests
         Assert.All(results, result => Assert.False(result.StreamAborted));
     }
 
+    [Fact]
+    public async Task ReentrantEpochStopObservesThePublishedSingleStopOperation()
+    {
+        var control = new FakeTraceEpochControl(acknowledgeOnStop: true);
+        using var epoch = new ManagedSamplingTraceEpoch(control, TimeSpan.FromSeconds(1));
+        Task<ManagedSamplingTraceEpochStopResult>? reentrantStop = null;
+        control.OnRequestStop = () => reentrantStop = epoch.StopAsync();
+
+        var stop = epoch.StopAsync();
+        var result = await stop.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Same(stop, reentrantStop);
+        Assert.Equal(1, control.StopCalls);
+        Assert.Equal(1, control.Disposals);
+        Assert.False(result.DataIncomplete);
+    }
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
@@ -83,6 +100,55 @@ public sealed class ManagedSamplingSessionTests
         Assert.Same(failure, thrown);
         Assert.True(control.ProcessExited);
         Assert.Equal(1, control.Aborts);
+        Assert.Equal(1, control.Disposals);
+    }
+
+    [Fact]
+    public async Task ThrowingAbortStillWaitsForParserQuiescenceAndDisposesControlOnce()
+    {
+        var stopFailure = new InvalidOperationException("StopTracing failed");
+        var abortFailure = new InvalidOperationException("stream abort failed");
+        var control = new FakeTraceEpochControl(
+            acknowledgeOnStop: false,
+            quiesceOnAbort: false,
+            stopFailure: stopFailure,
+            throwStopSynchronously: true,
+            abortFailure: abortFailure);
+        using var epoch = new ManagedSamplingTraceEpoch(control, TimeSpan.FromMilliseconds(20));
+
+        var stop = epoch.StopAsync();
+        await WaitUntilAsync(() => control.Aborts == 1, TimeSpan.FromSeconds(2));
+
+        Assert.False(stop.IsCompleted);
+        Assert.Equal(0, control.Disposals);
+        control.ReleaseProcessing();
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await stop.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Same(stopFailure, thrown);
+        Assert.True(control.ProcessExited);
+        Assert.Equal(1, control.Aborts);
+        Assert.Equal(1, control.Disposals);
+    }
+
+    [Fact]
+    public async Task ThrowingControlDisposeFaultsOnlyAfterParserQuiescenceAndRunsOnce()
+    {
+        var disposeFailure = new InvalidOperationException("control dispose failed");
+        var control = new FakeTraceEpochControl(
+            acknowledgeOnStop: true,
+            disposeFailure: disposeFailure);
+        using var epoch = new ManagedSamplingTraceEpoch(control, TimeSpan.FromSeconds(1));
+
+        var first = epoch.StopAsync();
+        var second = epoch.StopAsync();
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await first.WaitAsync(TimeSpan.FromSeconds(2)));
+
+        Assert.Same(first, second);
+        Assert.Same(disposeFailure, thrown);
+        Assert.True(control.ProcessExited);
+        Assert.Equal(1, control.StopCalls);
         Assert.Equal(1, control.Disposals);
     }
 
@@ -122,6 +188,69 @@ public sealed class ManagedSamplingSessionTests
 
         await replacement.StartAsync();
         await replacement.StopAsync();
+    }
+
+    [Fact]
+    public async Task StopDuringStartupCannotPublishAStoppingEpochAsRunning()
+    {
+        var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var control = new FakeTraceEpochControl(acknowledgeOnStop: true);
+        await using var session = new ManagedSamplingSession(new SamplingOptions(), () =>
+        {
+            entered.TrySetResult(true);
+            release.Task.GetAwaiter().GetResult();
+            return new ManagedSamplingTraceEpoch(control, TimeSpan.FromSeconds(1));
+        });
+
+        var start = Task.Run(() => session.StartAsync());
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var stop = session.StopAsync();
+        release.TrySetResult(true);
+
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await start.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Contains("stopped before completion", failure.Message, StringComparison.OrdinalIgnoreCase);
+        await stop.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(ManagedSamplingSessionState.Stopped, session.State);
+        Assert.Equal(1, control.StopCalls);
+        Assert.Equal(1, control.Disposals);
+    }
+
+    [Fact]
+    public async Task StopCannotPassStartingStateBeforeStartupTaskPublication()
+    {
+        var publicationEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var publicationRelease = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var control = new FakeTraceEpochControl(acknowledgeOnStop: true);
+        await using var session = new ManagedSamplingSession(
+            new SamplingOptions(),
+            reportAcquisition =>
+            {
+                var epoch = new ManagedSamplingTraceEpoch(control, TimeSpan.FromSeconds(1));
+                reportAcquisition(ManagedSamplingTraceAcquisition.FromEpoch(epoch));
+                return epoch;
+            },
+            beforeStartupTaskPublication: () =>
+            {
+                publicationEntered.TrySetResult(true);
+                publicationRelease.Task.GetAwaiter().GetResult();
+            });
+
+        var start = Task.Run(() => session.StartAsync());
+        await publicationEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var stop = Task.Run(session.StopAsync);
+        Assert.NotSame(stop, await Task.WhenAny(stop, Task.Delay(50)));
+        Assert.False(stop.IsCompleted);
+        publicationRelease.TrySetResult(true);
+
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await start.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Contains("stopped before completion", failure.Message, StringComparison.OrdinalIgnoreCase);
+        await stop.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(ManagedSamplingSessionState.Stopped, session.State);
+        Assert.Equal(1, control.StopCalls);
+        Assert.Equal(1, control.Disposals);
     }
 
     [Fact]
@@ -483,6 +612,96 @@ public sealed class ManagedSamplingSessionTests
     }
 
     [Fact]
+    public async Task ConcurrentCancellationAndExplicitStopCannotDeadlock()
+    {
+        if (Environment.GetEnvironmentVariable("GCSP_CANCELLATION_STOP_CHILD") == "1") return;
+        var resultPath = Path.Combine(Path.GetTempPath(),
+            "gcsp-cancellation-stop-" + Guid.NewGuid().ToString("N"));
+        var root = FindRepositoryRoot();
+        var project = Path.Combine(root, "tests", "GodotCSharpProfiler.Sampling.Tests",
+            "GodotCSharpProfiler.Sampling.Tests.csproj");
+        var configuration = new DirectoryInfo(AppContext.BaseDirectory).Parent?.Name ?? "Debug";
+        var dotnet = Environment.GetEnvironmentVariable("DOTNET_HOST_PATH");
+        if (string.IsNullOrWhiteSpace(dotnet))
+        {
+            var dotnetRoot = Environment.GetEnvironmentVariable("DOTNET_ROOT");
+            dotnet = string.IsNullOrWhiteSpace(dotnetRoot) ? "dotnet" :
+                Path.Combine(dotnetRoot, OperatingSystem.IsWindows() ? "dotnet.exe" : "dotnet");
+        }
+        var start = new ProcessStartInfo(dotnet)
+        {
+            WorkingDirectory = root,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        foreach (var argument in new[]
+                 {
+                     "test", project, "-c", configuration, "--no-build", "--no-restore",
+                     "--filter", "FullyQualifiedName~ConcurrentCancellationAndExplicitStopChildProbe",
+                     "--logger", "console;verbosity=minimal"
+                 })
+            start.ArgumentList.Add(argument);
+        start.Environment["GCSP_CANCELLATION_STOP_CHILD"] = "1";
+        start.Environment["GCSP_CANCELLATION_STOP_RESULT"] = resultPath;
+
+        using var process = Process.Start(start) ?? throw new InvalidOperationException("Could not start child testhost.");
+        var stdout = process.StandardOutput.ReadToEndAsync();
+        var stderr = process.StandardError.ReadToEndAsync();
+        try
+        {
+            await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(30));
+            Assert.True(process.ExitCode == 0,
+                $"Child cancellation/stop probe exited {process.ExitCode}.\n{await stdout}\n{await stderr}");
+            Assert.True(File.Exists(resultPath), "Child cancellation/stop probe did not reach its assertions.");
+            Assert.Equal("CANCELLATION_STOP_NO_DEADLOCK_OK", File.ReadAllText(resultPath));
+        }
+        finally
+        {
+            if (!process.HasExited) process.Kill(entireProcessTree: true);
+            File.Delete(resultPath);
+        }
+    }
+
+    [Fact]
+    public async Task ConcurrentCancellationAndExplicitStopChildProbe()
+    {
+        if (Environment.GetEnvironmentVariable("GCSP_CANCELLATION_STOP_CHILD") != "1") return;
+        using var cancellation = new CancellationTokenSource();
+        var control = new FakeTraceEpochControl(acknowledgeOnStop: true);
+        var session = new ManagedSamplingSession(new SamplingOptions(),
+            () => new ManagedSamplingTraceEpoch(control, TimeSpan.FromSeconds(1)));
+        await session.StartAsync(cancellation.Token);
+
+        var flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+        var stopGate = typeof(ManagedSamplingSession).GetField("_stopGate", flags)!.GetValue(session)!;
+        var registrationField = typeof(ManagedSamplingSession).GetField("_cancellationRegistration", flags)!;
+        ((CancellationTokenRegistration)registrationField.GetValue(session)!).Dispose();
+        using var callbackEntered = new ManualResetEventSlim(false);
+        var replacement = cancellation.Token.Register(() =>
+        {
+            callbackEntered.Set();
+            _ = session.StopAsync();
+        });
+        registrationField.SetValue(session, replacement);
+
+        var stop = Task.Run(() =>
+        {
+            lock (stopGate)
+            {
+                _ = Task.Run(cancellation.Cancel);
+                if (!callbackEntered.Wait(TimeSpan.FromSeconds(2)))
+                    throw new TimeoutException("Cancellation callback did not start.");
+                return session.StopAsync();
+            }
+        });
+        await stop.WaitAsync(TimeSpan.FromSeconds(2));
+        await session.DisposeAsync();
+        File.WriteAllText(Environment.GetEnvironmentVariable("GCSP_CANCELLATION_STOP_RESULT")!,
+            "CANCELLATION_STOP_NO_DEADLOCK_OK");
+    }
+
+    [Fact]
     public async Task SelfProcessSmokeObservesNamedManagedMethodOnLinux()
     {
         if (!OperatingSystem.IsLinux()) return;
@@ -562,7 +781,9 @@ public sealed class ManagedSamplingSessionTests
         bool acknowledgeOnStop,
         bool quiesceOnAbort = true,
         Exception? stopFailure = null,
-        bool throwStopSynchronously = false) : IManagedSamplingTraceEpochControl
+        bool throwStopSynchronously = false,
+        Exception? abortFailure = null,
+        Exception? disposeFailure = null) : IManagedSamplingTraceEpochControl
     {
         private readonly TaskCompletionSource<bool> _acknowledged = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TaskCompletionSource<bool> _processed = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -570,11 +791,15 @@ public sealed class ManagedSamplingSessionTests
         public int Aborts { get; private set; }
         public int Disposals { get; private set; }
         public bool ProcessExited => _processed.Task.IsCompleted;
+        public Action? OnRequestStop { get; set; }
 
         public Task ProcessAsync() => _processed.Task;
         public Task RequestStopAsync()
         {
             StopCalls++;
+            var onRequestStop = OnRequestStop;
+            OnRequestStop = null;
+            onRequestStop?.Invoke();
             if (stopFailure is not null)
             {
                 if (throwStopSynchronously) throw stopFailure;
@@ -590,6 +815,7 @@ public sealed class ManagedSamplingSessionTests
         public void AbortStream()
         {
             Aborts++;
+            if (abortFailure is not null) throw abortFailure;
             if (quiesceOnAbort) _processed.TrySetResult(true);
         }
         public void ReleaseProcessing() => _processed.TrySetResult(true);
@@ -597,6 +823,7 @@ public sealed class ManagedSamplingSessionTests
         {
             Disposals++;
             _processed.TrySetResult(true);
+            if (disposeFailure is not null) throw disposeFailure;
         }
         public void AcknowledgeStop() => _acknowledged.TrySetResult(true);
     }

@@ -144,11 +144,12 @@ public sealed class ModePresentationTests
         Assert.Contains(ResultColumn.EstimatedStackFrameShare, sampling);
         Assert.DoesNotContain(ResultColumn.Calls, sampling);
         Assert.DoesNotContain(ResultColumn.AverageWallTime, sampling);
-        Assert.DoesNotContain(ResultColumn.MaximumWallTime, sampling);
+        Assert.DoesNotContain(ResultColumn.LargestBatchAverageWallTime, sampling);
 
         var exact = ModePresenter.ColumnsFor([CaptureSource.AutomaticSpans]);
         Assert.Contains(ResultColumn.ObservedWallTime, exact);
         Assert.Contains(ResultColumn.Calls, exact);
+        Assert.Contains(ResultColumn.LargestBatchAverageWallTime, exact);
         Assert.DoesNotContain(ResultColumn.CpuTime, exact);
 
         var mixed = ModePresenter.Present(Input() with { ResultSources = [CaptureSource.Sampling, CaptureSource.ManualSpans] });

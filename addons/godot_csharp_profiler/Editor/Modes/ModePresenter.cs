@@ -51,7 +51,7 @@ public static class ModePresenter
         return sources.Single() == CaptureSource.Sampling
             ? [ResultColumn.Name, ResultColumn.Samples, ResultColumn.EstimatedStackFrameShare]
             : [ResultColumn.Name, ResultColumn.ObservedWallTime, ResultColumn.Calls,
-                ResultColumn.AverageWallTime, ResultColumn.MaximumWallTime];
+                ResultColumn.AverageWallTime, ResultColumn.LargestBatchAverageWallTime];
     }
 
     private static Availability AvailabilityFor(ModePresentationInput input, CaptureModes mode, string name)

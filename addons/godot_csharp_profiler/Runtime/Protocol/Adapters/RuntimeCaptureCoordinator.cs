@@ -64,7 +64,7 @@ public sealed class RuntimeCaptureCoordinator : IDisposable
     {
         ThrowIfDisposed();
         var completedReset = _pendingStop is { IsReset: true } completingReset &&
-            _pendingStopTask?.IsCompletedSuccessfully == true && !_backend.IsActive
+            _pendingStopTask?.IsCompleted == true && !_backend.IsActive
             ? completingReset : null;
         PollPendingStop();
         if (!_connected || string.IsNullOrWhiteSpace(owner) ||
@@ -303,7 +303,8 @@ public sealed class RuntimeCaptureCoordinator : IDisposable
                 var remaining = batch.Methods.Count - offset;
                 var count = Math.Min(remaining, Math.Min(_configuration.MaxMethods, ProtocolLimits.MaxMethodsPerBatch));
                 if (remaining == 0) count = 0;
-                while (count > 0 && !Fits(batch, offset, count)) count /= 2;
+                while (count > 0 && !Fits(batch, offset, count,
+                           firstChunk ? batch.Quality : QualityCounters.Zero)) count /= 2;
                 if (remaining > 0 && count == 0) break;
                 var methods = batch.Methods.Skip(offset).Take(count).ToArray();
                 Send(new BatchMessage(ProtocolVersion.Major, ProtocolVersion.Minor, _runtimeToken, _generation, ++_sequence,
@@ -318,12 +319,12 @@ public sealed class RuntimeCaptureCoordinator : IDisposable
         }
     }
 
-    private bool Fits(RuntimeSourceBatch batch, int offset, int count)
+    private bool Fits(RuntimeSourceBatch batch, int offset, int count, QualityCounters quality)
     {
         var message = new BatchMessage(ProtocolVersion.Major, ProtocolVersion.Minor, _runtimeToken, _generation, _sequence + 1,
             _configuration!.Fingerprint, batch.Source, batch.ExactCalls, batch.CpuTime,
-            QualityCounters.Zero, batch.Methods.Skip(offset).Take(count).ToArray());
-        return StrictWireAdapter.MeasureBytes(StrictWireAdapter.Serialize(message)) <= ProtocolLimits.MaxBatchBytes;
+            quality, batch.Methods.Skip(offset).Take(count).ToArray());
+        return WireJsonEnvelope.MeasureEncodedBytes(StrictWireAdapter.Serialize(message)) <= ProtocolLimits.MaxBatchBytes;
     }
 
     private bool ValidBatch(RuntimeSourceBatch batch)

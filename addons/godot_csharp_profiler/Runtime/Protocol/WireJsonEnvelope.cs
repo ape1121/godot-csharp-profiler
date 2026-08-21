@@ -10,11 +10,24 @@ public static class WireJsonEnvelope
     public static string Encode(WireValue value)
     {
         ArgumentNullException.ThrowIfNull(value);
-        using var stream = new MemoryStream();
-        using (var writer = new Utf8JsonWriter(stream)) Write(writer, value, 0);
+        using var stream = EncodeToStream(value);
         if (stream.Length > ProtocolLimits.MaxPayloadBytes)
             throw new ArgumentException("Profiler protocol payload exceeds the transport limit.", nameof(value));
         return Encoding.UTF8.GetString(stream.ToArray());
+    }
+
+    public static int MeasureEncodedBytes(WireValue value)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        using var stream = EncodeToStream(value);
+        return checked((int)stream.Length);
+    }
+
+    private static MemoryStream EncodeToStream(WireValue value)
+    {
+        var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream)) Write(writer, value, 0);
+        return stream;
     }
 
     public static bool TryDecode(string? json, out WireMap? map)

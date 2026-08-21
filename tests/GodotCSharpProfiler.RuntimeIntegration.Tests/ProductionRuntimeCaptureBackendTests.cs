@@ -1,3 +1,4 @@
+using Apeworks.GodotCSharpProfiler.Instrumentation;
 using Apeworks.GodotCSharpProfiler.Protocol;
 using Apeworks.GodotCSharpProfiler.Runtime.Protocol.Adapters;
 using Apeworks.GodotCSharpProfiler.Runtime.Sampling;
@@ -53,6 +54,85 @@ public sealed class ProductionRuntimeCaptureBackendTests
     }
 
     [Fact]
+    public void SamplingStopFailureStillStopsManualOverlayAndReturnsItsFinalBatchAfterRetry()
+    {
+        var samplingFailure = new InvalidOperationException("sampling stop failed");
+        var sampling = new FakeSamplingLease(
+            Snapshot(new SampledMethod(0, "Game", "Game.FinalSample", 7)))
+        {
+            StopFailure = samplingFailure
+        };
+        var manual = new FakeManualLease
+        {
+            Snapshot = new Apeworks.GodotCSharpProfiler.CsProfiler.FrameSnapshot
+            {
+                Names = ["ManualFinal"], Depths = [0], Calls = [2], TotalUsec = [4_000]
+            }
+        };
+        using var backend = new ProductionRuntimeCaptureBackend(_ => sampling, null, _ => manual);
+        var configuration = new RuntimeCaptureConfiguration(1, new string('a', 32),
+            CaptureModes.Sampling | CaptureModes.ManualScopes,
+            0, 16, "", "", "");
+        Assert.True(backend.TryStart(configuration, "owner", out var startError), startError);
+
+        var thrown = Assert.Throws<InvalidOperationException>(() => backend.Stop());
+        Assert.Contains("sampling", thrown.ToString(), StringComparison.OrdinalIgnoreCase);
+        Assert.True(backend.IsActive);
+        Assert.False(manual.IsActive);
+        Assert.Equal(1, manual.Stops);
+
+        sampling.StopFailure = null;
+        var result = backend.Stop();
+
+        Assert.Equal([CaptureSource.Sampling, CaptureSource.ManualSpans],
+            result.Select(batch => batch.Source));
+        Assert.Equal("Game.FinalSample",
+            Assert.Single(result.Single(batch => batch.Source == CaptureSource.Sampling).Methods).Label);
+        var manualBatch = result.Single(batch => batch.Source == CaptureSource.ManualSpans);
+        var method = Assert.Single(manualBatch.Methods);
+        Assert.Equal("ManualFinal", method.Label);
+        Assert.Equal(2, method.Calls);
+        Assert.False(backend.IsActive);
+    }
+
+    [Fact]
+    public void SamplingFinalBatchSurvivesLaterManualStopFailureAndRetry()
+    {
+        var sampling = new FakeSamplingLease(
+            Snapshot(new SampledMethod(0, "Game", "Game.FinalSample", 7)));
+        var manualFailure = new InvalidOperationException("manual stop failed");
+        var manual = new FakeManualLease
+        {
+            StopFailure = manualFailure,
+            Snapshot = new Apeworks.GodotCSharpProfiler.CsProfiler.FrameSnapshot
+            {
+                Names = ["ManualFinal"], Depths = [0], Calls = [3], TotalUsec = [5_000]
+            }
+        };
+        using var backend = new ProductionRuntimeCaptureBackend(_ => sampling, null, _ => manual);
+        var configuration = new RuntimeCaptureConfiguration(1, new string('a', 32),
+            CaptureModes.Sampling | CaptureModes.ManualScopes,
+            0, 16, "", "", "");
+        Assert.True(backend.TryStart(configuration, "owner", out var startError), startError);
+
+        Assert.Throws<InvalidOperationException>(() => backend.Stop());
+        Assert.True(backend.IsActive);
+        Assert.Equal(1, sampling.Disposals);
+
+        manual.StopFailure = null;
+        manual.Snapshot = Apeworks.GodotCSharpProfiler.CsProfiler.FrameSnapshot.Empty;
+        var result = backend.Stop();
+
+        Assert.Equal([CaptureSource.Sampling, CaptureSource.ManualSpans],
+            result.Select(batch => batch.Source));
+        Assert.Equal("Game.FinalSample",
+            Assert.Single(result.Single(batch => batch.Source == CaptureSource.Sampling).Methods).Label);
+        Assert.Equal("ManualFinal",
+            Assert.Single(result.Single(batch => batch.Source == CaptureSource.ManualSpans).Methods).Label);
+        Assert.False(backend.IsActive);
+    }
+
+    [Fact]
     public void SamplingIsNotStartedWhenTheBoundedManualLeaseCannotBeAcquired()
     {
         Assert.True(Apeworks.GodotCSharpProfiler.CsProfiler.TryStartCapture(
@@ -77,6 +157,34 @@ public sealed class ProductionRuntimeCaptureBackendTests
     }
 
     [Fact]
+    public async Task ConcurrentStartsAcquireOnlyOneManualLease()
+    {
+        var factoryEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var factoryRelease = new ManualResetEventSlim(false);
+        var factoryCalls = 0;
+        using var backend = new ProductionRuntimeCaptureBackend(null, null, _ =>
+        {
+            Interlocked.Increment(ref factoryCalls);
+            factoryEntered.TrySetResult(true);
+            factoryRelease.Wait(TimeSpan.FromSeconds(2));
+            return new FakeManualLease();
+        });
+        var configuration = new RuntimeCaptureConfiguration(1, new string('a', 32),
+            CaptureModes.ManualScopes, 0, 16, "", "", "");
+
+        var first = Task.Run(() => backend.TryStart(configuration, "first", out _));
+        await factoryEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var second = Task.Run(() => backend.TryStart(configuration, "second", out _));
+        Assert.NotSame(second, await Task.WhenAny(second, Task.Delay(50)));
+        factoryRelease.Set();
+
+        var accepted = await Task.WhenAll(first, second);
+        Assert.Single(accepted, value => value);
+        Assert.Equal(1, factoryCalls);
+        Assert.True(backend.IsActive);
+    }
+
+    [Fact]
     public async Task SamplingStopAsyncRetainsOwnershipUntilAcknowledgedAndReportsIncomplete()
     {
         var lease = new FakeSamplingLease { BlockStopAsync = true, StopDataIncomplete = true };
@@ -97,6 +205,153 @@ public sealed class ProductionRuntimeCaptureBackendTests
         Assert.False(backend.IsActive);
         Assert.Equal(1, lease.Stops);
         Assert.Equal(1, lease.Disposals);
+    }
+
+    [Fact]
+    public async Task ReentrantSamplingStopObservesThePublishedSingleStopOperation()
+    {
+        var lease = new FakeSamplingLease();
+        using var backend = new ProductionRuntimeCaptureBackend(_ => lease, null);
+        var configuration = new RuntimeCaptureConfiguration(1, new string('a', 32), CaptureModes.Sampling,
+            0, 16, "", "", "");
+        Assert.True(backend.TryStart(configuration, "owner", out var startError), startError);
+        lease.ReentrantStop = backend.StopAsync;
+
+        var stop = backend.StopAsync();
+        var result = await stop.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Same(stop, lease.ReentrantStopTask);
+        Assert.Equal(1, lease.Stops);
+        Assert.Equal(1, lease.Disposals);
+        Assert.False(result.DataIncomplete);
+        Assert.False(backend.IsActive);
+    }
+
+    [Fact]
+    public async Task ReentrantDisposeFromManualFactoryCannotInstallAnUnstoppableLease()
+    {
+        var manual = new FakeManualLease();
+        ProductionRuntimeCaptureBackend? backend = null;
+        backend = new ProductionRuntimeCaptureBackend(null, null, _ =>
+        {
+            backend!.Dispose();
+            return manual;
+        });
+        var configuration = new RuntimeCaptureConfiguration(1, new string('a', 32), CaptureModes.ManualScopes,
+            0, 16, "", "", "");
+
+        Assert.False(backend.TryStart(configuration, "owner", out var error));
+        Assert.Contains("disposed", error, StringComparison.OrdinalIgnoreCase);
+        for (var attempt = 0; attempt < 100 && backend.IsActive; attempt++) await Task.Delay(10);
+        Assert.False(backend.IsActive);
+        Assert.Equal(1, manual.Stops);
+    }
+
+    [Fact]
+    public async Task AutomaticOwnerIsRetainedUntilTheProcessRecorderHasStopped()
+    {
+        var manifest = CreateManifest("Game.Automatic");
+        using var first = new ProductionRuntimeCaptureBackend(null, manifest);
+        using var second = new ProductionRuntimeCaptureBackend(null, manifest);
+        var configuration = new RuntimeCaptureConfiguration(1, new string('a', 32),
+            CaptureModes.AutomaticInstrumentation, 0, 16, "", "", "");
+        Assert.True(first.TryStart(configuration, "first", out var firstError), firstError);
+
+        const System.Reflection.BindingFlags staticFlags =
+            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic;
+        const System.Reflection.BindingFlags instanceFlags =
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+        var recorderGate = typeof(Apeworks.GodotCSharpProfiler.Instrumentation.InstrumentationRecorder)
+            .GetField("Gate", staticFlags)!.GetValue(null)!;
+        var ownerField = typeof(ProductionRuntimeCaptureBackend)
+            .GetField("s_automaticOwner", staticFlags)!;
+        var stopTaskField = typeof(ProductionRuntimeCaptureBackend)
+            .GetField("_stopTask", instanceFlags)!;
+        Task<RuntimeCaptureStopResult> firstStop;
+        bool acceptedWhileFirstWasStopping;
+        lock (recorderGate)
+        {
+            firstStop = Task.Factory.StartNew(first.StopAsync, CancellationToken.None,
+                TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+            Assert.True(SpinWait.SpinUntil(
+                    () => ownerField.GetValue(null) is null || stopTaskField.GetValue(first) is not null,
+                    TimeSpan.FromSeconds(2)),
+                "First backend did not publish or enter automatic-recorder teardown.");
+            acceptedWhileFirstWasStopping = second.TryStart(
+                configuration with { Generation = 2 }, "second", out _);
+        }
+
+        await firstStop.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.False(acceptedWhileFirstWasStopping);
+        var rejectedStop = (Task<RuntimeCaptureStopResult>?)stopTaskField.GetValue(second);
+        if (rejectedStop is not null) await rejectedStop.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.True(second.TryStart(configuration with { Generation = 2 }, "second", out var secondError),
+            secondError);
+        Assert.True(second.IsActive);
+        Assert.True(Apeworks.GodotCSharpProfiler.Instrumentation.InstrumentationRecorder.Active);
+        await second.StopAsync();
+        Assert.False(second.IsActive);
+    }
+
+    [Fact]
+    public async Task BlockedSamplingStopStillStopsManualOverlayPromptly()
+    {
+        var sampling = new FakeSamplingLease { BlockStopAsync = true };
+        var manual = new FakeManualLease();
+        using var backend = new ProductionRuntimeCaptureBackend(_ => sampling, null, _ => manual);
+        var configuration = new RuntimeCaptureConfiguration(1, new string('a', 32),
+            CaptureModes.Sampling | CaptureModes.ManualScopes, 0, 16, "", "", "");
+        Assert.True(backend.TryStart(configuration, "owner", out var startError), startError);
+
+        var stop = backend.StopAsync();
+        await sampling.StopEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.False(stop.IsCompleted);
+        Assert.False(manual.IsActive);
+        Assert.Equal(1, manual.Stops);
+        sampling.StopAcknowledged.TrySetResult(true);
+        await stop.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.False(backend.IsActive);
+    }
+
+    [Fact]
+    public async Task LostManualFinalDataSurvivesSamplingRetryAsIncomplete()
+    {
+        var sampling = new FakeSamplingLease { StopFailure = new InvalidOperationException("sampling failed") };
+        var manual = new FakeManualLease { FlushFailure = new InvalidOperationException("manual flush failed") };
+        using var backend = new ProductionRuntimeCaptureBackend(_ => sampling, null, _ => manual);
+        var configuration = new RuntimeCaptureConfiguration(1, new string('a', 32),
+            CaptureModes.Sampling | CaptureModes.ManualScopes, 0, 16, "", "", "");
+        Assert.True(backend.TryStart(configuration, "owner", out var startError), startError);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => backend.StopAsync());
+        Assert.True(backend.IsActive);
+        Assert.False(manual.IsActive);
+        sampling.StopFailure = null;
+
+        var result = await backend.StopAsync();
+
+        Assert.True(result.DataIncomplete);
+        Assert.False(backend.IsActive);
+    }
+
+    [Fact]
+    public async Task InactiveManualFailurePreservesSamplingBatchAsPartialResult()
+    {
+        var sampling = new FakeSamplingLease(
+            Snapshot(new SampledMethod(0, "Game", "Game.FinalSample", 7)));
+        var manual = new FakeManualLease { FlushFailure = new InvalidOperationException("manual flush failed") };
+        using var backend = new ProductionRuntimeCaptureBackend(_ => sampling, null, _ => manual);
+        var configuration = new RuntimeCaptureConfiguration(1, new string('a', 32),
+            CaptureModes.Sampling | CaptureModes.ManualScopes, 0, 16, "", "", "");
+        Assert.True(backend.TryStart(configuration, "owner", out var startError), startError);
+
+        var result = await backend.StopAsync();
+
+        Assert.True(result.DataIncomplete);
+        Assert.Equal("Game.FinalSample",
+            Assert.Single(Assert.Single(result.Batches).Methods).Label);
+        Assert.False(backend.IsActive);
     }
 
     [Fact]
@@ -178,7 +433,7 @@ public sealed class ProductionRuntimeCaptureBackendTests
     }
 
     [Fact]
-    public void ManualFlushFailureStillStopsAndClearsLeaseWhenInactivityIsProven()
+    public async Task ManualFlushFailureReturnsAnInactivePartialResult()
     {
         var failure = new InvalidOperationException("manual flush failed");
         var manual = new FakeManualLease { FlushFailure = failure };
@@ -187,8 +442,10 @@ public sealed class ProductionRuntimeCaptureBackendTests
             0, 16, "", "", "");
         Assert.True(backend.TryStart(configuration, "owner", out var startError), startError);
 
-        var thrown = Assert.Throws<InvalidOperationException>(() => backend.Stop());
-        Assert.Same(failure, thrown.InnerException);
+        var result = await backend.StopAsync();
+
+        Assert.True(result.DataIncomplete);
+        Assert.Empty(result.Batches);
         Assert.Equal(1, manual.Flushes);
         Assert.Equal(1, manual.Stops);
         Assert.False(backend.IsActive);
@@ -246,6 +503,43 @@ public sealed class ProductionRuntimeCaptureBackendTests
     }
 
     [Fact]
+    public async Task ManualStopRetryMergesDataRecordedAfterTheFirstFailedAttempt()
+    {
+        var failure = new InvalidOperationException("manual stop failed");
+        var manual = new FakeManualLease
+        {
+            StopFailure = failure,
+            Snapshot = new Apeworks.GodotCSharpProfiler.CsProfiler.FrameSnapshot
+            {
+                Names = ["Accumulated"], Depths = [0], Calls = [2], TotalUsec = [4_000]
+            }
+        };
+        using var backend = new ProductionRuntimeCaptureBackend(null, null, _ => manual);
+        var configuration = new RuntimeCaptureConfiguration(1, new string('a', 32), CaptureModes.ManualScopes,
+            0, 16, "", "", "");
+        Assert.True(backend.TryStart(configuration, "owner", out var startError), startError);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => backend.StopAsync());
+        manual.StopFailure = null;
+        manual.Snapshot = new Apeworks.GodotCSharpProfiler.CsProfiler.FrameSnapshot
+        {
+            Names = ["Accumulated"], Depths = [0], Calls = [3], TotalUsec = [6_000]
+        };
+
+        var result = await backend.StopAsync();
+
+        var batch = Assert.Single(result.Batches);
+        var method = Assert.Single(batch.Methods);
+        Assert.Equal("Accumulated", method.Label);
+        Assert.Equal(5, method.Calls);
+        Assert.Equal(10_000_000, method.Value);
+        Assert.Equal(5, batch.Quality.Observed);
+        Assert.False(result.DataIncomplete);
+        Assert.Equal(2, manual.Flushes);
+        Assert.False(backend.IsActive);
+    }
+
+    [Fact]
     public void NonThrowingManualStopThatRemainsActiveIsRetryableAndRetainsOwnership()
     {
         var manual = new FakeManualLease { RemainActiveAfterStop = true };
@@ -263,6 +557,14 @@ public sealed class ProductionRuntimeCaptureBackendTests
         backend.Stop();
         Assert.Equal(2, manual.Stops);
         Assert.False(backend.IsActive);
+    }
+
+    private static InstrumentationManifest CreateManifest(params string[] labels)
+    {
+        var constructor = typeof(InstrumentationManifest).GetConstructors(
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic).Single();
+        return (InstrumentationManifest)constructor.Invoke(
+            [typeof(ProductionRuntimeCaptureBackendTests).Assembly, "0123456789abcdef", labels, 0]);
     }
 
     private static SamplingSnapshot Snapshot(params SampledMethod[] methods) => new(DateTimeOffset.UtcNow,
@@ -284,6 +586,8 @@ public sealed class ProductionRuntimeCaptureBackendTests
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource<bool> StopAcknowledged { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public Func<Task<RuntimeCaptureStopResult>>? ReentrantStop { get; set; }
+        public Task<RuntimeCaptureStopResult>? ReentrantStopTask { get; private set; }
         public void Start()
         {
             Starts++;
@@ -298,6 +602,9 @@ public sealed class ProductionRuntimeCaptureBackendTests
         {
             Stops++;
             StopEntered.TrySetResult(true);
+            var reentrantStop = ReentrantStop;
+            ReentrantStop = null;
+            if (reentrantStop is not null) ReentrantStopTask = reentrantStop();
             if (StopFailure is not null) throw StopFailure;
             if (BlockStopAsync) await StopAcknowledged.Task;
             return StopDataIncomplete;
