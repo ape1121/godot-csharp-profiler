@@ -21,7 +21,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private const string ReloadDebuggerInstanceMeta = "_godot_csharp_profiler_debugger_instance";
     private const string ReloadOwnerPluginInstanceMeta = "_godot_csharp_profiler_owner_plugin_instance";
     private const string ReloadStateMeta = "_godot_csharp_profiler_reload_state";
-    private const int MaximumReloadStateCharacters = 1_000_000;
+
 
     public sealed class ProfileFrame
     {
@@ -123,6 +123,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private bool _profilingRequested;
     private bool _reloadTransportBound;
     private ProfilerDockController _controller;
+    internal bool ManagedSurfaceReadyForReload => _controller != null && _reloadTransportBound;
     internal ModeConfiguration ConfigurationForProtocol => _controller?.Configuration ?? ModeConfiguration.Default;
     internal string StatusTextForTests => _statsLabel?.Text ?? "";
     internal string PerformanceTextForTests => _performanceLabel?.Text ?? "";
@@ -182,38 +183,17 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
 
     private void PersistReloadState(ProfilerDockReloadState state)
     {
-        try
-        {
-            var json = JsonSerializer.Serialize(state);
-            if (json.Length <= MaximumReloadStateCharacters)
-                SetMeta(ReloadStateMeta, json);
-            else
-                RemoveMeta(ReloadStateMeta);
-        }
-        catch (Exception error) when (error is JsonException or NotSupportedException or OverflowException)
-        {
-            RemoveMeta(ReloadStateMeta);
-        }
+        if (ProfilerReloadStateCodec.TryEncode(state, out var json)) SetMeta(ReloadStateMeta, json);
+        else RemoveMeta(ReloadStateMeta);
     }
 
     private ProfilerDockReloadState ReadReloadState()
     {
         if (!HasMeta(ReloadStateMeta)) return null;
-        try
-        {
-            var json = GetMeta(ReloadStateMeta).AsString();
-            if (json.Length == 0 || json.Length > MaximumReloadStateCharacters)
-                throw new JsonException("Profiler reload state is outside the allowed size.");
-            var state = JsonSerializer.Deserialize<ProfilerDockReloadState>(json);
-            if (state?.SchemaVersion != ProfilerDockReloadState.CurrentSchemaVersion)
-                throw new JsonException("Profiler reload state schema is unsupported.");
+        if (ProfilerReloadStateCodec.TryDecode(GetMeta(ReloadStateMeta).AsString(), out var state))
             return state;
-        }
-        catch (Exception error) when (error is JsonException or NotSupportedException or ArgumentException)
-        {
-            RemoveMeta(ReloadStateMeta);
-            return null;
-        }
+        RemoveMeta(ReloadStateMeta);
+        return null;
     }
 
     private void ClearSurfaceReferences()
@@ -974,7 +954,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
                     item.SetText(1, $"{row.ObservedWallTimeMilliseconds:0.###} ms");
                     item.SetText(2, row.Calls.ToString());
                     item.SetText(3, $"{row.AverageWallTimeMilliseconds:0.###} ms");
-                    item.SetText(4, $"{row.MaximumWallTimeMilliseconds:0.###} ms");
+                    item.SetText(4, $"{row.LargestBatchAverageWallTimeMilliseconds:0.###} ms");
                 }
             }
             _resultTabs.AddChild(tree);
@@ -1014,7 +994,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             builder.AppendLine(group.Source.ToString());
             builder.AppendLine(group.Source == CaptureSource.Sampling
                 ? "Name,Samples,Estimated stack-frame %"
-                : "Name,Wall time ms,Calls,Average wall time ms,Maximum wall time ms");
+                : "Name,Wall time ms,Calls,Average wall time ms,Largest batch average ms");
             foreach (var row in group.Rows)
             {
                 builder.Append(row.Name.Replace(',', ';')).Append(',');
@@ -1023,7 +1003,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
                 else
                     builder.Append(row.ObservedWallTimeMilliseconds).Append(',').Append(row.Calls)
                         .Append(',').Append(row.AverageWallTimeMilliseconds).Append(',')
-                        .Append(row.MaximumWallTimeMilliseconds);
+                        .Append(row.LargestBatchAverageWallTimeMilliseconds);
                 builder.AppendLine();
             }
         }
@@ -1237,7 +1217,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             var point = _protocolTimeline.Points[index];
             RenderSelectedBatch(point);
             _statsLabel.Text = point.Source == CaptureSource.Sampling
-                ? RuntimeStatus($"{point.Value} statistical samples | {point.Rows.Count} methods | batch #{point.Sequence}")
+                ? RuntimeStatus($"{point.Value} stack-frame observations | {point.Rows.Count} methods | batch #{point.Sequence}")
                 : RuntimeStatus($"{point.Value / 1_000_000.0:0.###} ms observed exact-span time | " +
                     $"{point.Observations} calls | batch #{point.Sequence}");
             return;
@@ -1330,7 +1310,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
                     item.SetText(1, $"{row.ObservedWallTimeMilliseconds:0.###} ms");
                     item.SetText(2, row.Calls.ToString());
                     item.SetText(3, $"{row.AverageWallTimeMilliseconds:0.###} ms");
-                    item.SetText(4, $"{row.MaximumWallTimeMilliseconds:0.###} ms");
+                    item.SetText(4, $"{row.LargestBatchAverageWallTimeMilliseconds:0.###} ms");
                 }
             }
         }
@@ -1419,7 +1399,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
                 group.Sum(entry => entry.Row.EstimatedStackFrameShare),
                 group.Sum(entry => entry.Row.Calls),
                 group.Sum(entry => entry.Row.ObservedWallTimeMilliseconds),
-                group.Max(entry => entry.Row.MaximumWallTimeMilliseconds),
+                group.Max(entry => entry.Row.LargestBatchAverageWallTimeMilliseconds),
                 group.Select(entry => entry.Row).ToArray()))
             .ToArray();
 

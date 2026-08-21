@@ -1,3 +1,4 @@
+#if GODOT_CSHARP_PROFILER_SAMPLING
 #nullable enable
 using System;
 using System.Threading;
@@ -46,57 +47,280 @@ internal sealed class ManagedSamplingTraceEpoch : IDisposable
     internal Task<ManagedSamplingTraceEpochStopResult> StopAsync()
     {
         lock (_stopGate)
-            return _stopTask ??= StopCoreAsync();
+        {
+            if (_stopTask is not null) return _stopTask;
+            var completion = new TaskCompletionSource<ManagedSamplingTraceEpochStopResult>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            _stopTask = completion.Task;
+            _ = CompleteStopOperationAsync(completion);
+            return _stopTask;
+        }
+    }
+
+    // Publish the stable operation identity before RequestStopAsync can synchronously reenter.
+    private async Task CompleteStopOperationAsync(
+        TaskCompletionSource<ManagedSamplingTraceEpochStopResult> completion)
+    {
+        await Task.Yield();
+        try
+        {
+            completion.TrySetResult(await StopCoreAsync().ConfigureAwait(false));
+        }
+        catch (Exception exception)
+        {
+            completion.TrySetException(exception);
+        }
     }
 
     private async Task<ManagedSamplingTraceEpochStopResult> StopCoreAsync()
     {
-        Task acknowledged;
+        Exception? stopFailure = null;
+        Task? acknowledged = null;
         try { acknowledged = _control.RequestStopAsync(); }
-        catch
+        catch (Exception exception)
         {
-            AbortStreamOnce();
-            throw;
+            stopFailure = exception;
+            var abortFailure = AbortStreamOnce();
+            stopFailure ??= abortFailure;
         }
 
-        if (await Task.WhenAny(acknowledged, Task.Delay(_gracePeriod)).ConfigureAwait(false) != acknowledged)
-            AbortStreamOnce();
-
-        try { await acknowledged.ConfigureAwait(false); }
-        catch
+        if (acknowledged is not null)
         {
-            AbortStreamOnce();
-            throw;
+            if (await Task.WhenAny(acknowledged, Task.Delay(_gracePeriod)).ConfigureAwait(false) != acknowledged)
+            {
+                var abortFailure = AbortStreamOnce();
+                stopFailure ??= abortFailure;
+            }
+
+            try { await acknowledged.ConfigureAwait(false); }
+            catch (Exception exception)
+            {
+                stopFailure ??= exception;
+                var abortFailure = AbortStreamOnce();
+                stopFailure ??= abortFailure;
+            }
         }
 
         if (await Task.WhenAny(_processingTask, Task.Delay(_gracePeriod)).ConfigureAwait(false) != _processingTask)
-            AbortStreamOnce();
+        {
+            var abortFailure = AbortStreamOnce();
+            stopFailure ??= abortFailure;
+        }
 
         var processingFaulted = false;
         try { await _processingTask.ConfigureAwait(false); }
         catch { processingFaulted = true; }
-        DisposeControlOnce();
+        var disposeFailure = DisposeControlOnce();
+        stopFailure ??= disposeFailure;
+        if (stopFailure is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(stopFailure).Throw();
         return new ManagedSamplingTraceEpochStopResult(
             Volatile.Read(ref _streamAborted) != 0,
             processingFaulted);
     }
 
-    private void AbortStreamOnce()
+    private Exception? AbortStreamOnce()
     {
-        if (Interlocked.Exchange(ref _streamAborted, 1) == 0)
-            _control.AbortStream();
+        if (Interlocked.Exchange(ref _streamAborted, 1) != 0) return null;
+        try { _control.AbortStream(); }
+        catch (Exception exception) { return exception; }
+        return null;
     }
 
-    private void DisposeControlOnce()
+    private Exception? DisposeControlOnce()
     {
-        if (Interlocked.Exchange(ref _disposed, 1) == 0)
-            _control.Dispose();
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return null;
+        try { _control.Dispose(); }
+        catch (Exception exception) { return exception; }
+        return null;
     }
 
     public void Dispose()
     {
-        AbortStreamOnce();
-        DisposeControlOnce();
+        var failure = AbortStreamOnce();
+        var disposeFailure = DisposeControlOnce();
+        failure ??= disposeFailure;
+        if (failure is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+    }
+}
+
+/// <summary>
+/// Transactional owner for a native EventPipe acquisition. Ownership is reported to the session
+/// immediately after StartEventPipeSession succeeds, before TraceEvent can perform fallible setup.
+/// A failed transaction receives the same one-shot StopTracing discipline as a published epoch.
+/// </summary>
+internal sealed class ManagedSamplingTraceAcquisition
+{
+    private readonly object _gate = new();
+    private readonly TimeSpan _gracePeriod;
+    private EventPipeSession? _session;
+    private TraceLogEventSource? _source;
+    private ManagedSamplingTraceEpoch? _epoch;
+    private Task? _cleanupTask;
+    private int _unaccountedNativeActivity;
+    private int _sessionDisposed;
+    private int _published;
+
+    private ManagedSamplingTraceAcquisition(EventPipeSession session, TimeSpan gracePeriod)
+    {
+        _session = session ?? throw new ArgumentNullException(nameof(session));
+        if (gracePeriod <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(gracePeriod));
+        _gracePeriod = gracePeriod;
+    }
+
+    private ManagedSamplingTraceAcquisition(TimeSpan gracePeriod)
+    {
+        if (gracePeriod <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(gracePeriod));
+        _gracePeriod = gracePeriod;
+    }
+
+    private ManagedSamplingTraceAcquisition(ManagedSamplingTraceEpoch epoch)
+    {
+        _epoch = epoch ?? throw new ArgumentNullException(nameof(epoch));
+        _gracePeriod = TimeSpan.FromSeconds(1);
+    }
+
+    internal static ManagedSamplingTraceAcquisition FromEventPipeSession(
+        EventPipeSession session,
+        TimeSpan gracePeriod) => new(session, gracePeriod);
+
+    internal static ManagedSamplingTraceAcquisition BeginUnknown(TimeSpan gracePeriod) =>
+        new(gracePeriod);
+
+    internal static ManagedSamplingTraceAcquisition FromEpoch(
+        ManagedSamplingTraceEpoch epoch) => new(epoch);
+
+    internal void MarkAdditionalNativeActivityUnaccounted()
+    {
+        lock (_gate) _unaccountedNativeActivity++;
+    }
+
+    internal void MarkAdditionalNativeActivityAccountedFor()
+    {
+        lock (_gate)
+        {
+            if (_unaccountedNativeActivity <= 0)
+                throw new InvalidOperationException("No unaccounted native activity was pending.");
+            _unaccountedNativeActivity--;
+        }
+    }
+
+    internal void AttachSession(EventPipeSession session)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        lock (_gate)
+        {
+            if (_session is not null || _epoch is not null || Volatile.Read(ref _published) != 0)
+                throw new InvalidOperationException("The EventPipe acquisition already owns a session or epoch.");
+            _session = session;
+        }
+    }
+
+    internal void AttachSource(TraceLogEventSource source)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        lock (_gate)
+        {
+            if (_source is not null || _epoch is not null || Volatile.Read(ref _published) != 0)
+                throw new InvalidOperationException("The EventPipe acquisition already owns a source or epoch.");
+            _source = source;
+        }
+    }
+
+    internal ManagedSamplingTraceEpoch CreateEpoch()
+    {
+        lock (_gate)
+        {
+            if (_session is null || _source is null || _epoch is not null ||
+                Volatile.Read(ref _published) != 0)
+                throw new InvalidOperationException("The EventPipe acquisition is not ready for publication.");
+            var control = new EventPipeSamplingTraceEpochControl(_session, _source);
+            _epoch = new ManagedSamplingTraceEpoch(control, _gracePeriod);
+            _source = null; // The epoch control now owns it.
+            return _epoch;
+        }
+    }
+
+    internal void Publish(ManagedSamplingTraceEpoch epoch)
+    {
+        lock (_gate)
+        {
+            if (!ReferenceEquals(_epoch, epoch))
+                throw new InvalidOperationException("The published epoch does not belong to this acquisition.");
+            if (Interlocked.Exchange(ref _published, 1) != 0)
+                throw new InvalidOperationException("The EventPipe acquisition was already published.");
+        }
+    }
+
+    internal Task CleanupAsync()
+    {
+        lock (_gate)
+            return _cleanupTask ??= CleanupCoreAsync();
+    }
+
+    private async Task CleanupCoreAsync()
+    {
+        ManagedSamplingTraceEpoch? epoch;
+        TraceLogEventSource? source;
+        lock (_gate)
+        {
+            if (Volatile.Read(ref _published) != 0)
+                throw new InvalidOperationException("A published EventPipe acquisition must be stopped by its session epoch.");
+            epoch = _epoch;
+            source = _source;
+        }
+
+        if (epoch is not null)
+            await epoch.StopAsync().ConfigureAwait(false);
+        else
+            await CleanupRawSessionAsync(source).ConfigureAwait(false);
+
+        int unaccountedNativeActivity;
+        lock (_gate) unaccountedNativeActivity = _unaccountedNativeActivity;
+        if (unaccountedNativeActivity != 0)
+            throw new InvalidOperationException(
+                "EventPipe construction failed while native activity was unaccounted for; " +
+                "process sampling ownership remains quarantined.");
+    }
+
+    private async Task CleanupRawSessionAsync(TraceLogEventSource? source)
+    {
+        if (_session is null)
+            return;
+
+        Exception? stopFailure = null;
+        Task? acknowledged = null;
+        try { acknowledged = _session.StopAsync(CancellationToken.None); }
+        catch (Exception exception)
+        {
+            stopFailure = exception;
+            DisposeSessionOnce();
+        }
+
+        if (acknowledged is not null)
+        {
+            if (await Task.WhenAny(acknowledged, Task.Delay(_gracePeriod)).ConfigureAwait(false) != acknowledged)
+                DisposeSessionOnce();
+            try { await acknowledged.ConfigureAwait(false); }
+            catch (Exception exception)
+            {
+                stopFailure = exception;
+                DisposeSessionOnce();
+            }
+        }
+
+        try { source?.Dispose(); }
+        catch (Exception exception) { stopFailure ??= exception; }
+        DisposeSessionOnce();
+        if (stopFailure is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(stopFailure).Throw();
+    }
+
+    private void DisposeSessionOnce()
+    {
+        if (Interlocked.Exchange(ref _sessionDisposed, 1) == 0)
+            _session?.Dispose();
     }
 }
 
@@ -123,3 +347,4 @@ internal sealed class EventPipeSamplingTraceEpochControl : IManagedSamplingTrace
         _session.Dispose();
     }
 }
+#endif

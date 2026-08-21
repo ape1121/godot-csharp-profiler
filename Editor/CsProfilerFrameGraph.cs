@@ -42,7 +42,7 @@ public partial class CsProfilerFrameGraph : Control
         CustomMinimumSize = new Vector2(0, 48);
         MouseDefaultCursorShape = CursorShape.PointingHand;
         ClipContents = true;
-        TooltipText = "Capture timeline · Sampling bars are sample counts; exact-span bars are observed time";
+        TooltipText = "Capture timeline · Sampling bars are depth-weighted stack-frame observation counts; exact-span bars are observed time";
     }
 
     public void SetFrames(IReadOnlyList<CsProfilerPanel.ProfileFrame> frames)
@@ -199,7 +199,7 @@ public partial class CsProfilerFrameGraph : Control
                 DrawRect(new Rect2(x, size.Y - height, barWidth, height), color);
             }
             var sampling = _timeline.Any(point => point.Source == CaptureSource.Sampling);
-            DrawString(font, new Vector2(4, 14), sampling ? "Statistical samples per batch (not frames)" : "Observed exact-span time per batch",
+            DrawString(font, new Vector2(4, 14), sampling ? "Stack-frame observations per batch" : "Observed exact-span time per batch",
                 HorizontalAlignment.Left, -1, fontSize, GuideTextColor);
         }
         else

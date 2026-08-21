@@ -126,7 +126,8 @@ public sealed class CaptureStateMachine
 
     public bool AcceptBatch(BatchMessage message)
     {
-        if (State != CaptureState.Capturing || !MatchesCapture(message) || message.Sequence != Sequence + 1 ||
+        if (State is not (CaptureState.Capturing or CaptureState.Stopping) ||
+            !MatchesCapture(message) || message.Sequence != Sequence + 1 ||
             !ValidSource(message.Source, message.ExactCalls, message.CpuTime)) return false;
         QualityCounters next;
         try { next = Quality.Add(message.Quality); }
@@ -158,12 +159,16 @@ public sealed class CaptureStateMachine
     public bool AcceptError(ErrorMessage message)
     {
         if (!MatchesCapture(message) || message.Sequence != Sequence + 1) return false;
-        Sequence = message.Sequence;
-        if (message.Fatal)
+        if (message.Fatal && State == CaptureState.Starting)
         {
+            Sequence = message.Sequence;
             State = CaptureState.Error;
             LeaseOwner = null;
+            return true;
         }
+        if (State is not (CaptureState.Capturing or CaptureState.Stopping)) return false;
+        Sequence = message.Sequence;
+        State = message.Fatal ? CaptureState.Stopping : CaptureState.Capturing;
         return true;
     }
 
