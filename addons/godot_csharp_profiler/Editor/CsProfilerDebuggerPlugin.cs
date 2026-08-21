@@ -12,7 +12,7 @@ using System.Linq;
 public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
 {
     private const string ReloadSessionIdsMeta = "_godot_csharp_profiler_reload_session_ids";
-    private const int MaximumRememberedSessions = 64;
+
     private CsProfilerPanel _panel;
     private HashSet<int> _sessionIds = new();
     private HashSet<int> _activeSessionIds = new();
@@ -32,20 +32,33 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
     {
         ArgumentNullException.ThrowIfNull(panel);
         EnsureManagedState();
-        var samePanel = ReferenceEquals(_panel, panel);
-        if (_panel != null && !samePanel) Teardown();
-        _panel = panel;
-        _panel.SessionActiveQuery = AnySessionActive;
-        _panel.ProfilingToggled -= SendControlMessage;
-        _panel.ProfilingToggled += SendControlMessage;
-        _panel.DiscoveryRequested -= SendDiscoveryMessages;
-        _panel.DiscoveryRequested += SendDiscoveryMessages;
-        _panel.InstanceSelected -= OnInstanceSelected;
-        _panel.InstanceSelected += OnInstanceSelected;
+        _panel = ProfilerDebuggerPanelBinding.Rebind(
+            _panel, panel, DetachPanelHandlers, AttachPanelHandlers);
         // Field initializers may run when Godot reconstructs the managed debugger object, leaving
         // an empty (non-null) set. Restore retained native session IDs once per panel rebind too.
         RestoreSessionIds();
         RepublishCurrentState();
+    }
+
+    private void DetachPanelHandlers(CsProfilerPanel panel)
+    {
+        panel.ProfilingToggled -= SendControlMessage;
+        panel.DiscoveryRequested -= SendDiscoveryMessages;
+        panel.InstanceSelected -= OnInstanceSelected;
+        panel.SessionActiveQuery = null;
+    }
+
+    private void AttachPanelHandlers(CsProfilerPanel panel)
+    {
+        // Remove first so same-wrapper recovery remains idempotent even if a prior callback ended
+        // between field reconstruction and this rebind.
+        panel.ProfilingToggled -= SendControlMessage;
+        panel.DiscoveryRequested -= SendDiscoveryMessages;
+        panel.InstanceSelected -= OnInstanceSelected;
+        panel.SessionActiveQuery = AnySessionActive;
+        panel.ProfilingToggled += SendControlMessage;
+        panel.DiscoveryRequested += SendDiscoveryMessages;
+        panel.InstanceSelected += OnInstanceSelected;
     }
 
     private void RepublishCurrentState()
@@ -120,12 +133,7 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
         _pendingCapture.Cancel();
         StopSelectedOwner();
         if (_panel != null)
-        {
-            _panel.ProfilingToggled -= SendControlMessage;
-            _panel.DiscoveryRequested -= SendDiscoveryMessages;
-            _panel.InstanceSelected -= OnInstanceSelected;
-            _panel.SessionActiveQuery = null;
-        }
+            DetachPanelHandlers(_panel);
         foreach (var endpoint in _protocol.Values) endpoint.Disconnect();
         _sessionIds.Clear();
         _activeSessionIds.Clear();
@@ -416,18 +424,45 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
 
     private void RememberSessionIds()
     {
-        SetMeta(ReloadSessionIdsMeta, string.Join(",", _sessionIds.OrderBy(id => id)
-            .Take(MaximumRememberedSessions)));
+        var values = new Godot.Collections.Array();
+        foreach (var sessionId in _sessionIds.Where(id => id >= 0).Distinct().OrderBy(id => id)
+                     .Take(ProfilerReloadSessionIdsCodec.MaximumSessions))
+            values.Add(sessionId);
+        SetMeta(ReloadSessionIdsMeta, values);
     }
 
     private void RestoreSessionIds()
     {
         if (!HasMeta(ReloadSessionIdsMeta)) return;
-        foreach (var value in GetMeta(ReloadSessionIdsMeta).AsString()
-                     .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                     .Take(MaximumRememberedSessions))
-            if (int.TryParse(value, out var sessionId) && sessionId >= 0)
-                _sessionIds.Add(sessionId);
+        var metadata = GetMeta(ReloadSessionIdsMeta);
+        if (metadata.VariantType != Variant.Type.Array)
+        {
+            RemoveMeta(ReloadSessionIdsMeta);
+            return;
+        }
+        var values = metadata.AsGodotArray();
+        if (values.Count > ProfilerReloadSessionIdsCodec.MaximumSessions)
+        {
+            RemoveMeta(ReloadSessionIdsMeta);
+            return;
+        }
+        var rawSessionIds = new long[values.Count];
+        for (var index = 0; index < values.Count; index++)
+        {
+            if (values[index].VariantType != Variant.Type.Int)
+            {
+                RemoveMeta(ReloadSessionIdsMeta);
+                return;
+            }
+            rawSessionIds[index] = values[index].AsInt64();
+        }
+        if (!ProfilerReloadSessionIdsCodec.TryDecode(rawSessionIds, out var sessionIds))
+        {
+            RemoveMeta(ReloadSessionIdsMeta);
+            return;
+        }
+        foreach (var sessionId in sessionIds)
+            _sessionIds.Add(sessionId);
         _nextOwnedDiscoveryAtSeconds = 0;
     }
 

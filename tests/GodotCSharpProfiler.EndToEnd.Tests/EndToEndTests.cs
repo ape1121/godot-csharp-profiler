@@ -175,6 +175,57 @@ public sealed class EndToEndTests
     }
 
     [Fact]
+    public void Runtime_drain_failure_preserves_identity_until_partial_results_are_committed()
+    {
+        using var loop = new Loop();
+        loop.Handshake();
+        Assert.True(loop.Editor.Start(ModeConfiguration.Default));
+        loop.Pump();
+        loop.Backend.Pending.Add(new(CaptureSource.Sampling, false, false,
+            new QualityCounters(1, 0, 0, 0), [new(7, "Game.Tick", 4, 0)]));
+        loop.Runtime.Flush();
+        loop.Pump();
+        loop.Backend.DrainFailure = new InvalidOperationException("drain failed");
+
+        loop.Runtime.Flush();
+        loop.Pump();
+
+        Assert.Equal(CaptureState.Partial, loop.Editor.Snapshot.State);
+        Assert.Equal(PartialReason.RuntimeError, loop.Editor.Snapshot.PartialReason);
+        var terminal = Assert.IsType<ProfilerTerminalCapture>(loop.Editor.LastTerminalCapture);
+        Assert.Equal("Game.Tick", terminal.Results.Groups.Single().Rows.Single().Name);
+        Assert.False(loop.Backend.IsActive);
+    }
+
+    [Fact]
+    public void Active_stop_failure_restores_editor_identity_and_allows_one_retry()
+    {
+        using var loop = new Loop();
+        loop.Handshake();
+        Assert.True(loop.Editor.Start(ModeConfiguration.Default));
+        loop.Pump();
+        loop.Backend.StopFailure = new InvalidOperationException("stop failed");
+        Assert.True(loop.Editor.Stop());
+
+        var firstStop = Assert.Single(loop.EditorOutput);
+        loop.EditorOutput.Clear();
+        Assert.False(loop.Runtime.Receive(firstStop, "editor-owner"));
+        while (loop.RuntimeOutput.Messages.TryDequeue(out var response))
+            Assert.True(loop.Editor.Receive(response));
+
+        Assert.True(loop.Backend.IsActive);
+        Assert.Equal(CaptureState.Capturing, loop.Editor.Snapshot.State);
+        Assert.Equal(ModeConfiguration.Default.Fingerprint, loop.Editor.Snapshot.Fingerprint);
+        Assert.Equal("editor-owner", loop.Editor.Snapshot.LeaseOwner);
+
+        loop.Backend.StopFailure = null;
+        Assert.True(loop.Editor.Stop());
+        loop.Pump();
+        Assert.False(loop.Backend.IsActive);
+        Assert.Equal(CaptureState.Complete, loop.Editor.Snapshot.State);
+    }
+
+    [Fact]
     public void Production_source_has_no_legacy_control_or_frame_messages()
     {
         var root = FindRepositoryRoot();
@@ -244,10 +295,24 @@ public sealed class EndToEndTests
         public bool IsActive { get; private set; }
         public bool Disposed { get; private set; }
         public List<RuntimeSourceBatch> Pending { get; } = [];
+        public Exception? DrainFailure { get; set; }
+        public Exception? StopFailure { get; set; }
         public bool TryStart(RuntimeCaptureConfiguration configuration, string owner, out string? error)
         { _ = configuration; _ = owner; error = null; if (IsActive) return false; IsActive = true; return true; }
-        public IReadOnlyList<RuntimeSourceBatch> Drain() { var result = Pending.ToArray(); Pending.Clear(); return result; }
-        public IReadOnlyList<RuntimeSourceBatch> Stop() { if (!IsActive) return []; IsActive = false; return Drain(); }
+        public IReadOnlyList<RuntimeSourceBatch> Drain()
+        {
+            if (DrainFailure is not null) throw DrainFailure;
+            var result = Pending.ToArray();
+            Pending.Clear();
+            return result;
+        }
+        public IReadOnlyList<RuntimeSourceBatch> Stop()
+        {
+            if (!IsActive) return [];
+            if (StopFailure is not null) throw StopFailure;
+            IsActive = false;
+            return Drain();
+        }
         public void Dispose() { Stop(); Disposed = true; }
     }
 }

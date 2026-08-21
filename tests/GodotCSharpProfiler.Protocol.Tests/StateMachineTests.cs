@@ -94,14 +94,39 @@ public sealed class StateMachineTests
     }
 
     [Fact]
-    public void FatalErrorTransitionsToErrorAndReleasesLease()
+    public void FatalInCaptureErrorRetainsIdentityUntilPartialTerminalArrives()
     {
         var machine = ReadyConfigured();
         machine.Start(new StartMessage(ProtocolVersion.Major, ProtocolVersion.Minor, Token, 1, Fingerprint), "owner");
         machine.AcceptState(State(1, CaptureState.Capturing, 1));
-        Assert.True(machine.AcceptError(new ErrorMessage(ProtocolVersion.Major, ProtocolVersion.Minor, Token, 1, 2, 7, "failure", true)));
-        Assert.Equal(CaptureState.Error, machine.State);
+
+        Assert.True(machine.AcceptError(new ErrorMessage(
+            ProtocolVersion.Major, ProtocolVersion.Minor, Token, 1, 2, 7, "failure", true)));
+        Assert.Equal(CaptureState.Stopping, machine.State);
+        Assert.Equal("owner", machine.LeaseOwner);
+        Assert.Equal(Fingerprint, machine.Fingerprint);
+        Assert.True(machine.AcceptBatch(Batch(1, 3)));
+        Assert.True(machine.AcceptState(State(1, CaptureState.Partial, 4,
+            CaptureCompleteness.Partial, PartialReason.RuntimeError)));
+        Assert.Equal(CaptureState.Partial, machine.State);
         Assert.Null(machine.LeaseOwner);
+    }
+
+    [Fact]
+    public void RecoverableStopErrorReturnsToCapturingWithoutReleasingIdentity()
+    {
+        var machine = ReadyConfigured();
+        machine.Start(new StartMessage(ProtocolVersion.Major, ProtocolVersion.Minor, Token, 1, Fingerprint), "owner");
+        machine.AcceptState(State(1, CaptureState.Capturing, 1));
+        Assert.True(machine.Stop(new StopMessage(
+            ProtocolVersion.Major, ProtocolVersion.Minor, Token, 1, 2, Fingerprint), "owner"));
+
+        Assert.True(machine.AcceptError(new ErrorMessage(
+            ProtocolVersion.Major, ProtocolVersion.Minor, Token, 1, 2, 2,
+            "stop failed while capture remains active", false)));
+        Assert.Equal(CaptureState.Capturing, machine.State);
+        Assert.Equal("owner", machine.LeaseOwner);
+        Assert.Equal(Fingerprint, machine.Fingerprint);
     }
 
     [Fact]

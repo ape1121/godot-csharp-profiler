@@ -467,12 +467,21 @@ public sealed class EditorCaptureCoordinator
 
     private bool AcceptError(ErrorMessage message)
     {
-        if (!MatchesRuntime(message) || message.Generation != snapshot.Generation || message.Sequence != snapshot.Sequence + 1) return false;
-        snapshot = snapshot with { Sequence = message.Sequence, State = message.Fatal ? CaptureState.Ready : snapshot.State,
-            Fingerprint = message.Fatal ? null : snapshot.Fingerprint,
-            LeaseOwner = message.Fatal ? null : snapshot.LeaseOwner,
-            Modes = message.Fatal ? CaptureModes.None : snapshot.Modes };
-        if (message.Fatal) stopRequestedWhileStarting = false;
+        if (!MatchesRuntime(message) || message.Generation != snapshot.Generation ||
+            message.Sequence != snapshot.Sequence + 1) return false;
+        if (message.Fatal && snapshot.State == CaptureState.Starting)
+        {
+            snapshot = snapshot with { Sequence = message.Sequence, State = CaptureState.Ready,
+                Fingerprint = null, LeaseOwner = null, Modes = CaptureModes.None };
+            stopRequestedWhileStarting = false;
+            return true;
+        }
+        if (snapshot.State is not (CaptureState.Capturing or CaptureState.Stopping)) return false;
+        snapshot = snapshot with
+        {
+            Sequence = message.Sequence,
+            State = message.Fatal ? CaptureState.Stopping : CaptureState.Capturing
+        };
         return true;
     }
 

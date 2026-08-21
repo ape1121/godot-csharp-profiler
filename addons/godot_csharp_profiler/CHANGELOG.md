@@ -2,6 +2,27 @@
 
 All notable changes use [Keep a Changelog](https://keepachangelog.com/) conventions.
 
+## [0.2.4] - 2026-08-21
+
+### Fixed
+
+- Fatal and retryable runtime shutdown errors no longer erase capture identity before final batches,
+  terminal `Partial` state, or a later owner-correct Stop retry.
+- EventPipe cleanup now preserves its one authoritative StopTracing request, aborts stalled streams,
+  waits for parser quiescence, and disposes controls exactly once before ownership can be released.
+- EventPipe startup and epoch rotation now use a fail-closed acquisition transaction. Cancellation and
+  bounded admission return without freezing the Godot callback, while ambiguous native-start and
+  hidden-rundown failures retain process-wide quarantine instead of permitting overlapping samplers.
+- Manual final flush/conversion failures still attempt Stop, retain truthful backend ownership when
+  inactivity is unproven, preserve final batches across retry, and reject a nonthrowing Stop that
+  leaves the process-wide recorder active.
+- Retained native panels whose managed controller was reconstructed as null now rebuild their managed
+  surface before Start; different managed wrappers rebind handlers without destructive teardown.
+- Reload metadata now rejects null/overflowing state and stores session IDs as a typed, count-bounded
+  native array, avoiding unbounded legacy string splitting while preserving explicit disable cleanup.
+- The editor-attached acceptance path now gives slow Godot build/play startup its own bounded window
+  before starting the capture deadline, preventing false no-bridge failures on large projects.
+
 ## [0.2.3] - 2026-08-20
 
 ### Fixed
@@ -103,6 +124,7 @@ All notable changes use [Keep a Changelog](https://keepachangelog.com/) conventi
 - Setup edits only an ownership-marked top-level project import, rejects unsafe path indirection, preserves unrelated project content, and never edits `NuGet.Config`.
 - Automatic installation requires a fresh reviewed preview and explicit confirmation; disable/uninstall remove only addon-owned configuration.
 
+[0.2.4]: https://github.com/ape1121/godot-csharp-profiler/releases/tag/v0.2.4
 [0.2.3]: https://github.com/ape1121/godot-csharp-profiler/releases/tag/v0.2.3
 [0.2.2]: https://github.com/ape1121/godot-csharp-profiler/releases/tag/v0.2.2
 [0.2.1]: https://github.com/ape1121/godot-csharp-profiler/releases/tag/v0.2.1

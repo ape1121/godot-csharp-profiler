@@ -372,6 +372,79 @@ public sealed class EditorIntegrationTests
     }
 
     [Fact]
+    public void MalformedNestedReloadConfigurationFailsClosedToDefaults()
+    {
+        var malformed = new ProfilerDockReloadState(
+            ProfilerDockReloadState.CurrentSchemaVersion,
+            new ModeConfiguration(PrimaryMode.Sampling, false, null!, null!, null!),
+            null);
+
+        var controller = new ProfilerDockController(
+            new FakeView(), new FakeTransport(), null, initialState: malformed);
+
+        Assert.Equal(ModeConfiguration.Default.Normalize(), controller.Configuration.Normalize());
+        Assert.Null(controller.CreateReloadSnapshot().TerminalCapture);
+    }
+
+    [Fact]
+    public void OverflowingRetainedTerminalCaptureIsDiscardedWithoutStrandingReconstruction()
+    {
+        var rows = Enumerable.Range(0, 129)
+            .Select(index => new ResultRow($"Method {index}", index + 1, 1, 0, 0, 0, 0))
+            .ToArray();
+        var retained = new ProfilerDockReloadState(
+            ProfilerDockReloadState.CurrentSchemaVersion,
+            ModeConfiguration.Default,
+            new ProfilerTerminalCapture(
+                new ProfilerResults([
+                    new SourceResultGroup(CaptureSource.Sampling, rows)
+                ], long.MaxValue),
+                CaptureTimeline.Empty,
+                CaptureCompleteness.Complete,
+                PartialReason.None,
+                QualityCounters.Zero));
+
+        var controller = new ProfilerDockController(
+            new FakeView(), new FakeTransport(), null, initialState: retained);
+
+        Assert.Equal(ModeConfiguration.Default.Normalize(), controller.Configuration.Normalize());
+        Assert.Null(controller.CreateReloadSnapshot().TerminalCapture);
+    }
+
+    [Fact]
+    public void ReloadSessionIdMetadataIsCharacterBoundedAndParsedWithoutPartialAcceptance()
+    {
+        Assert.False(ProfilerReloadSessionIdsCodec.TryDecode(
+            new string('1', ProfilerReloadSessionIdsCodec.MaximumCharacters + 1), out var oversized));
+        Assert.Empty(oversized);
+        Assert.False(ProfilerReloadSessionIdsCodec.TryDecode("1,,2", out var malformed));
+        Assert.Empty(malformed);
+        var tooMany = string.Join(',', Enumerable.Range(0,
+            ProfilerReloadSessionIdsCodec.MaximumSessions + 1));
+        Assert.False(ProfilerReloadSessionIdsCodec.TryDecode(tooMany, out var excess));
+        Assert.Empty(excess);
+        Assert.True(ProfilerReloadSessionIdsCodec.TryDecode("7, 3,7, 9", out var decoded));
+        Assert.Equal([7, 3, 9], decoded);
+        Assert.Equal("3,7,9", ProfilerReloadSessionIdsCodec.Encode(decoded));
+    }
+
+    [Fact]
+    public void DebuggerPanelWrapperReplacementOnlyDetachesAndReattachesBindings()
+    {
+        var previous = new object();
+        var replacement = new object();
+        var detached = new List<object>();
+        var attached = new List<object>();
+
+        var bound = ProfilerDebuggerPanelBinding.Rebind(
+            previous, replacement, detached.Add, attached.Add);
+
+        Assert.Same(replacement, bound);
+        Assert.Equal([previous], detached);
+        Assert.Equal([replacement], attached);
+    }
+
+    [Fact]
     public void NewCaptureLiveTimelineResetDoesNotOverwritePriorTerminalCapture()
     {
         ProfilerDockReloadState? persisted = null;
@@ -641,6 +714,26 @@ public sealed class EditorIntegrationTests
     }
 
     [Fact]
+    public void EditorAttachedProbeSeparatesSlowPlayStartupFromCaptureDeadline()
+    {
+        var root = FindRepositoryRoot();
+        var plugin = File.ReadAllText(Path.Combine(root, "addons", "godot_csharp_profiler", "Editor",
+            "CsProfilerPlugin.cs"));
+        var start = plugin[plugin.IndexOf("private void StartEditorAttachedProbe()", StringComparison.Ordinal)..
+            plugin.IndexOf("public override void _Process(double delta)", StringComparison.Ordinal)];
+        var process = plugin[plugin.IndexOf("public override void _Process(double delta)", StringComparison.Ordinal)..
+            plugin.IndexOf("private void FinishEditorAttachedProbe", StringComparison.Ordinal)];
+
+        Assert.Contains("_editorAttachedProbePlayObserved = false;", start, StringComparison.Ordinal);
+        Assert.Contains("_editorAttachedProbeDeadline = _editorAttachedProbeStartedAt + 300.0;", start,
+            StringComparison.Ordinal);
+        Assert.Contains("if (!_editorAttachedProbePlayObserved && EditorInterface.Singleton.IsPlayingScene())", process,
+            StringComparison.Ordinal);
+        Assert.Contains("_editorAttachedProbeStartedAt = now;", process, StringComparison.Ordinal);
+        Assert.Contains("_editorAttachedProbeDeadline = now + 30.0;", process, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Managed_reload_rebuilds_retained_panel_and_rebinds_debugger_on_the_first_click()
     {
         var root = FindRepositoryRoot();
@@ -655,6 +748,16 @@ public sealed class EditorIntegrationTests
         Assert.Contains("InstanceFromId", plugin, StringComparison.Ordinal);
         Assert.Contains("internal void RecoverPanelAfterManagedReload", plugin, StringComparison.Ordinal);
         Assert.Contains("if (!RecoverAfterManagedReload())", panel, StringComparison.Ordinal);
+        Assert.Contains(
+            "internal bool ManagedSurfaceReadyForReload => _controller != null && _reloadTransportBound;",
+            panel,
+            StringComparison.Ordinal);
+        var process = plugin[plugin.IndexOf("public override void _Process(double delta)", StringComparison.Ordinal)..
+            plugin.IndexOf("private void FinishEditorAttachedProbe", StringComparison.Ordinal)];
+        Assert.Contains("!_panel.ManagedSurfaceReadyForReload", process, StringComparison.Ordinal);
+        var recover = plugin[plugin.IndexOf("private bool RecoverAfterManagedReload()", StringComparison.Ordinal)..
+            plugin.IndexOf("public override void _ExitTree()", StringComparison.Ordinal)];
+        Assert.Contains("_panel.ManagedSurfaceReadyForReload", recover, StringComparison.Ordinal);
         var startHandler = panel[panel.IndexOf("private void OnStartPressed()", StringComparison.Ordinal)..
             panel.IndexOf("private bool TryHandoffRetainedStartIntent()", StringComparison.Ordinal)];
         Assert.Contains("if (_controller == null || !_reloadTransportBound)", startHandler,
@@ -684,14 +787,19 @@ public sealed class EditorIntegrationTests
         var initialize = debugger[debugger.IndexOf("public void Initialize(CsProfilerPanel panel)", StringComparison.Ordinal)..
             debugger.IndexOf("private void RepublishCurrentState()", StringComparison.Ordinal)];
         Assert.DoesNotContain("if (ReferenceEquals(_panel, panel)) return;", initialize, StringComparison.Ordinal);
-        Assert.Contains("var samePanel = ReferenceEquals(_panel, panel);", initialize, StringComparison.Ordinal);
-        Assert.Contains("if (_panel != null && !samePanel) Teardown();", initialize, StringComparison.Ordinal);
-        Assert.True(initialize.IndexOf("_panel.ProfilingToggled -= SendControlMessage;", StringComparison.Ordinal) <
-                    initialize.IndexOf("_panel.ProfilingToggled += SendControlMessage;", StringComparison.Ordinal));
-        Assert.True(initialize.IndexOf("_panel.DiscoveryRequested -= SendDiscoveryMessages;", StringComparison.Ordinal) <
-                    initialize.IndexOf("_panel.DiscoveryRequested += SendDiscoveryMessages;", StringComparison.Ordinal));
-        Assert.True(initialize.IndexOf("_panel.InstanceSelected -= OnInstanceSelected;", StringComparison.Ordinal) <
-                    initialize.IndexOf("_panel.InstanceSelected += OnInstanceSelected;", StringComparison.Ordinal));
+        Assert.DoesNotContain("Teardown();", initialize, StringComparison.Ordinal);
+        Assert.Contains("ProfilerDebuggerPanelBinding.Rebind", initialize, StringComparison.Ordinal);
+        Assert.Contains("DetachPanelHandlers, AttachPanelHandlers", initialize, StringComparison.Ordinal);
+        var detachHandlers = debugger[debugger.IndexOf("private void DetachPanelHandlers", StringComparison.Ordinal)..
+            debugger.IndexOf("private void AttachPanelHandlers", StringComparison.Ordinal)];
+        var attachHandlers = debugger[debugger.IndexOf("private void AttachPanelHandlers", StringComparison.Ordinal)..
+            debugger.IndexOf("private void RepublishCurrentState", StringComparison.Ordinal)];
+        Assert.Contains("panel.ProfilingToggled -= SendControlMessage;", detachHandlers, StringComparison.Ordinal);
+        Assert.Contains("panel.DiscoveryRequested -= SendDiscoveryMessages;", detachHandlers, StringComparison.Ordinal);
+        Assert.Contains("panel.InstanceSelected -= OnInstanceSelected;", detachHandlers, StringComparison.Ordinal);
+        Assert.Contains("panel.ProfilingToggled += SendControlMessage;", attachHandlers, StringComparison.Ordinal);
+        Assert.Contains("panel.DiscoveryRequested += SendDiscoveryMessages;", attachHandlers, StringComparison.Ordinal);
+        Assert.Contains("panel.InstanceSelected += OnInstanceSelected;", attachHandlers, StringComparison.Ordinal);
         Assert.Contains("EnsureManagedState();", debugger, StringComparison.Ordinal);
         Assert.Contains("RestoreSessionIds();", debugger, StringComparison.Ordinal);
         Assert.DoesNotContain("private readonly HashSet<int> _sessionIds", debugger, StringComparison.Ordinal);
@@ -701,6 +809,18 @@ public sealed class EditorIntegrationTests
                     plugin.IndexOf("RemoveDebuggerPlugin(_debugger)", StringComparison.Ordinal));
         Assert.Contains("public void Teardown()\n    {\n        EnsureManagedState();", debugger,
             StringComparison.Ordinal);
+        var restoreSessions = debugger[debugger.IndexOf("private void RestoreSessionIds()", StringComparison.Ordinal)..
+            debugger.IndexOf("private void ApplyRouteChange", StringComparison.Ordinal)];
+        Assert.Contains("ProfilerReloadSessionIdsCodec.TryDecode", restoreSessions, StringComparison.Ordinal);
+        Assert.Contains("Variant.Type.Array", restoreSessions, StringComparison.Ordinal);
+        Assert.Contains("AsGodotArray()", restoreSessions, StringComparison.Ordinal);
+        Assert.Contains("values.Count > ProfilerReloadSessionIdsCodec.MaximumSessions", restoreSessions,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain("AsString()", restoreSessions, StringComparison.Ordinal);
+        Assert.DoesNotContain(".Split(", restoreSessions, StringComparison.Ordinal);
+        Assert.Contains("new Godot.Collections.Array()", debugger, StringComparison.Ordinal);
+        Assert.Contains("ProfilerReloadStateCodec.TryDecode", panel, StringComparison.Ordinal);
+        Assert.Contains("ProfilerReloadStateCodec.TryEncode", panel, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -797,6 +917,64 @@ public sealed class EditorIntegrationTests
         Assert.True(editor.Receive(State(CaptureState.Complete, 3, QualityCounters.Zero)));
         Assert.Equal(quality, editor.Snapshot.Quality);
         Assert.Equal(5, editor.CompletedResults.Truncated);
+    }
+
+    [Fact]
+    public void RuntimeInitiatedFatalErrorRetainsCaptureIdentityUntilPartialTerminalIsCommitted()
+    {
+        var sent = new Queue<WireMap>();
+        var editor = ReadyEditor(sent);
+        Assert.True(editor.Start(TestConfiguration));
+        sent.Clear();
+        Assert.True(editor.Receive(State(CaptureState.Capturing, 1, QualityCounters.Zero)));
+        Assert.True(editor.Receive(Batch(CaptureSource.Sampling, 2,
+            [new MethodSample(1, "Game.Tick", 3, 0)])));
+
+        Assert.True(editor.Receive(StrictWireAdapter.Serialize(new ErrorMessage(
+            ProtocolVersion.Major, ProtocolVersion.Minor, "runtime", 1, 3, 3,
+            "drain failed", true))));
+        Assert.Equal(CaptureState.Stopping, editor.Snapshot.State);
+        Assert.Equal(TestConfiguration.Fingerprint, editor.Snapshot.Fingerprint);
+        Assert.Equal("owner", editor.Snapshot.LeaseOwner);
+        Assert.Equal(TestConfiguration.Modes, editor.Snapshot.Modes);
+
+        Assert.True(editor.Receive(Batch(CaptureSource.Sampling, 4,
+            [new MethodSample(1, "Game.Tick", 4, 0)])));
+        Assert.True(editor.Receive(StrictWireAdapter.Serialize(new StateMessage(
+            ProtocolVersion.Major, ProtocolVersion.Minor, "runtime", 1, 5,
+            TestConfiguration.Fingerprint, CaptureState.Partial, CaptureSource.Sampling,
+            CaptureCompleteness.Partial, PartialReason.RuntimeError, QualityCounters.Zero))));
+
+        Assert.Equal(CaptureState.Partial, editor.Snapshot.State);
+        var terminal = Assert.IsType<ProfilerTerminalCapture>(editor.LastTerminalCapture);
+        Assert.Equal(CaptureCompleteness.Partial, terminal.Completeness);
+        Assert.Equal(PartialReason.RuntimeError, terminal.PartialReason);
+        Assert.Equal(7, terminal.Results.Groups.Single().Rows.Single().Samples);
+    }
+
+    [Fact]
+    public void RecoverableStopFailureRestoresCapturingIdentitySoStopCanBeRetried()
+    {
+        var sent = new Queue<WireMap>();
+        var editor = ReadyEditor(sent);
+        Assert.True(editor.Start(TestConfiguration));
+        sent.Clear();
+        Assert.True(editor.Receive(State(CaptureState.Capturing, 1, QualityCounters.Zero)));
+        Assert.True(editor.Stop());
+        sent.Clear();
+
+        Assert.True(editor.Receive(StrictWireAdapter.Serialize(new ErrorMessage(
+            ProtocolVersion.Major, ProtocolVersion.Minor, "runtime", 1, 2, 2,
+            "stop failed while capture remains active", false))));
+        Assert.Equal(CaptureState.Capturing, editor.Snapshot.State);
+        Assert.Equal(TestConfiguration.Fingerprint, editor.Snapshot.Fingerprint);
+        Assert.Equal("owner", editor.Snapshot.LeaseOwner);
+        Assert.Equal(TestConfiguration.Modes, editor.Snapshot.Modes);
+
+        Assert.True(editor.Stop());
+        var retry = Assert.IsType<StopMessage>(Parse(Assert.Single(sent)));
+        Assert.Equal(3, retry.Sequence);
+        Assert.Equal(TestConfiguration.Fingerprint, retry.Fingerprint);
     }
 
     private static ProtocolMessage Parse(WireMap payload)

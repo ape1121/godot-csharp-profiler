@@ -21,7 +21,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private const string ReloadDebuggerInstanceMeta = "_godot_csharp_profiler_debugger_instance";
     private const string ReloadOwnerPluginInstanceMeta = "_godot_csharp_profiler_owner_plugin_instance";
     private const string ReloadStateMeta = "_godot_csharp_profiler_reload_state";
-    private const int MaximumReloadStateCharacters = 1_000_000;
+
 
     public sealed class ProfileFrame
     {
@@ -123,6 +123,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private bool _profilingRequested;
     private bool _reloadTransportBound;
     private ProfilerDockController _controller;
+    internal bool ManagedSurfaceReadyForReload => _controller != null && _reloadTransportBound;
     internal ModeConfiguration ConfigurationForProtocol => _controller?.Configuration ?? ModeConfiguration.Default;
     internal string StatusTextForTests => _statsLabel?.Text ?? "";
     internal string PerformanceTextForTests => _performanceLabel?.Text ?? "";
@@ -182,38 +183,17 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
 
     private void PersistReloadState(ProfilerDockReloadState state)
     {
-        try
-        {
-            var json = JsonSerializer.Serialize(state);
-            if (json.Length <= MaximumReloadStateCharacters)
-                SetMeta(ReloadStateMeta, json);
-            else
-                RemoveMeta(ReloadStateMeta);
-        }
-        catch (Exception error) when (error is JsonException or NotSupportedException or OverflowException)
-        {
-            RemoveMeta(ReloadStateMeta);
-        }
+        if (ProfilerReloadStateCodec.TryEncode(state, out var json)) SetMeta(ReloadStateMeta, json);
+        else RemoveMeta(ReloadStateMeta);
     }
 
     private ProfilerDockReloadState ReadReloadState()
     {
         if (!HasMeta(ReloadStateMeta)) return null;
-        try
-        {
-            var json = GetMeta(ReloadStateMeta).AsString();
-            if (json.Length == 0 || json.Length > MaximumReloadStateCharacters)
-                throw new JsonException("Profiler reload state is outside the allowed size.");
-            var state = JsonSerializer.Deserialize<ProfilerDockReloadState>(json);
-            if (state?.SchemaVersion != ProfilerDockReloadState.CurrentSchemaVersion)
-                throw new JsonException("Profiler reload state schema is unsupported.");
+        if (ProfilerReloadStateCodec.TryDecode(GetMeta(ReloadStateMeta).AsString(), out var state))
             return state;
-        }
-        catch (Exception error) when (error is JsonException or NotSupportedException or ArgumentException)
-        {
-            RemoveMeta(ReloadStateMeta);
-            return null;
-        }
+        RemoveMeta(ReloadStateMeta);
+        return null;
     }
 
     private void ClearSurfaceReferences()

@@ -38,10 +38,10 @@ public sealed class ProfilerDockController
         this.installer = installer;
         this.output = output;
         this.reloadStateChanged = reloadStateChanged;
-        if (initialState?.SchemaVersion == ProfilerDockReloadState.CurrentSchemaVersion)
+        if (TryNormalizeReloadState(initialState, out var normalizedInitialState))
         {
-            modes.Restore(BoundConfiguration(initialState.Configuration));
-            lastTerminalCapture = BoundTerminalCapture(initialState.TerminalCapture);
+            modes.Restore(normalizedInitialState.Configuration);
+            lastTerminalCapture = normalizedInitialState.TerminalCapture;
             results = lastTerminalCapture?.Results ?? ProfilerResults.Empty;
             timeline = lastTerminalCapture?.Timeline ?? CaptureTimeline.Empty;
             if (lastTerminalCapture is not null)
@@ -60,6 +60,31 @@ public sealed class ProfilerDockController
     public ProfilerDockReloadState CreateReloadSnapshot() => new(
         ProfilerDockReloadState.CurrentSchemaVersion, modes.Configuration.Normalize(),
         BoundTerminalCapture(lastTerminalCapture));
+
+    public static bool TryNormalizeReloadState(ProfilerDockReloadState? value,
+        out ProfilerDockReloadState normalized)
+    {
+        normalized = null!;
+        if (value?.SchemaVersion != ProfilerDockReloadState.CurrentSchemaVersion)
+            return false;
+        try
+        {
+            if (!TryBoundConfiguration(value.Configuration, out var configuration))
+                return false;
+            var terminal = BoundTerminalCapture(value.TerminalCapture);
+            if (value.TerminalCapture is not null && terminal is null)
+                return false;
+            normalized = new ProfilerDockReloadState(
+                ProfilerDockReloadState.CurrentSchemaVersion, configuration, terminal);
+            return true;
+        }
+        catch (Exception error) when (error is ArgumentException or InvalidOperationException or
+                                      OverflowException or NullReferenceException)
+        {
+            normalized = null!;
+            return false;
+        }
+    }
 
     public void UpdateSnapshot(CaptureSnapshot value, string targetDescription)
     {
@@ -231,9 +256,13 @@ public sealed class ProfilerDockController
         Render();
     }
 
-    private static ModeConfiguration BoundConfiguration(ModeConfiguration? value)
+    private static bool TryBoundConfiguration(ModeConfiguration? value,
+        out ModeConfiguration normalized)
     {
-        var normalized = (value ?? ModeConfiguration.Default).Normalize();
+        normalized = ModeConfiguration.Default;
+        if (value?.Sampling is null || value.Automatic is null || value.Manual is null)
+            return false;
+        normalized = value.Normalize();
         if (!Enum.IsDefined(normalized.Primary) || normalized.Sampling.RequestedIntervalNanoseconds < ProtocolLimits.MinSamplingIntervalNanoseconds ||
             normalized.Sampling.RequestedIntervalNanoseconds > ProtocolLimits.MaxSamplingIntervalNanoseconds ||
             normalized.Automatic.MaxMethods < 1 || normalized.Automatic.MaxMethods > ProtocolLimits.MaxConfiguredMethods ||
@@ -242,9 +271,12 @@ public sealed class ProfilerDockController
             !ValidText(normalized.Automatic.IncludePatterns, ProtocolLimits.MaxConfigurationListCharacters) ||
             !ValidText(normalized.Automatic.ExcludePatterns, ProtocolLimits.MaxConfigurationListCharacters) ||
             !ValidText(normalized.Manual.LabelPrefix, ProtocolLimits.MaxManualLabelPrefixCharacters))
-            return ModeConfiguration.Default;
-        return normalized;
+            return false;
+        return true;
     }
+
+    private static ModeConfiguration BoundConfiguration(ModeConfiguration? value) =>
+        TryBoundConfiguration(value, out var normalized) ? normalized : ModeConfiguration.Default;
 
     private static bool ValidText(string? value, int maximum) => value is not null && value.Length <= maximum &&
         !value.Any(char.IsControl);
@@ -258,10 +290,10 @@ public sealed class ProfilerDockController
         var results = BoundResults(value.Results, out var omittedResultRows);
         var timeline = BoundTimeline(value.Timeline, out var omittedTimelineRows);
         if (results is null || timeline is null) return null;
-        results = results with
-        {
-            Truncated = checked(results.Truncated + omittedResultRows + omittedTimelineRows)
-        };
+        long truncated;
+        try { truncated = checked(results.Truncated + omittedResultRows + omittedTimelineRows); }
+        catch (OverflowException) { return null; }
+        results = results with { Truncated = truncated };
         return new ProfilerTerminalCapture(results, timeline, value.Completeness,
             value.PartialReason, value.Quality);
     }

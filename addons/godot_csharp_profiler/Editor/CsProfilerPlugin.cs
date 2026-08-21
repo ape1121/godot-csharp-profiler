@@ -20,6 +20,7 @@ public partial class CsProfilerPlugin : EditorPlugin
     private bool _editorAttachedProbeRunning;
     private bool _editorAttachedProbeCaptureRequested;
     private bool _editorAttachedProbeStopSent;
+    private bool _editorAttachedProbePlayObserved;
     private double _editorAttachedProbeStartedAt;
     private double _editorAttachedProbeDeadline;
     private int _editorAttachedProbeRuns;
@@ -119,7 +120,8 @@ public partial class CsProfilerPlugin : EditorPlugin
     private bool RecoverAfterManagedReload()
     {
         if (_registered && _dock != null && _debugger != null && _panel != null &&
-            IsInstanceValid(_dock) && IsInstanceValid(_debugger) && IsInstanceValid(_panel))
+            IsInstanceValid(_dock) && IsInstanceValid(_debugger) && IsInstanceValid(_panel) &&
+            _panel.ManagedSurfaceReadyForReload)
             return true;
         if (!IsInsideTree()) return false;
 
@@ -231,19 +233,27 @@ public partial class CsProfilerPlugin : EditorPlugin
         _editorAttachedProbeRunning = true;
         _editorAttachedProbeCaptureRequested = false;
         _editorAttachedProbeStopSent = false;
+        _editorAttachedProbePlayObserved = false;
         _editorAttachedProbeStartedAt = Time.GetTicksMsec() / 1000.0;
-        _editorAttachedProbeDeadline = Time.GetTicksMsec() / 1000.0 + 30.0;
+        _editorAttachedProbeDeadline = _editorAttachedProbeStartedAt + 300.0;
         EditorInterface.Singleton.PlayMainScene();
     }
 
     public override void _Process(double delta)
     {
-        if (!_registered || _dock == null || _debugger == null || _panel == null)
+        if (!_registered || _dock == null || _debugger == null || _panel == null ||
+            !_panel.ManagedSurfaceReadyForReload)
             RecoverAfterManagedReload();
         _debugger?.PollActiveSessions();
         if (!_editorAttachedProbeRunning)
             return;
         var now = Time.GetTicksMsec() / 1000.0;
+        if (!_editorAttachedProbePlayObserved && EditorInterface.Singleton.IsPlayingScene())
+        {
+            _editorAttachedProbePlayObserved = true;
+            _editorAttachedProbeStartedAt = now;
+            _editorAttachedProbeDeadline = now + 30.0;
+        }
         if (!_editorAttachedProbeCaptureRequested && EditorInterface.Singleton.IsPlayingScene() &&
             _panel?.BridgeReadyForTests == true && _panel.IdentityForTests.EditorAttached)
         {

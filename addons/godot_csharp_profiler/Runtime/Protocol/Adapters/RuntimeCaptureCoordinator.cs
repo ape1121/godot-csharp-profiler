@@ -202,7 +202,7 @@ public sealed class RuntimeCaptureCoordinator : IDisposable
             {
                 _pendingStopTask = null;
                 if (!pending.IsReset) _pendingStop = null;
-                if (pending.SendTerminal) SendError(2, exception.Message, fatal: true);
+                if (pending.SendTerminal) SendError(2, exception.Message, fatal: false);
                 return false;
             }
             if (pending.SendTerminal) SendError(2, exception.Message, fatal: true);
@@ -227,7 +227,7 @@ public sealed class RuntimeCaptureCoordinator : IDisposable
             if (_backend.IsActive)
             {
                 if (pending.IsReset) _pendingStop = pending;
-                if (pending.SendTerminal) SendError(2, exception.Message, fatal: true);
+                if (pending.SendTerminal) SendError(2, exception.Message, fatal: false);
                 return false;
             }
             if (pending.SendTerminal) SendError(2, exception.Message, fatal: true);
@@ -236,7 +236,7 @@ public sealed class RuntimeCaptureCoordinator : IDisposable
         if (_backend.IsActive)
         {
             if (pending.IsReset) _pendingStop = pending;
-            if (pending.SendTerminal) SendError(2, "Capture backend remained active after stop.", fatal: true);
+            if (pending.SendTerminal) SendError(2, "Capture backend remained active after stop.", fatal: false);
             return false;
         }
 

@@ -13,12 +13,14 @@ public sealed class ProductionRuntimeCaptureBackend : IRuntimeCaptureBackend
 {
     private static ProductionRuntimeCaptureBackend? s_automaticOwner;
     private readonly Func<SamplingOptions, IManagedSamplingLease>? _samplingFactory;
+    private readonly Func<string, IManualCaptureLease?> _manualFactory;
     private readonly object _stopGate = new();
     private Task<RuntimeCaptureStopResult>? _stopTask;
     private readonly Dictionary<string, long> _manualIds = new(StringComparer.Ordinal);
     private readonly Dictionary<string, long> _samplingIds = new(StringComparer.Ordinal);
     private IManagedSamplingLease? _sampler;
-    private CsProfiler.CaptureLease? _manualLease;
+    private IManualCaptureLease? _manualLease;
+    private RuntimeSourceBatch? _pendingManualStopBatch;
     private CaptureModes _modes;
     private int _maxMethods;
     private long _nextManualId = 1;
@@ -28,12 +30,14 @@ public sealed class ProductionRuntimeCaptureBackend : IRuntimeCaptureBackend
     private bool _automatic;
     private bool _disposed;
 
-    public ProductionRuntimeCaptureBackend() : this(CreateSamplingFactory(), FindManifest()) { }
+    public ProductionRuntimeCaptureBackend() : this(CreateSamplingFactory(), FindManifest(), null) { }
 
     internal ProductionRuntimeCaptureBackend(Func<SamplingOptions, IManagedSamplingLease>? samplingFactory,
-        InstrumentationManifest? manifest)
+        InstrumentationManifest? manifest,
+        Func<string, IManualCaptureLease?>? manualFactory = null)
     {
         _samplingFactory = samplingFactory;
+        _manualFactory = manualFactory ?? AcquireManualLease;
         _manifest = manifest;
         var modes = CaptureModes.ManualScopes;
         if (samplingFactory is not null) modes |= CaptureModes.Sampling;
@@ -45,7 +49,7 @@ public sealed class ProductionRuntimeCaptureBackend : IRuntimeCaptureBackend
     }
 
     public RuntimeBackendCapabilities Capabilities { get; }
-    public bool IsActive => _sampler is not null || _automatic || _manualLease?.IsActive == true;
+    public bool IsActive => _sampler is not null || _automatic || _manualLease is not null;
 
     public bool TryStart(RuntimeCaptureConfiguration configuration, string owner, out string? error)
     {
@@ -57,6 +61,7 @@ public sealed class ProductionRuntimeCaptureBackend : IRuntimeCaptureBackend
         _maxMethods = configuration.MaxMethods;
         _manualIds.Clear();
         _samplingIds.Clear();
+        _pendingManualStopBatch = null;
         _nextManualId = _nextSamplingId = 1;
         _manualLabelPrefix = configuration.ManualLabelPrefix;
         try
@@ -70,7 +75,8 @@ public sealed class ProductionRuntimeCaptureBackend : IRuntimeCaptureBackend
             }
             if ((_modes & CaptureModes.ManualScopes) != 0)
             {
-                if (!CsProfiler.TryStartCapture(owner, out _manualLease))
+                _manualLease = _manualFactory(owner);
+                if (_manualLease is null)
                     throw new InvalidOperationException("Manual profiler lease is owned by another capture.");
             }
             if ((_modes & CaptureModes.Sampling) != 0)
@@ -88,8 +94,14 @@ public sealed class ProductionRuntimeCaptureBackend : IRuntimeCaptureBackend
         catch (Exception exception)
         {
             error = exception.Message;
-            try { Stop(); }
-            catch (Exception cleanup) { error = $"{error} Cleanup failed: {cleanup.Message}"; }
+            lock (_stopGate)
+            {
+                _stopTask ??= StopCoreAsync();
+                _ = _stopTask.ContinueWith(static task => _ = task.Exception,
+                    CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously | TaskContinuationOptions.OnlyOnFaulted,
+                    TaskScheduler.Default);
+            }
             return false;
         }
     }
@@ -174,13 +186,36 @@ public sealed class ProductionRuntimeCaptureBackend : IRuntimeCaptureBackend
             finally { _automatic = false; }
         }
         var manual = _manualLease;
-        _manualLease = null;
         if (manual is not null)
         {
-            try { if (manual.IsActive) result.Add(ManualBatch(manual.FlushFrame())); manual.Stop(); }
+            try
+            {
+                if (manual.IsActive && _pendingManualStopBatch is null)
+                    _pendingManualStopBatch = ManualBatch(manual.FlushFrame());
+            }
             catch (Exception exception) { failure ??= exception; }
+
+            try
+            {
+                if (manual.IsActive)
+                    manual.Stop();
+            }
+            catch (Exception exception) { failure ??= exception; }
+
+            // A failed final flush does not keep the process recorder active when Stop succeeded,
+            // but no failure may discard the only lease while the process-global capture survives.
+            if (manual.IsActive)
+                failure ??= new InvalidOperationException("Manual profiler remained active after stop.");
+            else
+            {
+                if (_pendingManualStopBatch is not null)
+                    result.Add(_pendingManualStopBatch);
+                _pendingManualStopBatch = null;
+                Interlocked.CompareExchange(ref _manualLease, null, manual);
+            }
         }
-        _modes = CaptureModes.None;
+        if (_sampler is null && !_automatic && _manualLease?.IsActive != true)
+            _modes = CaptureModes.None;
     }
 
     public void Dispose()
@@ -283,6 +318,23 @@ public sealed class ProductionRuntimeCaptureBackend : IRuntimeCaptureBackend
 #else
         return null;
 #endif
+    }
+
+    private static IManualCaptureLease? AcquireManualLease(string owner) =>
+        CsProfiler.TryStartCapture(owner, out var lease) ? new ManualCaptureLease(lease) : null;
+
+    internal interface IManualCaptureLease
+    {
+        bool IsActive { get; }
+        CsProfiler.FrameSnapshot FlushFrame();
+        bool Stop();
+    }
+
+    private sealed class ManualCaptureLease(CsProfiler.CaptureLease lease) : IManualCaptureLease
+    {
+        public bool IsActive => lease.IsActive;
+        public CsProfiler.FrameSnapshot FlushFrame() => lease.FlushFrame();
+        public bool Stop() => lease.Stop();
     }
 
     internal interface IManagedSamplingLease : IDisposable
