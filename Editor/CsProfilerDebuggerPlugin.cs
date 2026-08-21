@@ -1,6 +1,7 @@
 #if TOOLS
 using Apeworks.GodotCSharpProfiler;
 using Apeworks.GodotCSharpProfiler.Editor.Integration;
+using Apeworks.GodotCSharpProfiler.Editor.Modes;
 using Apeworks.GodotCSharpProfiler.Protocol;
 using Apeworks.GodotCSharpProfiler.Runtime.Protocol.Adapters;
 using Godot;
@@ -10,37 +11,86 @@ using System.Linq;
 
 public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
 {
+    private const string ReloadSessionIdsMeta = "_godot_csharp_profiler_reload_session_ids";
+    private const int MaximumRememberedSessions = 64;
     private CsProfilerPanel _panel;
-    private readonly HashSet<int> _sessionIds = new();
-    private readonly HashSet<int> _activeSessionIds = new();
-    private readonly Dictionary<int, EditorCaptureCoordinator> _protocol = new();
-    private readonly Dictionary<int, CsProfilerRuntimeIdentity> _identities = new();
-    private readonly Dictionary<(int Session, long Generation, long Sequence), BatchFlushFrame> _batchFrames = new();
-    private readonly CsProfilerSessionRouterState _router = new();
-    private readonly PendingCaptureRequest _pendingCapture = new();
+    private HashSet<int> _sessionIds = new();
+    private HashSet<int> _activeSessionIds = new();
+    private Dictionary<int, EditorCaptureCoordinator> _protocol = new();
+    private Dictionary<int, CsProfilerRuntimeIdentity> _identities = new();
+    private Dictionary<(int Session, long Generation, long Sequence), BatchFlushFrame> _batchFrames = new();
+    private CsProfilerSessionRouterState _router = new();
+    private PendingCaptureRequest _pendingCapture = new();
+    private Dictionary<int, ModeConfiguration> _startIntent = new();
+    private ModeConfiguration _unboundStartIntent;
+    private Dictionary<int, OrphanResetAttempt> _resetAttempts = new();
     private double _nextOwnedDiscoveryAtSeconds;
+
+    private sealed record OrphanResetAttempt(string RequestId, int Attempts, double NextRetryAtSeconds);
 
     public void Initialize(CsProfilerPanel panel)
     {
         ArgumentNullException.ThrowIfNull(panel);
-        if (ReferenceEquals(_panel, panel)) return;
-        if (_panel != null) Teardown();
+        EnsureManagedState();
+        var samePanel = ReferenceEquals(_panel, panel);
+        if (_panel != null && !samePanel) Teardown();
         _panel = panel;
         _panel.SessionActiveQuery = AnySessionActive;
+        _panel.ProfilingToggled -= SendControlMessage;
         _panel.ProfilingToggled += SendControlMessage;
+        _panel.DiscoveryRequested -= SendDiscoveryMessages;
         _panel.DiscoveryRequested += SendDiscoveryMessages;
+        _panel.InstanceSelected -= OnInstanceSelected;
         _panel.InstanceSelected += OnInstanceSelected;
+        // Field initializers may run when Godot reconstructs the managed debugger object, leaving
+        // an empty (non-null) set. Restore retained native session IDs once per panel rebind too.
+        RestoreSessionIds();
+        RepublishCurrentState();
+    }
+
+    private void RepublishCurrentState()
+    {
+        PublishInstances();
+        var sessionId = _router.SelectedSessionId;
+        if (sessionId < 0 || !_identities.TryGetValue(sessionId, out var identity)) return;
+        _panel?.OnBridgeReady(identity);
+        if (!_protocol.TryGetValue(sessionId, out var endpoint)) return;
+        _panel?.ApplyProtocolSnapshot(endpoint.Snapshot, identity);
+        _panel?.ApplyProtocolResults(endpoint.CompletedResults);
+        _panel?.ApplyProtocolTimeline(endpoint.Timeline);
     }
 
     public override void _SetupSession(int sessionId)
     {
+        EnsureManagedState();
         _sessionIds.Add(sessionId);
+        RememberSessionIds();
         _nextOwnedDiscoveryAtSeconds = 0;
         _panel?.InitializeSessionState(AnySessionActive());
     }
 
+    internal void QueueStartAfterManagedReload(ModeConfiguration configuration)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+        EnsureManagedState();
+        RestoreSessionIds();
+        var normalized = configuration.Normalize();
+        _unboundStartIntent = normalized;
+        ApplyRouteChange(_router.Reconcile(IsSessionActive));
+        var sessionId = _router.SelectedSessionId;
+        if (sessionId < 0)
+        {
+            SendDiscoveryMessages();
+            return;
+        }
+        _startIntent[sessionId] = normalized;
+        _unboundStartIntent = null;
+        DriveSelectedRecovery(sessionId);
+    }
+
     public void PollActiveSessions()
     {
+        EnsureManagedState();
         if (_panel == null) return;
         var active = _sessionIds.Where(IsSessionActive).ToHashSet();
         foreach (var stopped in _activeSessionIds.Except(active).ToArray())
@@ -48,6 +98,8 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
             _router.Forget(stopped);
             if (_protocol.Remove(stopped, out var endpoint)) endpoint.Disconnect();
             _identities.Remove(stopped);
+            _startIntent.Remove(stopped);
+            _resetAttempts.Remove(stopped);
             foreach (var key in _batchFrames.Keys.Where(key => key.Session == stopped).ToArray()) _batchFrames.Remove(key);
         }
         _activeSessionIds.Clear();
@@ -56,6 +108,7 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
         _panel.InitializeSessionState(active.Count > 0);
         PublishInstances();
         var now = Time.GetTicksMsec() / 1000.0;
+        RetrySelectedReset(now);
         if (active.Count == 0 || _router.SelectedSessionId >= 0 || now < _nextOwnedDiscoveryAtSeconds) return;
         _nextOwnedDiscoveryAtSeconds = now + 1;
         SendDiscoveryMessages();
@@ -63,20 +116,26 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
 
     public void Teardown()
     {
-        if (_panel == null) return;
+        EnsureManagedState();
         _pendingCapture.Cancel();
         StopSelectedOwner();
-        _panel.ProfilingToggled -= SendControlMessage;
-        _panel.DiscoveryRequested -= SendDiscoveryMessages;
-        _panel.InstanceSelected -= OnInstanceSelected;
-        _panel.SessionActiveQuery = null;
+        if (_panel != null)
+        {
+            _panel.ProfilingToggled -= SendControlMessage;
+            _panel.DiscoveryRequested -= SendDiscoveryMessages;
+            _panel.InstanceSelected -= OnInstanceSelected;
+            _panel.SessionActiveQuery = null;
+        }
         foreach (var endpoint in _protocol.Values) endpoint.Disconnect();
         _sessionIds.Clear();
         _activeSessionIds.Clear();
         _protocol.Clear();
         _identities.Clear();
+        _startIntent.Clear();
+        _resetAttempts.Clear();
         _batchFrames.Clear();
         _router.Clear();
+        RememberSessionIds();
         _panel = null;
     }
 
@@ -103,18 +162,24 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
 
     private void SendControlMessage(bool start)
     {
-        if (start) _pendingCapture.Request(_panel.ConfigurationForProtocol);
-        else _pendingCapture.Cancel();
         ApplyRouteChange(_router.Reconcile(IsSessionActive));
-        if (_router.SelectedSessionId < 0) { if (start) SendDiscoveryMessages(); return; }
-        if (!_protocol.TryGetValue(_router.SelectedSessionId, out var endpoint)) return;
-        if (start)
+        var sessionId = _router.SelectedSessionId;
+        if (sessionId < 0)
         {
-            var outcome = _pendingCapture.TryStart(endpoint);
-            if (outcome == PendingStartOutcome.Rejected)
-                _panel?.ReportDebuggerPayloadError("Selected capture mode is not supported by this target.");
+            _unboundStartIntent = start ? _panel.ConfigurationForProtocol.Normalize() : null;
+            if (start) SendDiscoveryMessages();
+            return;
         }
-        else endpoint.Stop();
+        if (start)
+            _startIntent[sessionId] = _panel.ConfigurationForProtocol.Normalize();
+        else
+        {
+            _startIntent.Remove(sessionId);
+            _pendingCapture.Cancel();
+            if (_protocol.TryGetValue(sessionId, out var endpoint) && endpoint.Stop())
+                return;
+        }
+        DriveSelectedRecovery(sessionId);
     }
 
     private void StopSelectedOwner()
@@ -163,7 +228,8 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
 
     public override bool _Capture(string message, Godot.Collections.Array data, int sessionId)
     {
-        _sessionIds.Add(sessionId);
+        EnsureManagedState();
+        if (_sessionIds.Add(sessionId)) RememberSessionIds();
         if (message == CsProfilerBridge.ReadyMessage)
         {
             if (!CsProfilerRuntimeIdentity.TryFromWire(data, out var identity))
@@ -176,6 +242,8 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
             PublishInstances();
             Callable.From(() => SendSessionMessage(sessionId, CsProfilerBridge.HandshakeMessage,
                 new Godot.Collections.Array())).CallDeferred();
+            if (_router.SelectedSessionId == sessionId)
+                Callable.From(() => DriveSelectedRecovery(sessionId)).CallDeferred();
             return true;
         }
         if (message == CsProfilerBridge.MetricsMessage)
@@ -221,11 +289,88 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
         if (accepted)
             foreach (var pair in _batchFrames.Where(pair => pair.Key.Session == sessionId).ToArray())
                 endpoint.AssociateBatchFlushFrame(pair.Key.Generation, pair.Key.Sequence, pair.Value);
-        if (accepted && _router.SelectedSessionId == sessionId && _pendingCapture.HasRequest &&
-            _identities.TryGetValue(sessionId, out var selectedIdentity) &&
-            string.Equals(endpoint.Snapshot.RuntimeToken, selectedIdentity.RuntimeToken, StringComparison.Ordinal))
-            Callable.From(() => _pendingCapture.TryStart(endpoint)).CallDeferred();
+        if (accepted && _router.SelectedSessionId == sessionId)
+        {
+            if (endpoint.ResetCompletedGeneration > 0)
+                _resetAttempts.Remove(sessionId);
+            Callable.From(() => DriveSelectedRecovery(sessionId)).CallDeferred();
+        }
         return true;
+    }
+
+    private void DriveSelectedRecovery(int sessionId)
+    {
+        if (sessionId < 0 || sessionId != _router.SelectedSessionId || !IsSessionActive(sessionId) ||
+            !_identities.TryGetValue(sessionId, out var identity)) return;
+        var endpoint = Endpoint(sessionId);
+        var runtimeMatches = string.Equals(endpoint.Snapshot.RuntimeToken, identity.RuntimeToken,
+            StringComparison.Ordinal);
+        var explicitIntent = _startIntent.ContainsKey(sessionId);
+        var action = OrphanRecoveryPolicy.Decide(true, runtimeMatches, identity.Capturing,
+            identity.ResetSupported, identity.Generation, endpoint.Snapshot,
+            endpoint.ResetCompletedGeneration, explicitIntent);
+        switch (action)
+        {
+            case OrphanRecoveryAction.WaitForNegotiation:
+                SendSessionMessage(sessionId, CsProfilerBridge.HandshakeMessage, new Godot.Collections.Array());
+                break;
+            case OrphanRecoveryAction.RestartTargetRequired:
+                _panel?.ReportDebuggerPayloadError(
+                    "This running target predates reload recovery. Restart the game, then press Start again.");
+                break;
+            case OrphanRecoveryAction.ResetOrphan:
+                SendOrRetryReset(sessionId, endpoint, identity);
+                break;
+            case OrphanRecoveryAction.StartFresh:
+                if (!_startIntent.Remove(sessionId, out var configuration)) return;
+                _pendingCapture.Request(configuration);
+                var outcome = _pendingCapture.TryStart(endpoint);
+                if (outcome == PendingStartOutcome.Rejected)
+                    _panel?.ReportDebuggerPayloadError(
+                        "Selected capture mode is not supported by this target.");
+                break;
+            case OrphanRecoveryAction.None:
+                break;
+        }
+    }
+
+    private void SendOrRetryReset(int sessionId, EditorCaptureCoordinator endpoint,
+        CsProfilerRuntimeIdentity identity)
+    {
+        if (_resetAttempts.ContainsKey(sessionId) || endpoint.ResetPending) return;
+        var requestId = Guid.NewGuid().ToString("N");
+        if (!endpoint.RequestOrphanReset(identity.Generation, requestId, identity.ResetSupported)) return;
+        _resetAttempts[sessionId] = new OrphanResetAttempt(requestId, 1,
+            Time.GetTicksMsec() / 1000.0 + 1.0);
+        _panel?.ReportDebuggerPayloadError(
+            "Game code rebuilt during capture; discarding the incomplete capture before restarting.");
+    }
+
+    private void RetrySelectedReset(double now)
+    {
+        var sessionId = _router.SelectedSessionId;
+        if (sessionId < 0 || !_resetAttempts.TryGetValue(sessionId, out var attempt) ||
+            now < attempt.NextRetryAtSeconds || !_protocol.TryGetValue(sessionId, out var endpoint)) return;
+        if (!endpoint.ResetPending)
+        {
+            _resetAttempts.Remove(sessionId);
+            DriveSelectedRecovery(sessionId);
+            return;
+        }
+        if (attempt.Attempts >= 3)
+        {
+            _resetAttempts.Remove(sessionId);
+            _startIntent.Remove(sessionId);
+            _panel?.ReportDebuggerPayloadError(
+                "Profiler could not reset the pre-rebuild capture. Restart the game, then press Start again.");
+            return;
+        }
+        if (!endpoint.RetryOrphanReset()) return;
+        _resetAttempts[sessionId] = attempt with
+        {
+            Attempts = attempt.Attempts + 1,
+            NextRetryAtSeconds = now + 1.0
+        };
     }
 
     private EditorCaptureCoordinator Endpoint(int sessionId)
@@ -246,15 +391,56 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
         {
             if (_router.SelectedSessionId == sessionId) _panel?.ApplyProtocolTimeline(timeline);
         };
+        endpoint.TerminalCaptureChanged += capture =>
+        {
+            if (_router.SelectedSessionId == sessionId) _panel?.ApplyProtocolTerminalCapture(capture);
+        };
         _protocol.Add(sessionId, endpoint);
         return endpoint;
     }
 
-        private void ApplyRouteChange(CsProfilerRouteChange change)
+    private void EnsureManagedState()
+    {
+        var restored = _sessionIds == null;
+        _sessionIds ??= new HashSet<int>();
+        _activeSessionIds ??= new HashSet<int>();
+        _protocol ??= new Dictionary<int, EditorCaptureCoordinator>();
+        _identities ??= new Dictionary<int, CsProfilerRuntimeIdentity>();
+        _batchFrames ??= new Dictionary<(int Session, long Generation, long Sequence), BatchFlushFrame>();
+        _router ??= new CsProfilerSessionRouterState();
+        _pendingCapture ??= new PendingCaptureRequest();
+        _startIntent ??= new Dictionary<int, ModeConfiguration>();
+        _resetAttempts ??= new Dictionary<int, OrphanResetAttempt>();
+        if (restored) RestoreSessionIds();
+    }
+
+    private void RememberSessionIds()
+    {
+        SetMeta(ReloadSessionIdsMeta, string.Join(",", _sessionIds.OrderBy(id => id)
+            .Take(MaximumRememberedSessions)));
+    }
+
+    private void RestoreSessionIds()
+    {
+        if (!HasMeta(ReloadSessionIdsMeta)) return;
+        foreach (var value in GetMeta(ReloadSessionIdsMeta).AsString()
+                     .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                     .Take(MaximumRememberedSessions))
+            if (int.TryParse(value, out var sessionId) && sessionId >= 0)
+                _sessionIds.Add(sessionId);
+        _nextOwnedDiscoveryAtSeconds = 0;
+    }
+
+    private void ApplyRouteChange(CsProfilerRouteChange change)
     {
         if (!change.Changed) return;
-        if (change.PreviousSessionId >= 0 && change.PreviousSessionId != change.SelectedSessionId &&
-            _protocol.TryGetValue(change.PreviousSessionId, out var previous)) previous.Stop();
+        if (change.PreviousSessionId >= 0 && change.PreviousSessionId != change.SelectedSessionId)
+        {
+            if (_startIntent.Remove(change.PreviousSessionId, out var previousIntent) &&
+                change.SelectedSessionId < 0)
+                _unboundStartIntent = previousIntent;
+            if (_protocol.TryGetValue(change.PreviousSessionId, out var previous)) previous.Stop();
+        }
         if (change.SelectedSessionId < 0 || change.Identity == null)
         {
             // A queued pre-target request must survive transient route loss during debugger startup.
@@ -265,13 +451,12 @@ public partial class CsProfilerDebuggerPlugin : EditorDebuggerPlugin
         _panel?.OnBridgeReady(change.Identity);
         if (_protocol.TryGetValue(change.SelectedSessionId, out var endpoint))
             _panel?.ApplyProtocolSnapshot(endpoint.Snapshot, change.Identity);
-        if (_panel?.ProfilingRequested == true)
+        if (_unboundStartIntent is not null && !_startIntent.ContainsKey(change.SelectedSessionId))
         {
-            _pendingCapture.Request(_panel.ConfigurationForProtocol);
-            if (_protocol.TryGetValue(change.SelectedSessionId, out endpoint) &&
-                string.Equals(endpoint.Snapshot.RuntimeToken, change.Identity.RuntimeToken, StringComparison.Ordinal))
-                _pendingCapture.TryStart(endpoint);
+            _startIntent[change.SelectedSessionId] = _unboundStartIntent;
+            _unboundStartIntent = null;
         }
+        DriveSelectedRecovery(change.SelectedSessionId);
     }
 }
 

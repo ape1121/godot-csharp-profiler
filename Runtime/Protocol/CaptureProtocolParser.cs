@@ -48,6 +48,8 @@ public sealed class CaptureProtocolParser
                 MessageKind.State => ParseState(fields, (int)major, (int)minor, token),
                 MessageKind.Batch => ParseBatch(fields, (int)major, (int)minor, token),
                 MessageKind.Stop => ParseStop(fields, (int)major, (int)minor, token),
+                MessageKind.Reset => ParseReset(fields, (int)major, (int)minor, token),
+                MessageKind.ResetAck => ParseResetAck(fields, (int)major, (int)minor, token),
                 MessageKind.Error => ParseError(fields, (int)major, (int)minor, token),
                 _ => null
             };
@@ -99,6 +101,12 @@ public sealed class CaptureProtocolParser
     private static StopMessage ParseStop(Dictionary<string, WireValue> f, int major, int minor, string token) =>
         new(major, minor, token, RequiredLong(f, "generation", 1, long.MaxValue),
             RequiredLong(f, "sequence", 1, long.MaxValue), RequiredFingerprint(f));
+
+    private static ResetMessage ParseReset(Dictionary<string, WireValue> f, int major, int minor, string token) =>
+        new(major, minor, token, RequiredLong(f, "generation", 1, long.MaxValue), RequiredRequestId(f));
+
+    private static ResetAckMessage ParseResetAck(Dictionary<string, WireValue> f, int major, int minor, string token) =>
+        new(major, minor, token, RequiredLong(f, "generation", 1, long.MaxValue), RequiredRequestId(f));
 
     private static ErrorMessage ParseError(Dictionary<string, WireValue> f, int major, int minor, string token) =>
         new(major, minor, token, RequiredLong(f, "generation", 0, long.MaxValue),
@@ -182,6 +190,14 @@ public sealed class CaptureProtocolParser
         if (value.Length != ProtocolLimits.FingerprintCharacters || value.Any(c => !Uri.IsHexDigit(c)))
             throw new InvalidWireException();
         return value;
+    }
+
+    private static string RequiredRequestId(Dictionary<string, WireValue> f)
+    {
+        var value = RequiredString(f, "requestId", ProtocolLimits.FingerprintCharacters);
+        if (value.Length != ProtocolLimits.FingerprintCharacters || value.Any(c => !Uri.IsHexDigit(c)))
+            throw new InvalidWireException();
+        return value.ToLowerInvariant();
     }
 
     private static string RequiredString(Dictionary<string, WireValue> f, string name, int max)

@@ -7,14 +7,19 @@ namespace Apeworks.GodotCSharpProfiler.Editor.Integration;
 /// <summary>Godot-free dock behavior. The view is a dumb renderer and never owns capture state.</summary>
 public sealed class ProfilerDockController
 {
+    private const int MaximumPersistedResultRows = 128;
+    private const int MaximumPersistedTimelineRowsPerPoint = 1;
+
     private readonly IProfilerDockView view;
     private readonly IProfilerCommandTransport transport;
     private readonly IAutomaticInstaller? installer;
     private readonly IProfilerOutput? output;
+    private readonly Action<ProfilerDockReloadState>? reloadStateChanged;
     private readonly ModeUiController modes = new();
     private CaptureSnapshot snapshot = DisconnectedSnapshot();
     private ProfilerResults results = ProfilerResults.Empty;
     private CaptureTimeline timeline = CaptureTimeline.Empty;
+    private ProfilerTerminalCapture? lastTerminalCapture;
     private string target = "No target";
     private string? statusOverride;
     private string installerStatus = "Automatic installation: not previewed";
@@ -24,16 +29,37 @@ public sealed class ProfilerDockController
     private bool waitingForTarget;
 
     public ProfilerDockController(IProfilerDockView view, IProfilerCommandTransport transport,
-        IAutomaticInstaller? installer, IProfilerOutput? output = null)
+        IAutomaticInstaller? installer, IProfilerOutput? output = null,
+        ProfilerDockReloadState? initialState = null,
+        Action<ProfilerDockReloadState>? reloadStateChanged = null)
     {
         this.view = view ?? throw new ArgumentNullException(nameof(view));
         this.transport = transport ?? throw new ArgumentNullException(nameof(transport));
         this.installer = installer;
         this.output = output;
+        this.reloadStateChanged = reloadStateChanged;
+        if (initialState?.SchemaVersion == ProfilerDockReloadState.CurrentSchemaVersion)
+        {
+            modes.Restore(BoundConfiguration(initialState.Configuration));
+            lastTerminalCapture = BoundTerminalCapture(initialState.TerminalCapture);
+            results = lastTerminalCapture?.Results ?? ProfilerResults.Empty;
+            timeline = lastTerminalCapture?.Timeline ?? CaptureTimeline.Empty;
+            if (lastTerminalCapture is not null)
+                snapshot = DisconnectedSnapshot() with
+                {
+                    Completeness = lastTerminalCapture.Completeness,
+                    PartialReason = lastTerminalCapture.PartialReason,
+                    Quality = lastTerminalCapture.Quality
+                };
+        }
         Render();
     }
 
     public ModeConfiguration Configuration => modes.Configuration;
+
+    public ProfilerDockReloadState CreateReloadSnapshot() => new(
+        ProfilerDockReloadState.CurrentSchemaVersion, modes.Configuration.Normalize(),
+        BoundTerminalCapture(lastTerminalCapture));
 
     public void UpdateSnapshot(CaptureSnapshot value, string targetDescription)
     {
@@ -69,24 +95,28 @@ public sealed class ProfilerDockController
     {
         modes.SelectPrimary(mode);
         Render();
+        PersistReloadState();
     }
 
     public void SelectManualOnly()
     {
         modes.SelectManualOnly();
         Render();
+        PersistReloadState();
     }
 
     public void SetManualOverlay(bool included)
     {
         modes.SetManualOverlay(included);
         Render();
+        PersistReloadState();
     }
 
     public void UpdateSampling(SamplingSettings settings)
     {
         modes.UpdateSampling(settings);
         Render();
+        PersistReloadState();
     }
 
     public void UpdateAutomatic(AutomaticSettings settings)
@@ -94,12 +124,14 @@ public sealed class ProfilerDockController
         modes.UpdateAutomatic(settings);
         InvalidatePreview();
         Render();
+        PersistReloadState();
     }
 
     public void UpdateManual(ManualSettings settings)
     {
         modes.UpdateManual(settings);
         Render();
+        PersistReloadState();
     }
 
     private void InvalidatePreview()
@@ -120,10 +152,14 @@ public sealed class ProfilerDockController
             transport.Send(ProfilerCommand.Start, modes.Configuration.Normalize());
             return true;
         }
-        if (snapshot.State is CaptureState.Disconnected or CaptureState.Negotiating)
+        var orphanResetPending = snapshot.State == CaptureState.Stopping &&
+                                 snapshot.LeaseOwner is null && snapshot.Fingerprint is null;
+        if (snapshot.State is CaptureState.Disconnected or CaptureState.Negotiating || orphanResetPending)
         {
             waitingForTarget = true;
-            statusOverride = "Waiting for target capabilities — capture will start automatically.";
+            statusOverride = orphanResetPending
+                ? "Resetting the pre-rebuild capture — a fresh capture will start automatically."
+                : "Waiting for target capabilities — capture will start automatically.";
             transport.Send(ProfilerCommand.Start, modes.Configuration.Normalize());
             Render();
             return true;
@@ -160,19 +196,144 @@ public sealed class ProfilerDockController
         }
         results = ProfilerResults.Empty;
         timeline = CaptureTimeline.Empty;
+        lastTerminalCapture = null;
         Render();
+        PersistReloadState();
     }
 
     public void ReplaceResults(ProfilerResults value)
     {
-        results = value ?? ProfilerResults.Empty;
+        results = BoundResults(value) ?? ProfilerResults.Empty;
         Render();
     }
 
+    public void ReplaceTerminalCapture(ProfilerTerminalCapture value)
+    {
+        lastTerminalCapture = BoundTerminalCapture(value);
+        if (lastTerminalCapture is null) return;
+        results = lastTerminalCapture.Results;
+        timeline = lastTerminalCapture.Timeline;
+        snapshot = snapshot with
+        {
+            Completeness = lastTerminalCapture.Completeness,
+            PartialReason = lastTerminalCapture.PartialReason,
+            Quality = lastTerminalCapture.Quality
+        };
+        Render();
+        PersistReloadState();
+    }
+
+    private void PersistReloadState() => reloadStateChanged?.Invoke(CreateReloadSnapshot());
+
     public void UpdateTimeline(CaptureTimeline value)
     {
-        timeline = value ?? CaptureTimeline.Empty;
+        timeline = BoundTimeline(value) ?? CaptureTimeline.Empty;
         Render();
+    }
+
+    private static ModeConfiguration BoundConfiguration(ModeConfiguration? value)
+    {
+        var normalized = (value ?? ModeConfiguration.Default).Normalize();
+        if (!Enum.IsDefined(normalized.Primary) || normalized.Sampling.RequestedIntervalNanoseconds < ProtocolLimits.MinSamplingIntervalNanoseconds ||
+            normalized.Sampling.RequestedIntervalNanoseconds > ProtocolLimits.MaxSamplingIntervalNanoseconds ||
+            normalized.Automatic.MaxMethods < 1 || normalized.Automatic.MaxMethods > ProtocolLimits.MaxConfiguredMethods ||
+            !ValidText(normalized.Sampling.IncludeAssemblies, ProtocolLimits.MaxConfigurationListCharacters) ||
+            !ValidText(normalized.Sampling.ExcludeAssemblies, ProtocolLimits.MaxConfigurationListCharacters) ||
+            !ValidText(normalized.Automatic.IncludePatterns, ProtocolLimits.MaxConfigurationListCharacters) ||
+            !ValidText(normalized.Automatic.ExcludePatterns, ProtocolLimits.MaxConfigurationListCharacters) ||
+            !ValidText(normalized.Manual.LabelPrefix, ProtocolLimits.MaxManualLabelPrefixCharacters))
+            return ModeConfiguration.Default;
+        return normalized;
+    }
+
+    private static bool ValidText(string? value, int maximum) => value is not null && value.Length <= maximum &&
+        !value.Any(char.IsControl);
+
+    private static ProfilerTerminalCapture? BoundTerminalCapture(ProfilerTerminalCapture? value)
+    {
+        if (value is null || value.Completeness is not (CaptureCompleteness.Complete or CaptureCompleteness.Partial) ||
+            value.Completeness == CaptureCompleteness.Complete && value.PartialReason != PartialReason.None ||
+            value.Completeness == CaptureCompleteness.Partial && value.PartialReason == PartialReason.None ||
+            !ValidQuality(value.Quality)) return null;
+        var results = BoundResults(value.Results, out var omittedResultRows);
+        var timeline = BoundTimeline(value.Timeline, out var omittedTimelineRows);
+        if (results is null || timeline is null) return null;
+        results = results with
+        {
+            Truncated = checked(results.Truncated + omittedResultRows + omittedTimelineRows)
+        };
+        return new ProfilerTerminalCapture(results, timeline, value.Completeness,
+            value.PartialReason, value.Quality);
+    }
+
+    private static ProfilerResults? BoundResults(ProfilerResults? value) =>
+        BoundResults(value, ProtocolLimits.MaxMethodsPerBatch, out _);
+
+    private static ProfilerResults? BoundResults(ProfilerResults? value, out long omittedRows) =>
+        BoundResults(value, MaximumPersistedResultRows, out omittedRows);
+
+    private static ProfilerResults? BoundResults(ProfilerResults? value, int maximumRows, out long omittedRows)
+    {
+        omittedRows = 0;
+        if (value?.Groups is null || value.Truncated < 0) return null;
+        var groups = new List<SourceResultGroup>();
+        var seen = new HashSet<CaptureSource>();
+        var remaining = maximumRows;
+        foreach (var group in value.Groups.Take(3))
+        {
+            if (group?.Rows is null || !Enum.IsDefined(group.Source) || !seen.Add(group.Source)) return null;
+            var rows = group.Rows.Take(Math.Min(group.Rows.Count, remaining)).ToArray();
+            if (rows.Any(row => !ValidResultRow(row, group.Source))) return null;
+            groups.Add(new SourceResultGroup(group.Source, rows));
+            omittedRows = checked(omittedRows + group.Rows.Count - rows.Length);
+            remaining -= rows.Length;
+        }
+        omittedRows = checked(omittedRows + value.Groups.Skip(3).Sum(group => group?.Rows?.Count ?? 0));
+        return new ProfilerResults(groups, value.Truncated);
+    }
+
+    private static bool ValidResultRow(ResultRow? row, CaptureSource source) => row is not null &&
+        !string.IsNullOrWhiteSpace(row.Name) && row.Name.Length <= ProtocolLimits.MaxMethodLabelCharacters &&
+        !row.Name.Any(char.IsControl) && row.Samples >= 0 && row.Calls >= 0 &&
+        double.IsFinite(row.EstimatedStackFrameShare) && row.EstimatedStackFrameShare >= 0 &&
+        double.IsFinite(row.ObservedWallTimeMilliseconds) && row.ObservedWallTimeMilliseconds >= 0 &&
+        double.IsFinite(row.AverageWallTimeMilliseconds) && row.AverageWallTimeMilliseconds >= 0 &&
+        double.IsFinite(row.MaximumWallTimeMilliseconds) && row.MaximumWallTimeMilliseconds >= 0 &&
+        (source == CaptureSource.Sampling
+            ? row.Calls == 0 && row.ObservedWallTimeMilliseconds == 0 && row.AverageWallTimeMilliseconds == 0 &&
+              row.MaximumWallTimeMilliseconds == 0
+            : row.Samples == 0 && row.EstimatedStackFrameShare == 0);
+
+    private static bool ValidQuality(QualityCounters value) => value.Observed >= 0 && value.Dropped >= 0 &&
+        value.Overflowed >= 0 && value.Invalid >= 0;
+
+    private static CaptureTimeline? BoundTimeline(CaptureTimeline? value) =>
+        BoundTimeline(value, ProtocolLimits.MaxMethodsPerBatch, out _);
+
+    private static CaptureTimeline? BoundTimeline(CaptureTimeline? value, out long omittedRows) =>
+        BoundTimeline(value, MaximumPersistedTimelineRowsPerPoint, out omittedRows);
+
+    private static CaptureTimeline? BoundTimeline(CaptureTimeline? value, int maximumRowsPerPoint,
+        out long omittedRows)
+    {
+        omittedRows = 0;
+        if (value?.Points is null) return null;
+        var points = value.Points.TakeLast(CaptureTimeline.MaximumPoints).ToArray();
+        long previousSequence = 0;
+        var bounded = new CaptureTimelinePoint[points.Length];
+        for (var index = 0; index < points.Length; index++)
+        {
+            var point = points[index];
+            if (point?.Rows is null || point.Sequence <= previousSequence || point.Value < 0 ||
+                point.Observations < 0 || !Enum.IsDefined(point.Source) ||
+                point.FlushFrame is { ProcessFrame: < 0 } or { ElapsedNanoseconds: <= 0 }) return null;
+            var rows = point.Rows.Take(maximumRowsPerPoint).ToArray();
+            if (rows.Any(row => !ValidResultRow(row, point.Source))) return null;
+            omittedRows = checked(omittedRows + point.Rows.Count - rows.Length);
+            bounded[index] = point with { Rows = rows };
+            previousSequence = point.Sequence;
+        }
+        return new CaptureTimeline(bounded);
     }
 
     public void Copy(ExportFormat format)
@@ -265,9 +426,8 @@ public sealed class ProfilerDockController
                 Completeness = snapshot.Completeness == CaptureCompleteness.Partial
                     ? CaptureCompleteness.Partial
                     : CaptureCompleteness.Complete,
-                PartialReason = snapshot.Completeness == CaptureCompleteness.Partial
-                    ? PartialReason.Disconnected
-                    : snapshot.PartialReason
+                // Keep the terminal capture's original failure reason after disconnect/reload.
+                PartialReason = snapshot.PartialReason
             };
         }
         return ModePresenter.Present(ModePresentationInput.FromSnapshot(presentationSnapshot,
@@ -316,6 +476,7 @@ public sealed class ProfilerDockController
             groups,
             timeline,
             waitingForTarget));
+
     }
 
     private static ToggleViewState Segment(string label, bool selected, Availability availability) =>

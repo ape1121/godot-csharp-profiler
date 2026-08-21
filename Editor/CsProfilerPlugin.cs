@@ -10,6 +10,10 @@ using System.Linq;
 [Tool]
 public partial class CsProfilerPlugin : EditorPlugin
 {
+    private const string ReloadDockInstanceMeta = "_godot_csharp_profiler_reload_dock_instance";
+    private const string ReloadDebuggerInstanceMeta = "_godot_csharp_profiler_reload_debugger_instance";
+    private const string ReloadPanelInstanceMeta = "_godot_csharp_profiler_reload_panel_instance";
+
     private CsProfilerDebuggerPlugin _debugger;
     private CsProfilerPanel _panel;
     private EditorDock _dock;
@@ -20,6 +24,7 @@ public partial class CsProfilerPlugin : EditorPlugin
     private double _editorAttachedProbeDeadline;
     private int _editorAttachedProbeRuns;
     private bool _registered;
+
     private ICoordinatorLifetime _coordinatorLifetime;
 
     // Backend ownership stays outside this plugin. A composition root may inject a disposal request.
@@ -30,10 +35,26 @@ public partial class CsProfilerPlugin : EditorPlugin
     {
         if (_registered)
             return;
+        // Godot normally retains the native EditorPlugin across a C# assembly reload without
+        // replaying _EnterTree. Some versions may replay it, so recover the retained surfaces
+        // instead of registering a duplicate dock/debugger pair.
+        if (HasMeta(ReloadDockInstanceMeta) || HasMeta(ReloadDebuggerInstanceMeta) ||
+            HasMeta(ReloadPanelInstanceMeta))
+        {
+            if (!RecoverAfterManagedReload())
+                CallDeferred(nameof(RecoverAfterManagedReload));
+            return;
+        }
         _registered = true;
         // Clean an owned entry left by an older build or interrupted editor session. Merely
         // opening the editor must not add this setting to the tracked project configuration.
         RemoveOwnedRuntimeBridgeAutoload();
+        CreateEditorSurfaces();
+        StartRequestedProbe();
+    }
+
+    private void CreateEditorSurfaces()
+    {
         _panel = new CsProfilerPanel { Name = "C# Profiler" };
         _dock = new EditorDock
         {
@@ -48,6 +69,12 @@ public partial class CsProfilerPlugin : EditorPlugin
         _debugger = new CsProfilerDebuggerPlugin();
         _debugger.Initialize(_panel);
         AddDebuggerPlugin(_debugger);
+        _panel.RememberReloadOwners(_debugger, this);
+        RememberReloadHandles();
+    }
+
+    private void StartRequestedProbe()
+    {
         if (OS.GetCmdlineUserArgs().Contains(
                 "--cs-profiler-editor-probe", StringComparer.Ordinal))
         {
@@ -58,12 +85,82 @@ public partial class CsProfilerPlugin : EditorPlugin
         {
             CallDeferred(nameof(RunUiProbe));
         }
+
+    }
+
+    internal void RecoverPanelAfterManagedReload(CsProfilerPanel panel)
+    {
+        _panel = panel;
+        _registered = true;
+        _dock ??= ResolveReloadHandle<EditorDock>(ReloadDockInstanceMeta);
+        _debugger ??= ResolveReloadHandle<CsProfilerDebuggerPlugin>(ReloadDebuggerInstanceMeta);
+        if (_debugger == null) return;
+        _panel.RememberReloadOwners(_debugger, this);
+        RememberReloadHandles();
+    }
+
+    private void RememberReloadHandles()
+    {
+        if (_dock != null && IsInstanceValid(_dock))
+            SetMeta(ReloadDockInstanceMeta, unchecked((long)_dock.GetInstanceId()));
+        if (_debugger != null && IsInstanceValid(_debugger))
+            SetMeta(ReloadDebuggerInstanceMeta, unchecked((long)_debugger.GetInstanceId()));
+        if (_panel != null && IsInstanceValid(_panel))
+            SetMeta(ReloadPanelInstanceMeta, unchecked((long)_panel.GetInstanceId()));
+    }
+
+    private T ResolveReloadHandle<T>(string metadata) where T : GodotObject
+    {
+        if (!HasMeta(metadata)) return null;
+        var id = unchecked((ulong)GetMeta(metadata).AsInt64());
+        return id == 0 ? null : InstanceFromId(id) as T;
+    }
+
+    private bool RecoverAfterManagedReload()
+    {
+        if (_registered && _dock != null && _debugger != null && _panel != null &&
+            IsInstanceValid(_dock) && IsInstanceValid(_debugger) && IsInstanceValid(_panel))
+            return true;
+        if (!IsInsideTree()) return false;
+
+        var retainedDock = ResolveReloadHandle<EditorDock>(ReloadDockInstanceMeta);
+        var retainedDebugger = ResolveReloadHandle<CsProfilerDebuggerPlugin>(ReloadDebuggerInstanceMeta);
+        var retainedPanel = ResolveReloadHandle<CsProfilerPanel>(ReloadPanelInstanceMeta);
+        if (retainedDock == null || retainedDebugger == null || retainedPanel == null ||
+            !IsInstanceValid(retainedDock) || !IsInstanceValid(retainedDebugger) ||
+            !IsInstanceValid(retainedPanel))
+        {
+            GD.PushError("C# Profiler could not recover its editor surfaces after the game rebuild. " +
+                         "Disable and re-enable the plugin once.");
+            return false;
+        }
+
+        _registered = true;
+        _dock = retainedDock;
+        _debugger = retainedDebugger;
+        _panel = retainedPanel;
+        if (!_panel.RecoverAfterManagedReload()) return false;
+        _debugger.Initialize(_panel);
+        _panel.RememberReloadOwners(_debugger, this);
+        RememberReloadHandles();
+        _debugger.PollActiveSessions();
+
+        return true;
     }
 
     public override void _ExitTree()
     {
         if (!_registered)
-            return;
+        {
+            // Disable may be the first callback after a managed rebuild. Recover only the retained
+            // native handles needed for teardown; rebuilding the panel while disabling is wasteful
+            // and can invoke controls that are about to be freed.
+            _dock ??= ResolveReloadHandle<EditorDock>(ReloadDockInstanceMeta);
+            _debugger ??= ResolveReloadHandle<CsProfilerDebuggerPlugin>(ReloadDebuggerInstanceMeta);
+            _panel ??= ResolveReloadHandle<CsProfilerPanel>(ReloadPanelInstanceMeta);
+            if (_dock == null && _debugger == null && _panel == null)
+                return;
+        }
         _registered = false;
         if (_debugger != null)
         {
@@ -83,6 +180,9 @@ public partial class CsProfilerPlugin : EditorPlugin
         _coordinatorLifetime?.RequestDispose();
         _coordinatorLifetime = null;
         RemoveOwnedRuntimeBridgeAutoload();
+        RemoveMeta(ReloadDockInstanceMeta);
+        RemoveMeta(ReloadDebuggerInstanceMeta);
+        RemoveMeta(ReloadPanelInstanceMeta);
     }
 
     private void RemoveOwnedRuntimeBridgeAutoload()
@@ -138,6 +238,8 @@ public partial class CsProfilerPlugin : EditorPlugin
 
     public override void _Process(double delta)
     {
+        if (!_registered || _dock == null || _debugger == null || _panel == null)
+            RecoverAfterManagedReload();
         _debugger?.PollActiveSessions();
         if (!_editorAttachedProbeRunning)
             return;

@@ -13,6 +13,8 @@ public sealed class ProductionRuntimeCaptureBackend : IRuntimeCaptureBackend
 {
     private static ProductionRuntimeCaptureBackend? s_automaticOwner;
     private readonly Func<SamplingOptions, IManagedSamplingLease>? _samplingFactory;
+    private readonly object _stopGate = new();
+    private Task<RuntimeCaptureStopResult>? _stopTask;
     private readonly Dictionary<string, long> _manualIds = new(StringComparer.Ordinal);
     private readonly Dictionary<string, long> _samplingIds = new(StringComparer.Ordinal);
     private IManagedSamplingLease? _sampler;
@@ -50,6 +52,7 @@ public sealed class ProductionRuntimeCaptureBackend : IRuntimeCaptureBackend
         error = null;
         if (_disposed || IsActive) { error = "Capture backend is busy."; return false; }
         if ((configuration.Modes & ~Capabilities.Modes) != 0) { error = "Requested backend is unavailable."; return false; }
+        lock (_stopGate) _stopTask = null;
         _modes = configuration.Modes;
         _maxMethods = configuration.MaxMethods;
         _manualIds.Clear();
@@ -58,16 +61,6 @@ public sealed class ProductionRuntimeCaptureBackend : IRuntimeCaptureBackend
         _manualLabelPrefix = configuration.ManualLabelPrefix;
         try
         {
-            if ((_modes & CaptureModes.Sampling) != 0)
-            {
-                _sampler = _samplingFactory!(new SamplingOptions
-                {
-                    MaxUniqueMethods = _maxMethods,
-                    IncludeAssemblyPrefixes = SplitList(configuration.SamplingIncludeAssemblies),
-                    ExcludeAssemblyPrefixes = SplitList(configuration.SamplingExcludeAssemblies)
-                });
-                _sampler.Start();
-            }
             if ((_modes & CaptureModes.AutomaticInstrumentation) != 0)
             {
                 if (Interlocked.CompareExchange(ref s_automaticOwner, this, null) is not null)
@@ -79,6 +72,16 @@ public sealed class ProductionRuntimeCaptureBackend : IRuntimeCaptureBackend
             {
                 if (!CsProfiler.TryStartCapture(owner, out _manualLease))
                     throw new InvalidOperationException("Manual profiler lease is owned by another capture.");
+            }
+            if ((_modes & CaptureModes.Sampling) != 0)
+            {
+                _sampler = _samplingFactory!(new SamplingOptions
+                {
+                    MaxUniqueMethods = _maxMethods,
+                    IncludeAssemblyPrefixes = SplitList(configuration.SamplingIncludeAssemblies),
+                    ExcludeAssemblyPrefixes = SplitList(configuration.SamplingExcludeAssemblies)
+                });
+                _sampler.Start();
             }
             return true;
         }
@@ -112,24 +115,58 @@ public sealed class ProductionRuntimeCaptureBackend : IRuntimeCaptureBackend
         return result;
     }
 
-    public IReadOnlyList<RuntimeSourceBatch> Stop()
+    public Task<RuntimeCaptureStopResult> StopAsync()
+    {
+        lock (_stopGate)
+        {
+            if (_stopTask is { IsCompleted: false } || _stopTask?.IsCompletedSuccessfully == true)
+                return _stopTask;
+            // Retry only backend cleanup. ManagedSamplingSession memoizes the one allowed
+            // EventPipe stop operation, so this cannot issue a second StopTracing command.
+            return _stopTask = StopCoreAsync();
+        }
+    }
+
+    private async Task<RuntimeCaptureStopResult> StopCoreAsync()
     {
         var result = new List<RuntimeSourceBatch>(3);
+        var dataIncomplete = false;
         Exception? failure = null;
         var sampler = _sampler;
-        _sampler = null;
         if (sampler is not null)
         {
+            try { dataIncomplete = await sampler.StopAsync().ConfigureAwait(false); }
+            catch (Exception exception)
+            {
+                throw new InvalidOperationException("Managed sampling failed to stop.", exception);
+            }
+
             try
             {
-                sampler.Stop();
                 var sampling = SamplingBatch(sampler.Snapshot(reset: true));
                 if (sampling.Methods.Count > 0 || sampling.Quality != QualityCounters.Zero)
                     result.Add(sampling);
             }
-            catch (Exception exception) { failure = exception; }
-            finally { try { sampler.Dispose(); } catch (Exception exception) { failure ??= exception; } }
+            catch (Exception exception) { failure = exception; dataIncomplete = true; }
+            try
+            {
+                sampler.Dispose();
+                _sampler = null;
+            }
+            catch (Exception exception) { failure ??= exception; }
         }
+
+        StopNonSamplingBackends(result, ref failure);
+        if (failure is not null)
+            throw new InvalidOperationException("One or more runtime capture backends failed to stop.", failure);
+        return new RuntimeCaptureStopResult(result, dataIncomplete);
+    }
+
+    public IReadOnlyList<RuntimeSourceBatch> Stop() =>
+        StopAsync().GetAwaiter().GetResult().Batches;
+
+    private void StopNonSamplingBackends(List<RuntimeSourceBatch> result, ref Exception? failure)
+    {
         if (_automatic && ReferenceEquals(Interlocked.CompareExchange(ref s_automaticOwner, null, this), this))
         {
             try { result.Add(AutomaticBatch(InstrumentationRecorder.StopCapture())); }
@@ -144,15 +181,18 @@ public sealed class ProductionRuntimeCaptureBackend : IRuntimeCaptureBackend
             catch (Exception exception) { failure ??= exception; }
         }
         _modes = CaptureModes.None;
-        if (failure is not null) throw new InvalidOperationException("One or more runtime capture backends failed to stop.", failure);
-        return result;
     }
 
     public void Dispose()
     {
         if (_disposed) return;
-        Stop();
         _disposed = true;
+        var stop = StopAsync();
+        if (!stop.IsCompletedSuccessfully)
+            _ = stop.ContinueWith(static task => _ = task.Exception,
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously | TaskContinuationOptions.OnlyOnFaulted,
+                TaskScheduler.Default);
     }
 
     private RuntimeSourceBatch SamplingBatch(SamplingSnapshot snapshot)
@@ -250,6 +290,7 @@ public sealed class ProductionRuntimeCaptureBackend : IRuntimeCaptureBackend
         Exception? Fault { get; }
         void Start();
         void Stop();
+        Task<bool> StopAsync();
         SamplingSnapshot Snapshot(bool reset);
     }
 
@@ -260,6 +301,11 @@ public sealed class ProductionRuntimeCaptureBackend : IRuntimeCaptureBackend
         public Exception? Fault => _session.Fault;
         public void Start() => _session.StartAsync().GetAwaiter().GetResult();
         public void Stop() => _session.StopAsync().GetAwaiter().GetResult();
+        public async Task<bool> StopAsync()
+        {
+            await _session.StopAsync().ConfigureAwait(false);
+            return _session.StopDataIncomplete;
+        }
         public SamplingSnapshot Snapshot(bool reset) => _session.GetSnapshot(reset);
         public void Dispose() => _session.DisposeAsync().AsTask().GetAwaiter().GetResult();
     }

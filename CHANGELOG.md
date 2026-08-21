@@ -2,6 +2,29 @@
 
 All notable changes use [Keep a Changelog](https://keepachangelog.com/) conventions.
 
+## [0.2.3] - 2026-08-20
+
+### Fixed
+
+- Starting or stopping the profiler after rebuilding game C# code no longer throws a
+  `NullReferenceException` from `CsProfilerPanel.OnStartPressed`. Godot retains the native editor
+  dock across managed assembly reloads but reconstructs its C# instance without rerunning
+  `_Ready()`. The first retained control action now rebuilds the panel's managed controller and
+  control tree in place, restores debugger sessions by reload-stable native IDs, rebinds command
+  transport, and continues the original action.
+- Reload recovery now clears disposed control wrappers before rebuilding and creates the controller
+  only after the replacement UI exists, preventing follow-on disposed-object failures during editor
+  polling.
+- Active sampling teardown no longer runs a potentially unbounded EventPipe Stop call on Godot's
+  debugger callback. One asynchronous epoch stop remains authoritative, stream backpressure has a
+  bounded abort fallback, and reset acknowledgement is withheld until runtime and local processing
+  are confirmed inactive.
+- Managed-reload recovery preserves one process-wide sampling lease across collectible C# contexts,
+  serializes epoch replacement, rejects conflicting reset retries, and starts the fresh generation
+  only after the orphaned generation's matching reset acknowledgement.
+- The sampling interval field now consistently converts displayed milliseconds to protocol
+  nanoseconds when configuration is changed and retained across reload.
+
 ## [0.2.2] - 2026-08-19
 
 ### Fixed
@@ -80,6 +103,7 @@ All notable changes use [Keep a Changelog](https://keepachangelog.com/) conventi
 - Setup edits only an ownership-marked top-level project import, rejects unsafe path indirection, preserves unrelated project content, and never edits `NuGet.Config`.
 - Automatic installation requires a fresh reviewed preview and explicit confirmation; disable/uninstall remove only addon-owned configuration.
 
+[0.2.3]: https://github.com/ape1121/godot-csharp-profiler/releases/tag/v0.2.3
 [0.2.2]: https://github.com/ape1121/godot-csharp-profiler/releases/tag/v0.2.2
 [0.2.1]: https://github.com/ape1121/godot-csharp-profiler/releases/tag/v0.2.1
 [0.2.0]: https://github.com/ape1121/godot-csharp-profiler/releases/tag/v0.2.0

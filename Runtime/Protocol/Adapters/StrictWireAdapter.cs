@@ -41,6 +41,10 @@ public static class StrictWireAdapter
                 fields.Add(Field("generation", value.Generation)); fields.Add(Field("fingerprint", value.Fingerprint)); break;
             case StopMessage value:
                 fields.Add(Field("generation", value.Generation)); fields.Add(Field("sequence", value.Sequence)); fields.Add(Field("fingerprint", value.Fingerprint)); break;
+            case ResetMessage value:
+                fields.Add(Field("generation", value.Generation)); fields.Add(Field("requestId", value.RequestId)); break;
+            case ResetAckMessage value:
+                fields.Add(Field("generation", value.Generation)); fields.Add(Field("requestId", value.RequestId)); break;
             case ErrorMessage value:
                 fields.Add(Field("generation", value.Generation)); fields.Add(Field("sequence", value.Sequence));
                 fields.Add(Field("code", value.Code)); fields.Add(Field("message", value.Message)); fields.Add(Field("fatal", value.Fatal)); break;
@@ -134,7 +138,8 @@ public static class StrictWireAdapter
         HelloMessage => MessageKind.Hello, CapabilitiesMessage => MessageKind.Capabilities,
         ConfigureMessage => MessageKind.Configure, StartMessage => MessageKind.Start,
         StateMessage => MessageKind.State, BatchMessage => MessageKind.Batch,
-        StopMessage => MessageKind.Stop, ErrorMessage => MessageKind.Error,
+        StopMessage => MessageKind.Stop, ResetMessage => MessageKind.Reset,
+        ResetAckMessage => MessageKind.ResetAck, ErrorMessage => MessageKind.Error,
         _ => throw new ArgumentOutOfRangeException(nameof(message))
     };
 

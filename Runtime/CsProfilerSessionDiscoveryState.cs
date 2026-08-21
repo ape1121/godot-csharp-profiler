@@ -74,7 +74,7 @@ internal sealed class CsProfilerRuntimeIdentity
     internal const int MaximumLabelLength = 64;
 
     internal static readonly CsProfilerRuntimeIdentity Unknown = new(
-        "unknown", 0, false, "game", "Game", false);
+        "unknown", 0, false, "game", "Game", false, 0);
 
     internal CsProfilerRuntimeIdentity(
         string runtimeToken,
@@ -82,7 +82,9 @@ internal sealed class CsProfilerRuntimeIdentity
         bool editorAttached,
         string role,
         string displayName,
-        bool capturing)
+        bool capturing,
+        long generation = 0,
+        bool resetSupported = false)
     {
         RuntimeToken = Normalize(runtimeToken, MaximumTokenLength, "unknown");
         ProcessId = Math.Max(0, processId);
@@ -90,6 +92,8 @@ internal sealed class CsProfilerRuntimeIdentity
         Role = Normalize(role, MaximumLabelLength, "game");
         DisplayName = Normalize(displayName, MaximumLabelLength, "Game");
         Capturing = capturing;
+        Generation = Math.Max(0, generation);
+        ResetSupported = resetSupported;
     }
 
     internal string RuntimeToken { get; }
@@ -98,6 +102,8 @@ internal sealed class CsProfilerRuntimeIdentity
     internal string Role { get; }
     internal string DisplayName { get; }
     internal bool Capturing { get; }
+    internal long Generation { get; }
+    internal bool ResetSupported { get; }
 
         internal static CsProfilerRuntimeIdentity FromWire(Godot.Collections.Array data) =>
         TryFromWire(data, out var identity) ? identity : Unknown;
@@ -107,7 +113,7 @@ internal sealed class CsProfilerRuntimeIdentity
         out CsProfilerRuntimeIdentity identity)
     {
         identity = Unknown;
-        if (data == null || data.Count != 6)
+        if (data == null || data.Count is not (6 or 7))
             return false;
         try
         {
@@ -116,18 +122,24 @@ internal sealed class CsProfilerRuntimeIdentity
                 data[2].VariantType != Variant.Type.Bool ||
                 data[3].VariantType != Variant.Type.String ||
                 data[4].VariantType != Variant.Type.String ||
-                data[5].VariantType != Variant.Type.Bool)
+                data[5].VariantType != Variant.Type.Bool ||
+                data.Count == 7 && data[6].VariantType != Variant.Type.Int)
             {
                 return false;
             }
 
+            var capturing = data[5].AsBool();
+            var generation = data.Count == 7 ? data[6].AsInt64() : 0;
+            if (generation < 0 || data.Count == 7 && capturing && generation < 1) return false;
             identity = new CsProfilerRuntimeIdentity(
                 data[0].AsString(),
                 data[1].AsInt64(),
                 data[2].AsBool(),
                 data[3].AsString(),
                 data[4].AsString(),
-                data[5].AsBool());
+                capturing,
+                generation,
+                data.Count == 7);
             return true;
         }
         catch (Exception error) when (error is InvalidCastException or ArgumentException or OverflowException)
