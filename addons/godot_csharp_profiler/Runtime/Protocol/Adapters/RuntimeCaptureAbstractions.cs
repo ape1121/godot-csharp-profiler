@@ -42,6 +42,10 @@ public sealed record RuntimeSourceBatch(
     QualityCounters Quality,
     IReadOnlyList<MethodSample> Methods);
 
+public sealed record RuntimeCaptureStopResult(
+    IReadOnlyList<RuntimeSourceBatch> Batches,
+    bool DataIncomplete);
+
 /// <summary>Backend-neutral capture operations. A backend must make Stop idempotent.</summary>
 public interface IRuntimeCaptureBackend : IDisposable
 {
@@ -50,4 +54,6 @@ public interface IRuntimeCaptureBackend : IDisposable
     bool TryStart(RuntimeCaptureConfiguration configuration, string owner, out string? error);
     IReadOnlyList<RuntimeSourceBatch> Drain();
     IReadOnlyList<RuntimeSourceBatch> Stop();
+    Task<RuntimeCaptureStopResult> StopAsync() =>
+        Task.FromResult(new RuntimeCaptureStopResult(Stop(), false));
 }

@@ -140,13 +140,22 @@ public static class CecilWeaver
             method.Body.Variables.Add(result);
         }
         var finallyStart = il.Create(OpCodes.Ldloc, token);
+        var after = il.Create(OpCodes.Nop);
         foreach (var ret in returns)
         {
-            if (result is not null) il.InsertBefore(ret, il.Create(OpCodes.Stloc, result));
-            ret.OpCode = OpCodes.Leave;
+            if (result is null)
+            {
+                ret.OpCode = OpCodes.Leave;
+                ret.Operand = after;
+                continue;
+            }
+
+            // Rewrite the original ret itself so any existing branch targeting it still
+            // stores the return value before leaving the protected region.
+            ret.OpCode = OpCodes.Stloc;
+            ret.Operand = result;
+            il.InsertAfter(ret, il.Create(OpCodes.Leave, after));
         }
-        var after = il.Create(OpCodes.Nop);
-        foreach (var ret in returns) ret.Operand = after;
         il.Append(finallyStart);
         il.Append(il.Create(OpCodes.Call, exit));
         il.Append(il.Create(OpCodes.Endfinally));

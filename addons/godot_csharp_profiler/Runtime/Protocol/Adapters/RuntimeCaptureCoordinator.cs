@@ -15,6 +15,11 @@ public sealed class RuntimeCaptureCoordinator : IDisposable
     private long _generation;
     private long _sequence;
     private QualityCounters _quality;
+    private string? _resetReceiptOwner;
+    private long _resetReceiptGeneration;
+    private string? _resetReceiptRequestId;
+    private Task<RuntimeCaptureStopResult>? _pendingStopTask;
+    private PendingStop? _pendingStop;
     private bool _connected;
     private bool _disposed;
 
@@ -29,7 +34,7 @@ public sealed class RuntimeCaptureCoordinator : IDisposable
     }
 
     public bool Connected => _connected;
-    public bool Capturing => _owner is not null && _backend.IsActive;
+    public bool Capturing => _owner is not null && (_pendingStop is not null || _backend.IsActive);
     public long Generation => _generation;
     public long Sequence => _sequence;
     public string? LeaseOwner => _owner;
@@ -49,7 +54,7 @@ public sealed class RuntimeCaptureCoordinator : IDisposable
         if (!_connected) return;
         Send(new HelloMessage(ProtocolVersion.Major, ProtocolVersion.Minor, _runtimeToken, "runtime", ProtocolLimits.MaxBatchBytes));
         var c = _backend.Capabilities;
-        Send(new CapabilitiesMessage(ProtocolVersion.Major, ProtocolVersion.Minor, _runtimeToken, 0, c.Modes,
+        Send(new CapabilitiesMessage(ProtocolVersion.Major, ProtocolVersion.Minor, _runtimeToken, _generation, c.Modes,
             c.SamplingIntervalRuntimeConfigurable, c.EffectiveSamplingIntervalNanoseconds,
             c.MaxMethods, ProtocolLimits.MaxBatchBytes, ProtocolLimits.MaxDepth));
     }
@@ -58,15 +63,25 @@ public sealed class RuntimeCaptureCoordinator : IDisposable
     public bool Receive(object? payload, string owner)
     {
         ThrowIfDisposed();
+        var completedReset = _pendingStop is { IsReset: true } completingReset &&
+            _pendingStopTask?.IsCompletedSuccessfully == true && !_backend.IsActive
+            ? completingReset : null;
+        PollPendingStop();
         if (!_connected || string.IsNullOrWhiteSpace(owner) ||
             !StrictWireAdapter.TryConvert(payload, out var wire) || wire is null ||
             !_parser.TryParse(wire, out var message, out _) || message is null ||
             !string.Equals(message.RuntimeToken, _runtimeToken, StringComparison.Ordinal)) return false;
+        if (completedReset is not null && message is ResetMessage completedMessage &&
+            completedReset.Generation == completedMessage.Generation &&
+            string.Equals(completedReset.Owner, owner, StringComparison.Ordinal) &&
+            string.Equals(completedReset.RequestId, completedMessage.RequestId, StringComparison.Ordinal))
+            return true;
         return message switch
         {
             ConfigureMessage configure => Configure(configure),
             StartMessage start => Start(start, owner),
             StopMessage stop => Stop(stop, owner),
+            ResetMessage reset => Reset(reset, owner),
             _ => false
         };
     }
@@ -74,22 +89,30 @@ public sealed class RuntimeCaptureCoordinator : IDisposable
     public void Flush()
     {
         ThrowIfDisposed();
-        if (!_connected || _owner is null || !_backend.IsActive || _configuration is null) return;
+        PollPendingStop();
+        if (!_connected || _pendingStop is not null || _owner is null || !_backend.IsActive || _configuration is null) return;
         try { EmitBatches(_backend.Drain()); }
         catch (Exception exception)
         {
             SendError(3, exception.Message, fatal: true);
-            StopOwned(sendTerminal: true, PartialReason.RuntimeError);
+            BeginStop(new PendingStop(true, PartialReason.RuntimeError,
+                _owner!, _generation, null));
         }
     }
 
     public void Disconnect()
     {
         if (_disposed || !_connected) return;
-        if (_owner is not null) StopOwned(sendTerminal: false, PartialReason.Disconnected);
         _connected = false;
-        _configuration = null;
-        _generation = _sequence = 0;
+        ClearResetReceipt();
+        if (_owner is not null)
+        {
+            if (_pendingStop is null)
+                BeginStop(new PendingStop(false, PartialReason.Disconnected,
+                    _owner, _generation, null));
+            return;
+        }
+        ClearInactiveState();
     }
 
     public void Dispose()
@@ -111,6 +134,7 @@ public sealed class RuntimeCaptureCoordinator : IDisposable
         _generation = message.Generation;
         _sequence = 0;
         _quality = QualityCounters.Zero;
+        ClearResetReceipt();
         return true;
     }
 
@@ -140,27 +164,127 @@ public sealed class RuntimeCaptureCoordinator : IDisposable
         // editor has at least seen the Capturing state, sequence 1). Sequences ahead of the stream
         // are still rejected, and Stop does not consume a slot; final batches continue the stream.
         if (message.Sequence < 2 || message.Sequence > _sequence + 1) return false;
-        StopOwned(sendTerminal: true, PartialReason.None);
-        return true;
+        return BeginStop(new PendingStop(true, PartialReason.None, owner, _generation, null));
     }
 
-    private void StopOwned(bool sendTerminal, PartialReason reason)
+    private bool Reset(ResetMessage message, string owner)
     {
-        IReadOnlyList<RuntimeSourceBatch> final;
-        try { final = _backend.Stop(); }
+        if (_resetReceiptRequestId is not null)
+        {
+            if (_resetReceiptGeneration != message.Generation ||
+                !string.Equals(_resetReceiptOwner, owner, StringComparison.Ordinal) ||
+                !string.Equals(_resetReceiptRequestId, message.RequestId, StringComparison.Ordinal)) return false;
+            SendResetAck(message.Generation, message.RequestId);
+            return true;
+        }
+        if (_pendingStop is { } pending)
+        {
+            var exact = pending.IsReset && pending.Generation == message.Generation &&
+                string.Equals(pending.Owner, owner, StringComparison.Ordinal) &&
+                string.Equals(pending.RequestId, message.RequestId, StringComparison.Ordinal);
+            if (!exact || _pendingStopTask is not null) return exact;
+            return BeginStop(pending, resume: true);
+        }
+        if (_owner is null || !string.Equals(_owner, owner, StringComparison.Ordinal) ||
+            message.Generation != _generation) return false;
+        return BeginStop(new PendingStop(false, PartialReason.None, owner,
+            message.Generation, message.RequestId));
+    }
+
+    private bool BeginStop(PendingStop pending, bool resume = false)
+    {
+        if (_pendingStop is not null && !resume) return false;
+        _pendingStop = pending;
+        try { _pendingStopTask = _backend.StopAsync(); }
         catch (Exception exception)
         {
-            final = Array.Empty<RuntimeSourceBatch>();
-            if (sendTerminal) SendError(2, exception.Message, fatal: true);
+            if (_backend.IsActive)
+            {
+                _pendingStopTask = null;
+                if (!pending.IsReset) _pendingStop = null;
+                if (pending.SendTerminal) SendError(2, exception.Message, fatal: true);
+                return false;
+            }
+            if (pending.SendTerminal) SendError(2, exception.Message, fatal: true);
+            _pendingStopTask = Task.FromResult(new RuntimeCaptureStopResult(
+                Array.Empty<RuntimeSourceBatch>(), true));
         }
-        if (sendTerminal)
+        return PollPendingStop() ?? true;
+    }
+
+    private bool? PollPendingStop()
+    {
+        var pending = _pendingStop;
+        var task = _pendingStopTask;
+        if (pending is null || task is null || !task.IsCompleted) return null;
+        _pendingStop = null;
+        _pendingStopTask = null;
+
+        RuntimeCaptureStopResult result;
+        try { result = task.GetAwaiter().GetResult(); }
+        catch (Exception exception)
         {
-            EmitBatches(final);
-            var completeness = reason == PartialReason.None ? CaptureCompleteness.Complete : CaptureCompleteness.Partial;
+            if (_backend.IsActive)
+            {
+                if (pending.IsReset) _pendingStop = pending;
+                if (pending.SendTerminal) SendError(2, exception.Message, fatal: true);
+                return false;
+            }
+            if (pending.SendTerminal) SendError(2, exception.Message, fatal: true);
+            result = new RuntimeCaptureStopResult(Array.Empty<RuntimeSourceBatch>(), true);
+        }
+        if (_backend.IsActive)
+        {
+            if (pending.IsReset) _pendingStop = pending;
+            if (pending.SendTerminal) SendError(2, "Capture backend remained active after stop.", fatal: true);
+            return false;
+        }
+
+        if (pending.IsReset)
+        {
+            _configuration = null;
+            _sequence = 0;
+            _quality = QualityCounters.Zero;
+            _resetReceiptOwner = pending.Owner;
+            _resetReceiptGeneration = pending.Generation;
+            _resetReceiptRequestId = pending.RequestId;
+            _owner = null;
+            SendResetAck(pending.Generation, pending.RequestId!);
+            return true;
+        }
+
+        if (pending.SendTerminal)
+        {
+            EmitBatches(result.Batches);
+            var reason = result.DataIncomplete && pending.Reason == PartialReason.None
+                ? PartialReason.RuntimeError : pending.Reason;
+            var completeness = reason == PartialReason.None
+                ? CaptureCompleteness.Complete : CaptureCompleteness.Partial;
             var state = reason == PartialReason.None ? CaptureState.Complete : CaptureState.Partial;
             SendState(state, completeness, reason, SourceForState(), _quality);
         }
         _owner = null;
+        if (!_connected) ClearInactiveState();
+        return true;
+    }
+
+    private void SendResetAck(long generation, string requestId) =>
+        Send(new ResetAckMessage(ProtocolVersion.Major, ProtocolVersion.Minor, _runtimeToken,
+            generation, requestId));
+
+    private void ClearResetReceipt()
+    {
+        _resetReceiptOwner = null;
+        _resetReceiptGeneration = 0;
+        _resetReceiptRequestId = null;
+    }
+
+    private void ClearInactiveState()
+    {
+        if (_owner is not null || _backend.IsActive) return;
+        _configuration = null;
+        _generation = _sequence = 0;
+        _quality = QualityCounters.Zero;
     }
 
     private void EmitBatches(IReadOnlyList<RuntimeSourceBatch>? batches)
@@ -259,6 +383,12 @@ public sealed class RuntimeCaptureCoordinator : IDisposable
     {
         value = string.IsNullOrWhiteSpace(value) ? "Runtime capture error." : new string(value.Where(c => !char.IsControl(c)).ToArray());
         return value[..Math.Min(value.Length, ProtocolLimits.MaxErrorCharacters)];
+    }
+
+    private sealed record PendingStop(bool SendTerminal, PartialReason Reason, string Owner,
+        long Generation, string? RequestId)
+    {
+        public bool IsReset => RequestId is not null;
     }
 
     private void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);

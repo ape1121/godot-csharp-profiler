@@ -28,6 +28,274 @@ public sealed class RuntimeCaptureCoordinatorTests
     }
 
     [Fact]
+    public void OrphanResetRequiresExactOwnerAndGenerationBeforeFreshCapture()
+    {
+        var (runtime, transport, backend) = Runtime();
+        runtime.Connect();
+        Assert.True(runtime.Receive(Configure(4, CaptureModes.ManualScopes), "owner"));
+        Assert.True(runtime.Receive(Start(4), "owner"));
+
+        const string requestId = "11111111111111111111111111111111";
+        Assert.False(runtime.Receive(Reset(4, requestId), "other"));
+        Assert.False(runtime.Receive(Reset(3, requestId), "owner"));
+        Assert.True(runtime.Capturing);
+
+        Assert.True(runtime.Receive(Reset(4, requestId), "owner"));
+        Assert.False(runtime.Capturing);
+        Assert.Equal(1, backend.Stops);
+        var acknowledgement = Assert.IsType<ResetAckMessage>(transport.Parsed.Last());
+        Assert.Equal((4L, requestId), (acknowledgement.Generation, acknowledgement.RequestId));
+
+        Assert.True(runtime.Receive(Configure(5, CaptureModes.ManualScopes), "owner"));
+        Assert.True(runtime.Receive(Start(5), "owner"));
+        Assert.False(runtime.Receive(Reset(4, requestId), "owner"));
+        Assert.True(runtime.Capturing);
+    }
+
+    [Fact]
+    public void ResetAcknowledgementIsIdempotentForTheSameOwnerGenerationAndRequest()
+    {
+        var (runtime, transport, backend) = Runtime();
+        runtime.Connect();
+        Assert.True(runtime.Receive(Configure(4, CaptureModes.ManualScopes), "owner"));
+        Assert.True(runtime.Receive(Start(4), "owner"));
+        const string requestId = "11111111111111111111111111111111";
+
+        Assert.True(runtime.Receive(Reset(4, requestId), "owner"));
+        Assert.True(runtime.Receive(Reset(4, requestId), "owner"));
+
+        Assert.Equal(1, backend.Stops);
+        var receipts = transport.Parsed.OfType<ResetAckMessage>().ToArray();
+        Assert.Equal(2, receipts.Length);
+        Assert.All(receipts, receipt => Assert.Equal((4L, requestId),
+            (receipt.Generation, receipt.RequestId)));
+        Assert.False(runtime.Receive(Reset(4, "22222222222222222222222222222222"), "owner"));
+    }
+
+    [Fact]
+    public void ResetFailureDoesNotAcknowledgeOrReleaseTheActiveLease()
+    {
+        var (runtime, transport, backend) = Runtime();
+        runtime.Connect();
+        Assert.True(runtime.Receive(Configure(4, CaptureModes.ManualScopes), "owner"));
+        Assert.True(runtime.Receive(Start(4), "owner"));
+        backend.StopFailure = new InvalidOperationException("stop failed");
+        const string requestId = "11111111111111111111111111111111";
+
+        Assert.False(runtime.Receive(Reset(4, requestId), "owner"));
+        Assert.True(runtime.Capturing);
+        Assert.Equal("owner", runtime.LeaseOwner);
+        Assert.DoesNotContain(transport.Parsed, message => message is ResetAckMessage);
+
+        backend.StopFailure = null;
+        Assert.False(runtime.Receive(Reset(4, "22222222222222222222222222222222"), "owner"));
+        Assert.False(runtime.Receive(Reset(4, requestId), "other"));
+        Assert.True(runtime.Receive(Reset(4, requestId), "owner"));
+        Assert.False(runtime.Capturing);
+        Assert.Single(transport.Parsed.OfType<ResetAckMessage>());
+    }
+
+    [Fact]
+    public async Task ResetDoesNotBlockTheDebuggerCallbackAndAcknowledgesOnlyAfterStopCompletes()
+    {
+        var (runtime, transport, backend) = Runtime();
+        runtime.Connect();
+        Assert.True(runtime.Receive(Configure(4, CaptureModes.ManualScopes), "owner"));
+        Assert.True(runtime.Receive(Start(4), "owner"));
+        backend.BlockStop = true;
+
+        const string requestId = "11111111111111111111111111111111";
+        var receive = Task.Run(() => runtime.Receive(Reset(4, requestId), "owner"));
+        await backend.StopEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        try
+        {
+            Assert.Same(receive, await Task.WhenAny(receive, Task.Delay(TimeSpan.FromSeconds(1))));
+            Assert.True(await receive);
+            Assert.True(runtime.Capturing);
+            Assert.Equal("owner", runtime.LeaseOwner);
+            Assert.DoesNotContain(transport.Parsed, message => message is ResetAckMessage);
+        }
+        finally
+        {
+            backend.StopRelease.Set();
+        }
+
+        await backend.StopExited.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        runtime.Flush();
+        Assert.False(runtime.Capturing);
+        Assert.Null(runtime.LeaseOwner);
+        Assert.Single(transport.Parsed.OfType<ResetAckMessage>());
+    }
+
+    [Fact]
+    public async Task PendingResetRetriesConvergeOnOneStopAndAckOnlyAfterInactivity()
+    {
+        var (runtime, transport, backend) = Runtime();
+        runtime.Connect();
+        Assert.True(runtime.Receive(Configure(4, CaptureModes.Sampling), "owner"));
+        Assert.True(runtime.Receive(Start(4), "owner"));
+        backend.BlockStop = true;
+        const string requestId = "11111111111111111111111111111111";
+
+        Assert.True(runtime.Receive(Reset(4, requestId), "owner"));
+        await backend.StopEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.True(runtime.Receive(Reset(4, requestId), "owner"));
+        Assert.False(runtime.Receive(Reset(4, "22222222222222222222222222222222"), "owner"));
+        Assert.Equal(1, backend.StopAttempts);
+        Assert.DoesNotContain(transport.Parsed, message => message is ResetAckMessage);
+
+        backend.StopRelease.Set();
+        await backend.StopExited.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        for (var attempt = 0; attempt < 100 && runtime.Capturing; attempt++)
+        {
+            runtime.Flush();
+            await Task.Delay(1);
+        }
+        Assert.False(runtime.Capturing);
+        Assert.Single(transport.Parsed.OfType<ResetAckMessage>());
+        Assert.True(runtime.Receive(Reset(4, requestId), "owner"));
+        Assert.Equal(2, transport.Parsed.OfType<ResetAckMessage>().Count());
+        Assert.Equal(1, backend.Stops);
+    }
+
+    [Fact]
+    public async Task CompletionObservedByExactResetRetryEmitsOneAcknowledgement()
+    {
+        var (runtime, transport, backend) = Runtime();
+        runtime.Connect();
+        Assert.True(runtime.Receive(Configure(4, CaptureModes.Sampling), "owner"));
+        Assert.True(runtime.Receive(Start(4), "owner"));
+        backend.BlockStop = true;
+        const string requestId = "11111111111111111111111111111111";
+
+        Assert.True(runtime.Receive(Reset(4, requestId), "owner"));
+        await backend.StopEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        backend.StopRelease.Set();
+        await backend.StopExited.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await Task.Delay(10);
+
+        Assert.True(runtime.Receive(Reset(4, requestId), "owner"));
+        Assert.Single(transport.Parsed.OfType<ResetAckMessage>());
+        Assert.True(runtime.Receive(Reset(4, requestId), "owner"));
+        Assert.Equal(2, transport.Parsed.OfType<ResetAckMessage>().Count());
+    }
+
+    [Fact]
+    public void SuccessfulStopResultThatRemainsActiveRetainsResetIdentity()
+    {
+        var (runtime, transport, backend) = Runtime();
+        runtime.Connect();
+        Assert.True(runtime.Receive(Configure(4, CaptureModes.Sampling), "owner"));
+        Assert.True(runtime.Receive(Start(4), "owner"));
+        backend.RemainActiveAfterStop = true;
+        const string requestId = "11111111111111111111111111111111";
+
+        Assert.False(runtime.Receive(Reset(4, requestId), "owner"));
+        Assert.True(runtime.Capturing);
+        Assert.Equal("owner", runtime.LeaseOwner);
+        Assert.DoesNotContain(transport.Parsed, message => message is ResetAckMessage);
+
+        backend.RemainActiveAfterStop = false;
+        Assert.False(runtime.Receive(Reset(4, "22222222222222222222222222222222"), "owner"));
+        Assert.True(runtime.Receive(Reset(4, requestId), "owner"));
+        Assert.False(runtime.Capturing);
+        Assert.Single(transport.Parsed.OfType<ResetAckMessage>());
+        Assert.Equal(2, backend.StopAttempts);
+    }
+
+    [Fact]
+    public async Task ExactResetRetryResumesWhenAsynchronousSuccessfulStopRemainsActive()
+    {
+        var (runtime, transport, backend) = Runtime();
+        runtime.Connect();
+        Assert.True(runtime.Receive(Configure(4, CaptureModes.Sampling), "owner"));
+        Assert.True(runtime.Receive(Start(4), "owner"));
+        backend.BlockStop = true;
+        backend.RemainActiveAfterStop = true;
+        const string requestId = "11111111111111111111111111111111";
+
+        Assert.True(runtime.Receive(Reset(4, requestId), "owner"));
+        await backend.StopEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        backend.StopRelease.Set();
+        await backend.StopExited.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await Task.Delay(10);
+        backend.BlockStop = false;
+        backend.RemainActiveAfterStop = false;
+
+        Assert.True(runtime.Receive(Reset(4, requestId), "owner"));
+        Assert.False(runtime.Capturing);
+        Assert.Single(transport.Parsed.OfType<ResetAckMessage>());
+        Assert.Equal(2, backend.StopAttempts);
+    }
+
+    [Fact]
+    public async Task ExactResetRetryResumesAfterAsynchronousStopFailure()
+    {
+        var (runtime, transport, backend) = Runtime();
+        runtime.Connect();
+        Assert.True(runtime.Receive(Configure(4, CaptureModes.Sampling), "owner"));
+        Assert.True(runtime.Receive(Start(4), "owner"));
+        backend.BlockStop = true;
+        backend.StopFailure = new InvalidOperationException("async failure");
+        const string requestId = "11111111111111111111111111111111";
+
+        Assert.True(runtime.Receive(Reset(4, requestId), "owner"));
+        await backend.StopEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        backend.StopRelease.Set();
+        for (var attempt = 0; attempt < 100 && !backend.StopExited.Task.IsCompleted; attempt++)
+            await Task.Delay(1);
+        await Task.Delay(10);
+        backend.BlockStop = false;
+        backend.StopFailure = null;
+
+        Assert.True(runtime.Receive(Reset(4, requestId), "owner"));
+        Assert.False(runtime.Capturing);
+        Assert.Single(transport.Parsed.OfType<ResetAckMessage>());
+        Assert.Equal(2, backend.StopAttempts);
+    }
+
+    [Fact]
+    public void OrdinaryStopFailureRetainsOwnerAndEmitsNoCompleteUntilRetrySucceeds()
+    {
+        var (runtime, transport, backend) = Runtime();
+        runtime.Connect();
+        Assert.True(runtime.Receive(Configure(1, CaptureModes.Sampling), "owner"));
+        Assert.True(runtime.Receive(Start(1), "owner"));
+        backend.StopFailure = new InvalidOperationException("still active");
+
+        Assert.False(runtime.Receive(Stop(1, 2), "owner"));
+        Assert.True(runtime.Capturing);
+        Assert.Equal("owner", runtime.LeaseOwner);
+        Assert.DoesNotContain(transport.Parsed,
+            message => message is StateMessage { State: CaptureState.Complete });
+        Assert.False(runtime.Receive(Configure(2, CaptureModes.Sampling), "owner"));
+
+        backend.StopFailure = null;
+        Assert.True(runtime.Receive(Stop(1, 2), "owner"));
+        Assert.False(runtime.Capturing);
+        Assert.Contains(transport.Parsed,
+            message => message is StateMessage { State: CaptureState.Complete });
+    }
+
+    [Fact]
+    public void InactiveAbortFinishesOrdinaryStopAsPartialRatherThanComplete()
+    {
+        var (runtime, transport, backend) = Runtime();
+        runtime.Connect();
+        Assert.True(runtime.Receive(Configure(1, CaptureModes.Sampling), "owner"));
+        Assert.True(runtime.Receive(Start(1), "owner"));
+        backend.StopDataIncomplete = true;
+
+        Assert.True(runtime.Receive(Stop(1, 2), "owner"));
+
+        var terminal = transport.Parsed.OfType<StateMessage>().Last();
+        Assert.Equal(CaptureState.Partial, terminal.State);
+        Assert.Equal(CaptureCompleteness.Partial, terminal.Completeness);
+        Assert.Equal(PartialReason.RuntimeError, terminal.PartialReason);
+        Assert.False(runtime.Capturing);
+    }
+
+    [Fact]
     public void MalformedStaleDuplicateGapAndWrongFingerprintAreInert()
     {
         var (runtime, _, backend) = Runtime();
@@ -152,6 +420,51 @@ public sealed class RuntimeCaptureCoordinatorTests
     }
 
     [Fact]
+    public async Task DrainFailureAndDisconnectDoNotBlockRuntimeCallbacks()
+    {
+        var (faultedRuntime, _, faultedBackend) = Runtime();
+        faultedRuntime.Connect();
+        Assert.True(faultedRuntime.Receive(Configure(1, CaptureModes.Sampling), "owner"));
+        Assert.True(faultedRuntime.Receive(Start(1), "owner"));
+        faultedBackend.DrainFailure = new InvalidOperationException("drain failed");
+        faultedBackend.BlockStop = true;
+
+        var (disconnectRuntime, _, disconnectBackend) = Runtime();
+        disconnectRuntime.Connect();
+        Assert.True(disconnectRuntime.Receive(Configure(1, CaptureModes.Sampling), "owner"));
+        Assert.True(disconnectRuntime.Receive(Start(1), "owner"));
+        disconnectBackend.BlockStop = true;
+
+        var flush = Task.Run(faultedRuntime.Flush);
+        var disconnect = Task.Run(disconnectRuntime.Disconnect);
+        await Task.WhenAll(
+            faultedBackend.StopEntered.Task.WaitAsync(TimeSpan.FromSeconds(2)),
+            disconnectBackend.StopEntered.Task.WaitAsync(TimeSpan.FromSeconds(2)));
+        try
+        {
+            Assert.Same(flush, await Task.WhenAny(flush, Task.Delay(TimeSpan.FromSeconds(1))));
+            Assert.Same(disconnect, await Task.WhenAny(disconnect, Task.Delay(TimeSpan.FromSeconds(1))));
+            Assert.True(faultedRuntime.Capturing);
+            Assert.True(disconnectRuntime.Capturing);
+        }
+        finally
+        {
+            faultedBackend.StopRelease.Set();
+            disconnectBackend.StopRelease.Set();
+        }
+
+        await Task.WhenAll(
+            faultedBackend.StopExited.Task.WaitAsync(TimeSpan.FromSeconds(2)),
+            disconnectBackend.StopExited.Task.WaitAsync(TimeSpan.FromSeconds(2)));
+        for (var attempt = 0; attempt < 100 && faultedRuntime.Capturing; attempt++)
+        {
+            faultedRuntime.Flush();
+            await Task.Delay(1);
+        }
+        Assert.False(faultedRuntime.Capturing);
+    }
+
+    [Fact]
     public void SamplingAndAutomaticAreExclusiveWhileManualOverlayIsAllowed()
     {
         var (runtime, _, _) = Runtime(CaptureModes.Sampling | CaptureModes.AutomaticInstrumentation | CaptureModes.ManualScopes);
@@ -202,6 +515,8 @@ public sealed class RuntimeCaptureCoordinatorTests
     private static WireMap Start(long generation) => StrictWireAdapter.Serialize(new StartMessage(ProtocolVersion.Major, ProtocolVersion.Minor, Token, generation, Fingerprint));
     private static WireMap Stop(long generation, long sequence, string fingerprint = Fingerprint) =>
         StrictWireAdapter.Serialize(new StopMessage(ProtocolVersion.Major, ProtocolVersion.Minor, Token, generation, sequence, fingerprint));
+    private static WireMap Reset(long generation, string requestId) =>
+        StrictWireAdapter.Serialize(new ResetMessage(ProtocolVersion.Major, ProtocolVersion.Minor, Token, generation, requestId));
 
     private sealed class FakeTransport : IRuntimeCaptureTransport
     {
@@ -220,9 +535,19 @@ public sealed class RuntimeCaptureCoordinatorTests
         public bool IsActive { get; private set; }
         public int Starts { get; private set; }
         public int Stops { get; private set; }
+        public int StopAttempts { get; private set; }
         public List<RuntimeSourceBatch> Pending { get; } = [];
         public RuntimeCaptureConfiguration? LastConfiguration { get; private set; }
         public Exception? DrainFailure { get; set; }
+        public Exception? StopFailure { get; set; }
+        public bool StopDataIncomplete { get; set; }
+        public bool RemainActiveAfterStop { get; set; }
+        public bool BlockStop { get; set; }
+        public TaskCompletionSource<bool> StopEntered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public ManualResetEventSlim StopRelease { get; } = new(false);
+        public TaskCompletionSource<bool> StopExited { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool TryStart(RuntimeCaptureConfiguration configuration, string owner, out string? error)
         { LastConfiguration = configuration; _ = owner; error = null; Starts++; IsActive = true; return true; }
         public IReadOnlyList<RuntimeSourceBatch> Drain()
@@ -230,7 +555,29 @@ public sealed class RuntimeCaptureCoordinatorTests
             if (DrainFailure is not null) throw DrainFailure;
             var value = Pending.ToArray(); Pending.Clear(); return value;
         }
-        public IReadOnlyList<RuntimeSourceBatch> Stop() { if (!IsActive) return []; Stops++; IsActive = false; return Drain(); }
+        public Task<RuntimeCaptureStopResult> StopAsync() => BlockStop
+            ? Task.Run(() => new RuntimeCaptureStopResult(Stop(), StopDataIncomplete))
+            : Task.FromResult(new RuntimeCaptureStopResult(Stop(), StopDataIncomplete));
+
+        public IReadOnlyList<RuntimeSourceBatch> Stop()
+        {
+            if (!IsActive) return [];
+            StopAttempts++;
+            if (BlockStop)
+            {
+                StopEntered.TrySetResult(true);
+                StopRelease.Wait(TimeSpan.FromSeconds(10));
+            }
+            if (StopFailure is not null)
+            {
+                StopExited.TrySetResult(true);
+                throw StopFailure;
+            }
+            Stops++;
+            if (!RemainActiveAfterStop) IsActive = false;
+            StopExited.TrySetResult(true);
+            return Drain();
+        }
         public void Dispose() { if (IsActive) Stop(); }
     }
 }

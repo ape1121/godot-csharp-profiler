@@ -79,6 +79,9 @@ public sealed class ModeUiController
 {
     public ModeConfiguration Configuration { get; private set; } = ModeConfiguration.Default;
 
+    public void Restore(ModeConfiguration configuration) =>
+        Configuration = (configuration ?? ModeConfiguration.Default).Normalize();
+
     public void SelectPrimary(PrimaryMode mode) => Configuration = Configuration with
     {
         Primary = mode,

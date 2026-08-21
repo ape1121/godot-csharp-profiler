@@ -117,9 +117,16 @@ internal static class Program
 
     private static void MalformedReadyPayloadFailsClosed()
     {
-        var valid = new Godot.Collections.Array("token", 42L, true, "game", "Game", false);
-        True(CsProfilerRuntimeIdentity.TryFromWire(valid, out var identity), "valid payload accepted");
-        Equal("token", identity.RuntimeToken, "valid identity parsed");
+        var legacy = new Godot.Collections.Array("token", 42L, true, "game", "Game", false);
+        True(CsProfilerRuntimeIdentity.TryFromWire(legacy, out var legacyIdentity), "legacy payload accepted");
+        Equal("token", legacyIdentity.RuntimeToken, "legacy identity parsed");
+        False(legacyIdentity.ResetSupported, "legacy payload does not claim reset support");
+
+        var current = new Godot.Collections.Array("token", 42L, true, "game", "Game", true, 4L);
+        True(CsProfilerRuntimeIdentity.TryFromWire(current, out var identity), "current payload accepted");
+        Equal(4L, identity.Generation, "current generation parsed");
+        True(identity.Capturing, "current capture state parsed");
+        True(identity.ResetSupported, "current payload advertises reset support");
 
         Godot.Collections.Array[] malformed =
         {
@@ -131,6 +138,9 @@ internal static class Program
             new("token", 42L, true, 123L, "Game", false),
             new("token", 42L, true, "game", 123L, false),
             new("token", 42L, true, "game", "Game", "not-bool"),
+            new("token", 42L, true, "game", "Game", true, "not-long"),
+            new("token", 42L, true, "game", "Game", true, 0L),
+            new("token", 42L, true, "game", "Game", false, -1L),
         };
         foreach (var payload in malformed)
         {

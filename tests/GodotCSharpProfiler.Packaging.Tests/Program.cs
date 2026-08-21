@@ -40,6 +40,8 @@ using (var zip = ZipFile.OpenRead(path))
     Assert(plugin.Contains($"version=\"{version}\"", StringComparison.Ordinal), "Exact release plugin version is missing.");
     var sampling = Read(zip, root + "Runtime/Sampling/ManagedSamplingSession.cs");
     Assert(sampling.StartsWith("#if GODOT_CSHARP_PROFILER_SAMPLING\n", StringComparison.Ordinal), "Raw addon must gate external sampling references.");
+    var epoch = Read(zip, root + "Runtime/Sampling/ManagedSamplingTraceEpoch.cs");
+    Assert(epoch.StartsWith("#if GODOT_CSHARP_PROFILER_SAMPLING\n", StringComparison.Ordinal), "Raw addon must gate external EventPipe epoch references.");
     var manifest = Read(zip, root + "assets/dependencies.json");
     Assert(manifest.Contains("0.2.661903") && manifest.Contains("3.2.5"), "Exact sampling versions are absent.");
     var setup = Read(zip, root + "assets/setup.ps1");

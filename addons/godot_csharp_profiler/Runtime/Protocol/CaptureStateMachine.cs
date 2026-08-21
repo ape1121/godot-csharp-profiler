@@ -67,9 +67,10 @@ public sealed class CaptureStateMachine
 
     public bool AcceptCapabilities(CapabilitiesMessage message)
     {
-        if (State != CaptureState.Ready || !MatchesRuntime(message) || message.Generation != 0 ||
+        if (State != CaptureState.Ready || !MatchesRuntime(message) || message.Generation < Generation ||
             !ValidAvailableModes(message.Modes) || message.MaxMethods < 1 ||
             !ValidCapabilityInterval(message)) return false;
+        Generation = message.Generation;
         SupportedModes = message.Modes;
         SamplingIntervalRuntimeConfigurable = message.SamplingIntervalRuntimeConfigurable;
         EffectiveSamplingIntervalNanoseconds = message.EffectiveSamplingIntervalNanoseconds;

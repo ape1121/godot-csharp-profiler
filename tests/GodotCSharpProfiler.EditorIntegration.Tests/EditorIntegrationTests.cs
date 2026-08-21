@@ -41,6 +41,19 @@ public sealed class EditorIntegrationTests
     }
 
     [Fact]
+    public void SamplingIntervalUiConvertsMillisecondsToNanoseconds()
+    {
+        var root = FindRepositoryRoot();
+        var panel = File.ReadAllText(Path.Combine(root, "addons", "godot_csharp_profiler", "Editor",
+            "CsProfilerPanel.cs"));
+
+        Assert.Contains(
+            "RequestedIntervalNanoseconds = (long)(value * 1_000_000)",
+            panel,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void SamplingIsUniversalDefaultAndManualHooksAreAnOptionalOverlay()
     {
         var controller = new ProfilerDockController(new FakeView(), new FakeTransport(), null);
@@ -69,6 +82,64 @@ public sealed class EditorIntegrationTests
     }
 
     [Fact]
+    public void OrphanRecoveryPolicyIsSelectedRouteScopedAndResetBarriered()
+    {
+        var readyAtFour = Snapshot(CaptureState.Ready) with
+        {
+            Generation = 4,
+            Sequence = 0,
+            Fingerprint = null,
+            LeaseOwner = null
+        };
+
+        Assert.Equal(OrphanRecoveryAction.None,
+            OrphanRecoveryPolicy.Decide(false, true, true, true, 4, readyAtFour, 0, true));
+        Assert.Equal(OrphanRecoveryAction.ResetOrphan,
+            OrphanRecoveryPolicy.Decide(true, true, true, true, 4, readyAtFour, 0, true));
+        var resetPendingAtFour = readyAtFour with { State = CaptureState.Stopping };
+        Assert.Equal(OrphanRecoveryAction.None,
+            OrphanRecoveryPolicy.Decide(true, true, true, true, 4, resetPendingAtFour, 0, true));
+        Assert.Equal(OrphanRecoveryAction.StartFresh,
+            OrphanRecoveryPolicy.Decide(true, true, true, true, 4, readyAtFour, 4, true));
+        Assert.Equal(OrphanRecoveryAction.None,
+            OrphanRecoveryPolicy.Decide(true, true, true, true, 4, readyAtFour, 4, false));
+        Assert.Equal(OrphanRecoveryAction.RestartTargetRequired,
+            OrphanRecoveryPolicy.Decide(true, true, true, false, 0, readyAtFour, 0, true));
+        Assert.Equal(OrphanRecoveryAction.WaitForNegotiation,
+            OrphanRecoveryPolicy.Decide(true, false, true, true, 4, readyAtFour, 0, true));
+        Assert.Equal(OrphanRecoveryAction.StartFresh,
+            OrphanRecoveryPolicy.Decide(true, true, false, true, 4, readyAtFour, 0, true));
+    }
+
+    [Fact]
+    public void ReconstructedEditorWaitsForMatchingResetAcknowledgementBeforeOneFreshStart()
+    {
+        var sent = new Queue<WireMap>();
+        var endpoint = new EditorCaptureCoordinator("owner", sent.Enqueue);
+        Assert.True(endpoint.Receive(StrictWireAdapter.Serialize(new HelloMessage(
+            ProtocolVersion.Major, ProtocolVersion.Minor, "runtime", "runtime", 4096))));
+        Assert.True(endpoint.Receive(StrictWireAdapter.Serialize(new CapabilitiesMessage(
+            ProtocolVersion.Major, ProtocolVersion.Minor, "runtime", 4,
+            CaptureModes.Sampling | CaptureModes.ManualScopes, true, 2_000_000, 4096, 4096, 8))));
+
+        const string requestId = "11111111111111111111111111111111";
+        Assert.True(endpoint.RequestOrphanReset(4, requestId));
+        Assert.IsType<ResetMessage>(Parse(sent.Dequeue()));
+        Assert.False(endpoint.Start(TestConfiguration));
+        Assert.False(endpoint.Receive(StrictWireAdapter.Serialize(new ResetAckMessage(
+            ProtocolVersion.Major, ProtocolVersion.Minor, "runtime", 4,
+            "22222222222222222222222222222222"))));
+        Assert.True(endpoint.Receive(StrictWireAdapter.Serialize(new ResetAckMessage(
+            ProtocolVersion.Major, ProtocolVersion.Minor, "runtime", 4, requestId))));
+
+        Assert.True(endpoint.Start(TestConfiguration));
+        var configure = Assert.IsType<ConfigureMessage>(Parse(sent.Dequeue()));
+        Assert.Equal(5, configure.Generation);
+        Assert.IsType<StartMessage>(Parse(sent.Dequeue()));
+        Assert.False(endpoint.Start(TestConfiguration));
+    }
+
+    [Fact]
     public void StartRequestedDuringNegotiationIsQueuedUntilCapabilitiesAreReady()
     {
         var sent = new Queue<WireMap>();
@@ -90,6 +161,25 @@ public sealed class EditorIntegrationTests
         Assert.False(pending.HasRequest);
     }
         [Fact]
+    public void StartPressedWhileOrphanResetIsPendingQueuesOneFreshIntent()
+    {
+        var view = new FakeView();
+        var transport = new FakeTransport();
+        var controller = new ProfilerDockController(view, transport, null);
+        controller.UpdateSnapshot(Snapshot(CaptureState.Stopping) with
+        {
+            Fingerprint = null,
+            LeaseOwner = null,
+            Modes = CaptureModes.None
+        }, "Resetting target");
+
+        Assert.True(controller.RequestStart());
+        Assert.Equal([ProfilerCommand.Start], transport.Commands);
+        Assert.True(view.Last!.CapturePending);
+        Assert.False(controller.RequestStart());
+    }
+
+    [Fact]
     public void ProductionControllerQueuesPreTargetStartAndStopCancelsThroughRealTransportPath()
     {
         var view = new FakeView();
@@ -132,6 +222,39 @@ public sealed class EditorIntegrationTests
         Assert.Equal(4, row.Samples);
         Assert.Equal(100, row.EstimatedStackFrameShare);
         Assert.Equal(0, row.ObservedWallTimeMilliseconds);
+    }
+
+    [Fact]
+    public void TerminalSnapshotIsPublishedBeforeCompletedResults()
+    {
+        var sent = new Queue<WireMap>();
+        var editor = ReadyEditor(sent);
+        Assert.True(editor.Start(TestConfiguration));
+        sent.Clear();
+        Assert.True(editor.Receive(State(CaptureState.Capturing, 1, QualityCounters.Zero)));
+        Assert.True(editor.Receive(Batch(CaptureSource.Sampling, 2,
+            [new MethodSample(7, "Game.Tick", 4, 0)])));
+        Assert.True(editor.Stop());
+        var events = new List<string>();
+        editor.SnapshotChanged += snapshot =>
+        {
+            if (snapshot.State == CaptureState.Complete) events.Add("snapshot");
+        };
+        editor.CompletedResultsChanged += _ => events.Add("results");
+        ProfilerTerminalCapture? terminal = null;
+        editor.TerminalCaptureChanged += value =>
+        {
+            terminal = value;
+            events.Add("terminal");
+        };
+
+        Assert.True(editor.Receive(State(CaptureState.Complete, 3, QualityCounters.Zero)));
+
+        Assert.Equal(["snapshot", "results", "terminal"], events);
+        Assert.NotNull(terminal);
+        Assert.Equal(editor.CompletedResults, terminal!.Results);
+        Assert.Equal(editor.Timeline.Points, terminal.Timeline.Points);
+        Assert.Equal(CaptureCompleteness.Complete, terminal.Completeness);
     }
 
     [Fact]
@@ -205,6 +328,69 @@ public sealed class EditorIntegrationTests
         Assert.Contains("Complete capture", view.Last.QualityBanner);
         Assert.True(view.Last.Commands.Start);
         Assert.False(view.Last.Commands.Stop);
+    }
+
+    [Fact]
+    public void ReloadSnapshotRestoresCustomModeSettingsCompletedResultsAndBoundedTimeline()
+    {
+        var original = new ProfilerDockController(new FakeView(), new FakeTransport(), null);
+        original.SelectMode(PrimaryMode.AutomaticInstrumentation);
+        original.SetManualOverlay(true);
+        original.UpdateSampling(new SamplingSettings("Game;Core", "System", 3_000_000));
+        original.UpdateAutomatic(new AutomaticSettings("Game.*", "Generated", 321));
+        original.UpdateManual(new ManualSettings("Gameplay/"));
+        var timeline = new CaptureTimeline(Enumerable.Range(1, CaptureTimeline.MaximumPoints + 20)
+            .Select(index => new CaptureTimelinePoint(index, CaptureSource.AutomaticSpans,
+                index * 100L, index, [new ResultRow($"Method {index}", 0, 0, index,
+                    index / 10.0, 0.1, 0.2)], new BatchFlushFrame(index, index * 1_000L))).ToArray());
+        original.UpdateTimeline(timeline);
+        original.UpdateSnapshot(Snapshot(CaptureState.Partial), "Game");
+        original.ReplaceTerminalCapture(new ProfilerTerminalCapture(Results(), timeline,
+            CaptureCompleteness.Partial, PartialReason.TransportLoss,
+            new QualityCounters(12, 1, 0, 0)));
+
+        var saved = original.CreateReloadSnapshot();
+        var restoredView = new FakeView();
+        var restored = new ProfilerDockController(restoredView, new FakeTransport(), null, initialState: saved);
+
+        Assert.Equal(original.Configuration.Normalize(), restored.Configuration.Normalize());
+        Assert.Equal(PrimaryMode.AutomaticInstrumentation, restored.Configuration.Primary);
+        Assert.True(restored.Configuration.IncludeManual);
+        Assert.Equal("Game.*", restored.Configuration.Automatic.IncludePatterns);
+        Assert.Equal(321, restored.Configuration.Automatic.MaxMethods);
+        Assert.Equal("Gameplay/", restored.Configuration.Manual.LabelPrefix);
+        var terminal = Assert.IsType<ProfilerTerminalCapture>(saved.TerminalCapture);
+        Assert.Equal(2, terminal.Results.Truncated);
+        Assert.Equal(CaptureCompleteness.Partial, terminal.Completeness);
+        Assert.Equal(PartialReason.TransportLoss, terminal.PartialReason);
+        Assert.Equal(new QualityCounters(12, 1, 0, 0), terminal.Quality);
+        Assert.Equal(3, restoredView.Last!.ResultGroups.Count);
+        Assert.Equal(CaptureTimeline.MaximumPoints, restoredView.Last.Timeline.Points.Count);
+        Assert.Equal(21, restoredView.Last.Timeline.Points[0].Sequence);
+        Assert.Equal(new BatchFlushFrame(21, 21_000), restoredView.Last.Timeline.Points[0].FlushFrame);
+        Assert.Contains("Transport loss", restoredView.Last.QualityBanner);
+    }
+
+    [Fact]
+    public void NewCaptureLiveTimelineResetDoesNotOverwritePriorTerminalCapture()
+    {
+        ProfilerDockReloadState? persisted = null;
+        var controller = new ProfilerDockController(new FakeView(), new FakeTransport(), null,
+            reloadStateChanged: state => persisted = state);
+        var terminalTimeline = new CaptureTimeline([
+            new CaptureTimelinePoint(2, CaptureSource.Sampling, 4, 4,
+                [new ResultRow("Game.Tick", 4, 100, 0, 0, 0, 0)],
+                new BatchFlushFrame(12, 34_000))
+        ]);
+        controller.ReplaceTerminalCapture(new ProfilerTerminalCapture(Results(), terminalTimeline,
+            CaptureCompleteness.Complete, PartialReason.None, new QualityCounters(4, 0, 0, 0)));
+        var terminal = Assert.IsType<ProfilerTerminalCapture>(persisted!.TerminalCapture);
+
+        controller.UpdateTimeline(CaptureTimeline.Empty);
+
+        Assert.Same(terminal, persisted.TerminalCapture);
+        Assert.Single(controller.CreateReloadSnapshot().TerminalCapture!.Timeline.Points);
+        Assert.Equal(2, controller.CreateReloadSnapshot().TerminalCapture!.Timeline.Points[0].Sequence);
     }
 
     [Fact]
@@ -444,6 +630,77 @@ public sealed class EditorIntegrationTests
 
         Assert.Equal((1, 1, 1, 1), (host.AddDock, host.AddDebugger, host.RemoveDebugger, host.RemoveDock));
         Assert.Equal(1, coordinator.DisposeCalls);
+    }
+
+    private static string FindRepositoryRoot()
+    {
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory != null && !Directory.Exists(Path.Combine(directory.FullName, "addons")))
+            directory = directory.Parent;
+        return directory?.FullName ?? throw new InvalidOperationException("Repository root not found.");
+    }
+
+    [Fact]
+    public void Managed_reload_rebuilds_retained_panel_and_rebinds_debugger_on_the_first_click()
+    {
+        var root = FindRepositoryRoot();
+        var plugin = File.ReadAllText(Path.Combine(root, "addons", "godot_csharp_profiler", "Editor",
+            "CsProfilerPlugin.cs"));
+        var panel = File.ReadAllText(Path.Combine(root, "addons", "godot_csharp_profiler", "Editor",
+            "CsProfilerPanel.cs"));
+        var debugger = File.ReadAllText(Path.Combine(root, "addons", "godot_csharp_profiler", "Editor",
+            "CsProfilerDebuggerPlugin.cs"));
+
+        Assert.Contains("RememberReloadOwners(_debugger, this)", plugin, StringComparison.Ordinal);
+        Assert.Contains("InstanceFromId", plugin, StringComparison.Ordinal);
+        Assert.Contains("internal void RecoverPanelAfterManagedReload", plugin, StringComparison.Ordinal);
+        Assert.Contains("if (!RecoverAfterManagedReload())", panel, StringComparison.Ordinal);
+        var startHandler = panel[panel.IndexOf("private void OnStartPressed()", StringComparison.Ordinal)..
+            panel.IndexOf("private bool TryHandoffRetainedStartIntent()", StringComparison.Ordinal)];
+        Assert.Contains("if (_controller == null || !_reloadTransportBound)", startHandler,
+            StringComparison.Ordinal);
+        Assert.Contains("if (!TryHandoffRetainedStartIntent())", startHandler, StringComparison.Ordinal);
+        Assert.True(startHandler.IndexOf("TryHandoffRetainedStartIntent()", StringComparison.Ordinal) <
+                    startHandler.IndexOf("RecoverAfterManagedReload()", StringComparison.Ordinal));
+        Assert.DoesNotContain("CallDeferred", startHandler, StringComparison.Ordinal);
+        var handoff = panel[panel.IndexOf("private bool TryHandoffRetainedStartIntent()", StringComparison.Ordinal)..
+            panel.IndexOf("private void CompleteStartRequest()", StringComparison.Ordinal)];
+        Assert.Contains("ReadReloadState()?.Configuration", handoff, StringComparison.Ordinal);
+        Assert.Contains("debugger.QueueStartAfterManagedReload(configuration);", handoff, StringComparison.Ordinal);
+        Assert.DoesNotContain("QueueStartReplayAfterManagedReload", panel, StringComparison.Ordinal);
+        var debuggerHandoff = debugger[debugger.IndexOf("internal void QueueStartAfterManagedReload", StringComparison.Ordinal)..
+            debugger.IndexOf("public void PollActiveSessions()", StringComparison.Ordinal)];
+        Assert.Contains("RestoreSessionIds();", debuggerHandoff, StringComparison.Ordinal);
+        Assert.Contains("_unboundStartIntent = normalized", debuggerHandoff, StringComparison.Ordinal);
+        Assert.Contains("DriveSelectedRecovery(sessionId);", debuggerHandoff, StringComparison.Ordinal);
+        Assert.Contains("ClearSurfaceReferences();", panel, StringComparison.Ordinal);
+        Assert.True(panel.IndexOf("ClearSurfaceReferences();", StringComparison.Ordinal) <
+                    panel.IndexOf("RemoveChild(child);", StringComparison.Ordinal));
+        Assert.True(panel.IndexOf("BuildSettingsUi();", StringComparison.Ordinal) <
+                    panel.IndexOf("_controller = new ProfilerDockController", StringComparison.Ordinal));
+        Assert.Contains("ResolveReloadObject<CsProfilerDebuggerPlugin>", panel, StringComparison.Ordinal);
+        Assert.Contains("debugger.Initialize(this);", panel, StringComparison.Ordinal);
+        Assert.DoesNotContain("ReloadRecoveryRequested", panel, StringComparison.Ordinal);
+        var initialize = debugger[debugger.IndexOf("public void Initialize(CsProfilerPanel panel)", StringComparison.Ordinal)..
+            debugger.IndexOf("private void RepublishCurrentState()", StringComparison.Ordinal)];
+        Assert.DoesNotContain("if (ReferenceEquals(_panel, panel)) return;", initialize, StringComparison.Ordinal);
+        Assert.Contains("var samePanel = ReferenceEquals(_panel, panel);", initialize, StringComparison.Ordinal);
+        Assert.Contains("if (_panel != null && !samePanel) Teardown();", initialize, StringComparison.Ordinal);
+        Assert.True(initialize.IndexOf("_panel.ProfilingToggled -= SendControlMessage;", StringComparison.Ordinal) <
+                    initialize.IndexOf("_panel.ProfilingToggled += SendControlMessage;", StringComparison.Ordinal));
+        Assert.True(initialize.IndexOf("_panel.DiscoveryRequested -= SendDiscoveryMessages;", StringComparison.Ordinal) <
+                    initialize.IndexOf("_panel.DiscoveryRequested += SendDiscoveryMessages;", StringComparison.Ordinal));
+        Assert.True(initialize.IndexOf("_panel.InstanceSelected -= OnInstanceSelected;", StringComparison.Ordinal) <
+                    initialize.IndexOf("_panel.InstanceSelected += OnInstanceSelected;", StringComparison.Ordinal));
+        Assert.Contains("EnsureManagedState();", debugger, StringComparison.Ordinal);
+        Assert.Contains("RestoreSessionIds();", debugger, StringComparison.Ordinal);
+        Assert.DoesNotContain("private readonly HashSet<int> _sessionIds", debugger, StringComparison.Ordinal);
+        Assert.Contains("_dock ??= ResolveReloadHandle<EditorDock>", plugin, StringComparison.Ordinal);
+        Assert.Contains("_debugger ??= ResolveReloadHandle<CsProfilerDebuggerPlugin>", plugin, StringComparison.Ordinal);
+        Assert.True(plugin.IndexOf("_debugger ??= ResolveReloadHandle<CsProfilerDebuggerPlugin>", StringComparison.Ordinal) <
+                    plugin.IndexOf("RemoveDebuggerPlugin(_debugger)", StringComparison.Ordinal));
+        Assert.Contains("public void Teardown()\n    {\n        EnsureManagedState();", debugger,
+            StringComparison.Ordinal);
     }
 
     [Fact]

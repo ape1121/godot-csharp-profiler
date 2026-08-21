@@ -61,11 +61,11 @@ public partial class CsProfilerBridge : Node
         if (!_captureRegistered) return;
         EngineDebugger.SendMessage(ReadyMessage, BuildReadyPayload(_runtimeToken, OS.GetProcessId(),
             IsEditorLaunched(OS.GetCmdlineArgs(), EngineDebugger.IsActive()), OS.GetCmdlineUserArgs(),
-            _coordinator?.Capturing == true));
+            _coordinator?.Capturing == true, _coordinator?.Generation ?? 0));
     }
 
     internal static Godot.Collections.Array BuildReadyPayload(string runtimeToken, long processId,
-        bool editorLaunched, string[] userArguments, bool capturing)
+        bool editorLaunched, string[] userArguments, bool capturing, long generation = 0)
     {
         var role = "game";
         var displayName = "Game";
@@ -85,7 +85,8 @@ public partial class CsProfilerBridge : Node
             CsProfilerRuntimeIdentity.Normalize(runtimeToken, CsProfilerRuntimeIdentity.MaximumTokenLength, "unknown"),
             Math.Max(0, processId), editorLaunched,
             CsProfilerRuntimeIdentity.Normalize(role, CsProfilerRuntimeIdentity.MaximumLabelLength, "game"),
-            CsProfilerRuntimeIdentity.Normalize(displayName, CsProfilerRuntimeIdentity.MaximumLabelLength, "Game"), capturing
+            CsProfilerRuntimeIdentity.Normalize(displayName, CsProfilerRuntimeIdentity.MaximumLabelLength, "Game"), capturing,
+            Math.Max(0, generation)
         };
     }
 

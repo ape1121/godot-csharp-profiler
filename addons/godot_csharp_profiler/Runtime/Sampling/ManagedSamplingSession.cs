@@ -27,22 +27,33 @@ public sealed class ManagedSamplingSession : IAsyncDisposable
         new("3c530d44-97ae-513a-1e6d-783e8f8e03a9");
     private static ManagedSamplingSession? s_activeSession;
 
+    private static readonly TimeSpan StopGracePeriod = TimeSpan.FromSeconds(1);
     private readonly SamplingOptions _options;
     private readonly SamplingAggregator _aggregator;
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
-    private EventPipeSession? _eventPipeSession;
-    private Microsoft.Diagnostics.Tracing.Etlx.TraceLogEventSource? _eventSource;
-    private Task? _processingTask;
+    private readonly object _stopGate = new();
+    private readonly Func<ManagedSamplingTraceEpoch> _epochFactory;
+    private readonly CancellationTokenSource _rotationCancellation = new();
+    private ManagedSamplingTraceEpoch? _currentEpoch;
+    private IDisposable? _processLease;
     private CancellationTokenRegistration _cancellationRegistration;
+    private Task? _stopTask;
     private int _state = (int)ManagedSamplingSessionState.Stopped;
     private int _traceEpochCount;
+    private int _streamAborted;
     private bool _hasStarted;
     private Exception? _fault;
 
     public ManagedSamplingSession(SamplingOptions options)
+        : this(options, null) { }
+
+    internal ManagedSamplingSession(
+        SamplingOptions options,
+        Func<ManagedSamplingTraceEpoch>? epochFactory)
     {
         _options = (options ?? throw new ArgumentNullException(nameof(options))).ValidateAndCopy();
         _aggregator = new SamplingAggregator(_options);
+        _epochFactory = epochFactory ?? CreateProductionTraceEpoch;
     }
 
     public static SamplingCapabilities Capabilities { get; } = SamplingCapabilities.Detect();
@@ -59,6 +70,9 @@ public sealed class ManagedSamplingSession : IAsyncDisposable
     /// </summary>
     public int TraceEpochCount => Volatile.Read(ref _traceEpochCount);
 
+    /// <summary>True when teardown required stream abort or parser processing faulted.</summary>
+    public bool StopDataIncomplete => Volatile.Read(ref _streamAborted) != 0;
+
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -71,19 +85,27 @@ public sealed class ManagedSamplingSession : IAsyncDisposable
 
             if (Interlocked.CompareExchange(ref s_activeSession, this, null) is not null)
                 throw new InvalidOperationException("Another managed sampling session is already active.");
+            _processLease = ManagedSamplingProcessLease.TryAcquire();
+            if (_processLease is null)
+            {
+                ReleaseGlobalOwnership();
+                throw new InvalidOperationException("Another managed sampling session is already active in this process.");
+            }
             _hasStarted = true;
 
             try
             {
-                CreateTraceEpoch();
+                _currentEpoch = _epochFactory();
+                Interlocked.Increment(ref _traceEpochCount);
                 Volatile.Write(ref _state, (int)ManagedSamplingSessionState.Running);
-                _processingTask = Task.Run(ProcessTraceEpochs);
+                ScheduleRotation(_currentEpoch);
                 _cancellationRegistration = cancellationToken.Register(
                     static state => _ = ((ManagedSamplingSession)state!).StopAsync(), this);
             }
             catch (Exception exception)
             {
-                DisposeTraceEpoch();
+                _currentEpoch?.Dispose();
+                _currentEpoch = null;
                 ReleaseGlobalOwnership();
                 var wrapped = CreateStartFailure(exception);
                 Volatile.Write(ref _fault, wrapped);
@@ -103,39 +125,53 @@ public sealed class ManagedSamplingSession : IAsyncDisposable
         }
     }
 
-    public async Task StopAsync()
+    public Task StopAsync()
     {
+        lock (_stopGate)
+        {
+            if (State == ManagedSamplingSessionState.Stopped) return Task.CompletedTask;
+            return _stopTask ??= StopCoreAsync();
+        }
+    }
+
+    private async Task StopCoreAsync()
+    {
+        ManagedSamplingTraceEpoch? epoch;
         await _lifecycle.WaitAsync().ConfigureAwait(false);
         try
         {
-            var state = State;
-            if (state is ManagedSamplingSessionState.Stopped or ManagedSamplingSessionState.Stopping)
-                return;
-            if (state == ManagedSamplingSessionState.Faulted && _eventPipeSession is null)
-            {
-                ReleaseGlobalOwnership();
-                return;
-            }
-
+            if (State == ManagedSamplingSessionState.Stopped) return;
             Volatile.Write(ref _state, (int)ManagedSamplingSessionState.Stopping);
+            _rotationCancellation.Cancel();
             _cancellationRegistration.Dispose();
-            StopCurrentTraceEpoch();
-            if (_processingTask is not null)
-                await _processingTask.ConfigureAwait(false);
+            epoch = _currentEpoch;
+        }
+        finally
+        {
+            _lifecycle.Release();
+        }
 
-            DisposeTraceEpoch();
-            _processingTask = null;
-            ReleaseGlobalOwnership();
-            if (State != ManagedSamplingSessionState.Faulted)
-                Volatile.Write(ref _state, (int)ManagedSamplingSessionState.Stopped);
+        try
+        {
+            if (epoch is not null)
+            {
+                var result = await epoch.StopAsync().ConfigureAwait(false);
+                if (result.DataIncomplete) Interlocked.Exchange(ref _streamAborted, 1);
+            }
         }
         catch (Exception exception)
         {
             Volatile.Write(ref _fault, exception);
             Volatile.Write(ref _state, (int)ManagedSamplingSessionState.Faulted);
-            DisposeTraceEpoch();
-            ReleaseGlobalOwnership();
             throw;
+        }
+
+        await _lifecycle.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (ReferenceEquals(_currentEpoch, epoch)) _currentEpoch = null;
+            ReleaseGlobalOwnership();
+            Volatile.Write(ref _state, (int)ManagedSamplingSessionState.Stopped);
         }
         finally
         {
@@ -151,39 +187,59 @@ public sealed class ManagedSamplingSession : IAsyncDisposable
         _lifecycle.Dispose();
     }
 
-    private void ProcessTraceEpochs()
+    private void ScheduleRotation(ManagedSamplingTraceEpoch epoch) =>
+        _ = RotateAfterDelayAsync(epoch);
+
+    private async Task RotateAfterDelayAsync(ManagedSamplingTraceEpoch epoch)
     {
         try
         {
-            while (State == ManagedSamplingSessionState.Running)
-            {
-                using var epochTimer = new System.Threading.Timer(
-                    static state => ((ManagedSamplingSession)state!).StopCurrentTraceEpoch(),
-                    this,
-                    _options.TraceRetentionDuration,
-                    Timeout.InfiniteTimeSpan);
-                _eventSource!.Process();
-                DisposeTraceEpoch();
-
-                if (State == ManagedSamplingSessionState.Running)
-                    CreateTraceEpoch();
-            }
+            await Task.Delay(_options.TraceRetentionDuration, _rotationCancellation.Token)
+                .ConfigureAwait(false);
+            await RotateTraceEpochAsync(epoch).ConfigureAwait(false);
         }
-        catch (Exception exception) when (State is ManagedSamplingSessionState.Stopping or ManagedSamplingSessionState.Stopped)
-        {
-            // Stopping an EventPipe epoch terminates its processing stream.
-            _ = exception;
-        }
+        catch (OperationCanceledException) when (_rotationCancellation.IsCancellationRequested) { }
         catch (Exception exception)
         {
             Volatile.Write(ref _fault, exception);
             Volatile.Write(ref _state, (int)ManagedSamplingSessionState.Faulted);
-            DisposeTraceEpoch();
-            ReleaseGlobalOwnership();
         }
     }
 
-    private void CreateTraceEpoch()
+    internal async Task RotateTraceEpochAsync(ManagedSamplingTraceEpoch epoch)
+    {
+        await _lifecycle.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (State != ManagedSamplingSessionState.Running ||
+                !ReferenceEquals(_currentEpoch, epoch)) return;
+        }
+        finally
+        {
+            _lifecycle.Release();
+        }
+
+        var result = await epoch.StopAsync().ConfigureAwait(false);
+        if (result.DataIncomplete) Interlocked.Exchange(ref _streamAborted, 1);
+
+        await _lifecycle.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (State != ManagedSamplingSessionState.Running ||
+                !ReferenceEquals(_currentEpoch, epoch)) return;
+            _currentEpoch = _epochFactory();
+            Interlocked.Increment(ref _traceEpochCount);
+            ScheduleRotation(_currentEpoch);
+        }
+        finally
+        {
+            _lifecycle.Release();
+        }
+    }
+
+    internal ManagedSamplingTraceEpoch? CurrentEpochForTests => _currentEpoch;
+
+    private ManagedSamplingTraceEpoch CreateProductionTraceEpoch()
     {
         var providers = new List<EventPipeProvider>
         {
@@ -194,41 +250,22 @@ public sealed class ManagedSamplingSession : IAsyncDisposable
             new("Microsoft-DotNETCore-SampleProfiler", EventLevel.Informational)
         };
         var client = new DiagnosticsClient(Environment.ProcessId);
-        _eventPipeSession = client.StartEventPipeSession(
+        var session = client.StartEventPipeSession(
             providers, requestRundown: false, _options.CircularBufferSizeMegabytes);
         try
         {
-            _eventSource = Microsoft.Diagnostics.Tracing.Etlx.TraceLog.CreateFromEventPipeSession(
-                _eventPipeSession,
+            var source = Microsoft.Diagnostics.Tracing.Etlx.TraceLog.CreateFromEventPipeSession(
+                session,
                 Microsoft.Diagnostics.Tracing.Etlx.TraceLog.EventPipeRundownConfiguration.Enable(client));
-            _eventSource.AllEvents += OnAnyEvent;
-            Interlocked.Increment(ref _traceEpochCount);
+            source.AllEvents += OnAnyEvent;
+            return new ManagedSamplingTraceEpoch(
+                new EventPipeSamplingTraceEpochControl(session, source), StopGracePeriod);
         }
         catch
         {
-            DisposeTraceEpoch();
+            session.Dispose();
             throw;
         }
-    }
-
-    private void StopCurrentTraceEpoch()
-    {
-        try
-        {
-            _eventPipeSession?.Stop();
-        }
-        catch (ServerNotAvailableException)
-        {
-            // The runtime may have already closed the stream during process shutdown.
-        }
-    }
-
-    private void DisposeTraceEpoch()
-    {
-        _eventSource?.Dispose();
-        _eventPipeSession?.Dispose();
-        _eventSource = null;
-        _eventPipeSession = null;
     }
 
     private void OnAnyEvent(TraceEvent traceEvent)
@@ -278,6 +315,9 @@ public sealed class ManagedSamplingSession : IAsyncDisposable
         return new InvalidOperationException("Unable to start the managed EventPipe sampling session.", exception);
     }
 
-    private void ReleaseGlobalOwnership() =>
+    private void ReleaseGlobalOwnership()
+    {
         Interlocked.CompareExchange(ref s_activeSession, null, this);
+        Interlocked.Exchange(ref _processLease, null)?.Dispose();
+    }
 }

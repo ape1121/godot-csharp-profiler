@@ -99,7 +99,9 @@ static class ReleaseBuilder
 
     static void TransformStage(string addon, string version)
     {
-        Transform(Path.Combine(addon, "Runtime", "Sampling", "ManagedSamplingSession.cs"), text => "#if GODOT_CSHARP_PROFILER_SAMPLING\n" + NormalizeLf(text).TrimEnd('\n') + "\n#endif\n");
+        foreach (var file in new[] { "ManagedSamplingSession.cs", "ManagedSamplingTraceEpoch.cs" })
+            Transform(Path.Combine(addon, "Runtime", "Sampling", file), text =>
+                "#if GODOT_CSHARP_PROFILER_SAMPLING\n" + NormalizeLf(text).TrimEnd('\n') + "\n#endif\n");
         ReplaceExactly(Path.Combine(addon, "plugin.cfg"), "version=\"0.1.0\"", $"version=\"{version}\"");
         ReplaceExactly(Path.Combine(addon, "Editor", "Installation", "ProjectInstaller.cs"), "ProfilerFodyVersion = \"0.1.0\"", $"ProfilerFodyVersion = \"{version}\"");
         var manifestPath = Path.Combine(addon, "assets", "dependencies.json");

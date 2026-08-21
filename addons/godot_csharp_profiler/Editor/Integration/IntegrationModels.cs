@@ -7,6 +7,52 @@ namespace Apeworks.GodotCSharpProfiler.Editor.Integration;
 
 public enum ProfilerCommand { Start, Stop, CancelPending }
 public enum ExportFormat { LosslessJson, VisibleCsv, ChromeTrace }
+public enum OrphanRecoveryAction { None, WaitForNegotiation, ResetOrphan, StartFresh, RestartTargetRequired }
+
+public static class OrphanRecoveryPolicy
+{
+    public static OrphanRecoveryAction Decide(bool selected, bool runtimeMatches, bool identityCapturing,
+        bool resetSupported, long identityGeneration, CaptureSnapshot endpoint, long resetCompletedGeneration,
+        bool explicitStartIntent)
+    {
+        if (!selected) return OrphanRecoveryAction.None;
+        if (endpoint.LeaseOwner is not null && endpoint.State is
+            CaptureState.Starting or CaptureState.Capturing or CaptureState.Stopping)
+            return OrphanRecoveryAction.None;
+        var orphanResetPending = endpoint.State == CaptureState.Stopping &&
+                                 endpoint.LeaseOwner is null && endpoint.Fingerprint is null;
+        if (orphanResetPending) return OrphanRecoveryAction.None;
+        var mayStart = endpoint.State is CaptureState.Ready or CaptureState.Complete or CaptureState.Partial;
+        var capabilitiesReady = endpoint.SupportedModes != CaptureModes.None && endpoint.CapabilityMaxMethods > 0;
+        if (identityCapturing)
+        {
+            // A locally accepted terminal state is newer authority than an observational Ready packet
+            // emitted while this same generation was still running.
+            if (endpoint.State is CaptureState.Complete or CaptureState.Partial &&
+                endpoint.Generation >= identityGeneration)
+                return explicitStartIntent && runtimeMatches && capabilitiesReady
+                    ? OrphanRecoveryAction.StartFresh
+                    : OrphanRecoveryAction.None;
+            if (identityGeneration < 1)
+                return OrphanRecoveryAction.RestartTargetRequired;
+            // Ready.Capturing describes generation G at discovery time. Once G was reset, that
+            // observation is stale and must never trigger another reset or handshake loop.
+            if (resetCompletedGeneration == identityGeneration)
+                return explicitStartIntent && runtimeMatches && mayStart && capabilitiesReady
+                    ? OrphanRecoveryAction.StartFresh
+                    : explicitStartIntent ? OrphanRecoveryAction.WaitForNegotiation : OrphanRecoveryAction.None;
+            if (!runtimeMatches || endpoint.State != CaptureState.Ready ||
+                endpoint.Generation != identityGeneration)
+                return OrphanRecoveryAction.WaitForNegotiation;
+            if (!resetSupported)
+                return OrphanRecoveryAction.RestartTargetRequired;
+            return OrphanRecoveryAction.ResetOrphan;
+        }
+        if (!explicitStartIntent) return OrphanRecoveryAction.None;
+        if (!runtimeMatches || !mayStart || !capabilitiesReady) return OrphanRecoveryAction.WaitForNegotiation;
+        return OrphanRecoveryAction.StartFresh;
+    }
+}
 public enum InstallerGate { Ready, PackageUnavailable, NeedsBuild, NeedsRestart, Stale, NoMatches, Error }
 
 public sealed record ResultRow(string Name, long Samples, double EstimatedStackFrameShare, long Calls,
@@ -32,6 +78,23 @@ public sealed record CaptureTimeline(IReadOnlyList<CaptureTimelinePoint> Points)
 {
     public const int MaximumPoints = 120;
     public static CaptureTimeline Empty { get; } = new(Array.Empty<CaptureTimelinePoint>());
+}
+
+/// <summary>One terminal editor-owned capture; never an in-flight lease or pending aggregate.</summary>
+public sealed record ProfilerTerminalCapture(
+    ProfilerResults Results,
+    CaptureTimeline Timeline,
+    CaptureCompleteness Completeness,
+    PartialReason PartialReason,
+    QualityCounters Quality);
+
+/// <summary>Versioned, bounded editor-owned state that may survive a managed assembly reload.</summary>
+public sealed record ProfilerDockReloadState(
+    int SchemaVersion,
+    ModeConfiguration Configuration,
+    ProfilerTerminalCapture? TerminalCapture)
+{
+    public const int CurrentSchemaVersion = 1;
 }
 
 public sealed record ToggleViewState(string Label, bool Selected, bool Enabled, string Tooltip);
@@ -91,6 +154,8 @@ public sealed class EditorCaptureCoordinator
     private readonly Dictionary<CaptureSource, Dictionary<long, Aggregate>> pending = new();
     private readonly List<CaptureTimelinePoint> timeline = new();
     private bool stopRequestedWhileStarting;
+    private string? resetRequestId;
+    private long resetGeneration;
     private int configuredMaxMethods = ProtocolLimits.MaxMethodsPerBatch;
     private CaptureSnapshot snapshot = new(CaptureState.Negotiating, null, 0, 0, null, null,
         CaptureModes.None, CaptureSource.Sampling, CaptureCompleteness.InProgress, PartialReason.None,
@@ -104,11 +169,16 @@ public sealed class EditorCaptureCoordinator
     }
 
     public CaptureSnapshot Snapshot => snapshot;
+    public bool ResetSupported { get; private set; }
+    public bool ResetPending => resetRequestId is not null;
+    public long ResetCompletedGeneration { get; private set; }
     public ProfilerResults CompletedResults { get; private set; } = ProfilerResults.Empty;
     public CaptureTimeline Timeline => new(timeline.ToArray());
+    public ProfilerTerminalCapture? LastTerminalCapture { get; private set; }
     public event Action<CaptureSnapshot>? SnapshotChanged;
     public event Action<ProfilerResults>? CompletedResultsChanged;
     public event Action<CaptureTimeline>? TimelineChanged;
+    public event Action<ProfilerTerminalCapture>? TerminalCaptureChanged;
     public event Action<string>? Rejected;
 
     public bool AssociateBatchFlushFrame(long generation, long sequence, BatchFlushFrame frame)
@@ -120,6 +190,11 @@ public sealed class EditorCaptureCoordinator
         if (timeline[index].FlushFrame is { } existing) return existing == frame;
         timeline[index] = timeline[index] with { FlushFrame = frame };
         TimelineChanged?.Invoke(Timeline);
+        if (LastTerminalCapture is not null && snapshot.State is (CaptureState.Complete or CaptureState.Partial))
+        {
+            LastTerminalCapture = LastTerminalCapture with { Timeline = Timeline };
+            TerminalCaptureChanged?.Invoke(LastTerminalCapture);
+        }
         return true;
     }
 
@@ -136,12 +211,20 @@ public sealed class EditorCaptureCoordinator
             CapabilitiesMessage value => AcceptCapabilities(value),
             StateMessage value => AcceptState(value),
             BatchMessage value => AcceptBatch(value),
+            ResetAckMessage value => AcceptResetAck(value),
             ErrorMessage value => AcceptError(value),
             _ => false
         };
         if (!accepted) return Reject("Profiler protocol packet rejected (stale, duplicate, gap, or incompatible identity).");
         if (message is ErrorMessage error) Rejected?.Invoke(ProfilerDockController.SafeText(error.Message, 160, "Runtime capture error"));
-        if (message is StateMessage terminal && terminal.State is CaptureState.Complete or CaptureState.Partial) CommitResults();
+        if (message is StateMessage terminal && terminal.State is CaptureState.Complete or CaptureState.Partial)
+        {
+            // Publish the terminal summary before results so persistence commits results, final timeline,
+            // completeness, reason, and quality as one editor-owned terminal capture.
+            SnapshotChanged?.Invoke(snapshot);
+            CommitResults();
+            return true;
+        }
         SnapshotChanged?.Invoke(snapshot);
         return true;
     }
@@ -149,7 +232,8 @@ public sealed class EditorCaptureCoordinator
     public bool Start(ModeConfiguration configuration)
     {
         ArgumentNullException.ThrowIfNull(configuration);
-        if (snapshot.State is not (CaptureState.Ready or CaptureState.Complete or CaptureState.Partial) ||
+        if (resetRequestId is not null ||
+            snapshot.State is not (CaptureState.Ready or CaptureState.Complete or CaptureState.Partial) ||
             snapshot.RuntimeToken is null || snapshot.SupportedModes == CaptureModes.None) return false;
         var normalized = configuration.Normalize();
         var generation = checked(snapshot.Generation + 1);
@@ -184,6 +268,29 @@ public sealed class EditorCaptureCoordinator
         return true;
     }
 
+    public bool RequestOrphanReset(long generation, string requestId, bool resetSupported = true)
+    {
+        ResetSupported = resetSupported;
+        if (!ResetSupported || snapshot.RuntimeToken is null || generation < 1 || snapshot.Generation != generation ||
+            resetRequestId is not null || !ValidRequestId(requestId)) return false;
+        resetGeneration = generation;
+        resetRequestId = requestId.ToLowerInvariant();
+        snapshot = snapshot with { State = CaptureState.Stopping };
+        send(StrictWireAdapter.Serialize(new ResetMessage(ProtocolVersion.Major, ProtocolVersion.Minor,
+            snapshot.RuntimeToken, generation, resetRequestId)));
+        SnapshotChanged?.Invoke(snapshot);
+        return true;
+    }
+
+    public bool RetryOrphanReset()
+    {
+        if (!ResetSupported || resetRequestId is null || resetGeneration < 1 ||
+            snapshot.RuntimeToken is null) return false;
+        send(StrictWireAdapter.Serialize(new ResetMessage(ProtocolVersion.Major, ProtocolVersion.Minor,
+            snapshot.RuntimeToken, resetGeneration, resetRequestId)));
+        return true;
+    }
+
     public bool Stop()
     {
         if (snapshot.State is not (CaptureState.Starting or CaptureState.Capturing) ||
@@ -210,6 +317,10 @@ public sealed class EditorCaptureCoordinator
 
     public void Disconnect()
     {
+        ResetSupported = false;
+        resetRequestId = null;
+        resetGeneration = 0;
+        ResetCompletedGeneration = 0;
         snapshot = snapshot with { State = CaptureState.Disconnected, RuntimeToken = null, Generation = 0,
             Sequence = 0, Fingerprint = null, LeaseOwner = null, Modes = CaptureModes.None,
             SupportedModes = CaptureModes.None, SamplingIntervalRuntimeConfigurable = false,
@@ -221,6 +332,7 @@ public sealed class EditorCaptureCoordinator
         private bool AcceptHello(HelloMessage message)
     {
         if (message.Major != ProtocolVersion.Major) return false;
+
         if (string.Equals(snapshot.RuntimeToken, message.RuntimeToken, StringComparison.Ordinal))
         {
             if (snapshot.State == CaptureState.Error)
@@ -236,18 +348,21 @@ public sealed class EditorCaptureCoordinator
             SupportedModes = CaptureModes.None, SamplingIntervalRuntimeConfigurable = false,
             EffectiveSamplingIntervalNanoseconds = 0, CapabilityMaxMethods = 0 };
         pending.Clear();
+        resetRequestId = null;
+        resetGeneration = 0;
+        ResetCompletedGeneration = 0;
         return true;
     }
 
         private bool AcceptCapabilities(CapabilitiesMessage message)
     {
-        if (!MatchesRuntime(message) || message.Generation != 0) return false;
+        if (!MatchesRuntime(message) || message.Generation < snapshot.Generation) return false;
         if (snapshot.State != CaptureState.Ready)
             return message.Modes == snapshot.SupportedModes &&
                    message.SamplingIntervalRuntimeConfigurable == snapshot.SamplingIntervalRuntimeConfigurable &&
                    message.EffectiveSamplingIntervalNanoseconds == snapshot.EffectiveSamplingIntervalNanoseconds &&
                    message.MaxMethods == snapshot.CapabilityMaxMethods;
-        snapshot = snapshot with { SupportedModes = message.Modes,
+        snapshot = snapshot with { Generation = message.Generation, SupportedModes = message.Modes,
             SamplingIntervalRuntimeConfigurable = message.SamplingIntervalRuntimeConfigurable,
             EffectiveSamplingIntervalNanoseconds = message.EffectiveSamplingIntervalNanoseconds,
             CapabilityMaxMethods = message.MaxMethods };
@@ -323,6 +438,33 @@ public sealed class EditorCaptureCoordinator
         return true;
     }
 
+    private bool AcceptResetAck(ResetAckMessage message)
+    {
+        if (resetRequestId is null || !MatchesRuntime(message) ||
+            message.Generation != resetGeneration ||
+            !string.Equals(message.RequestId, resetRequestId, StringComparison.Ordinal)) return false;
+        resetRequestId = null;
+        resetGeneration = 0;
+        ResetCompletedGeneration = message.Generation;
+        stopRequestedWhileStarting = false;
+        pending.Clear();
+        timeline.Clear();
+        snapshot = snapshot with
+        {
+            State = CaptureState.Ready,
+            Generation = message.Generation,
+            Sequence = 0,
+            Fingerprint = null,
+            LeaseOwner = null,
+            Modes = CaptureModes.None,
+            Completeness = CaptureCompleteness.InProgress,
+            PartialReason = PartialReason.None,
+            Quality = QualityCounters.Zero
+        };
+        TimelineChanged?.Invoke(CaptureTimeline.Empty);
+        return true;
+    }
+
     private bool AcceptError(ErrorMessage message)
     {
         if (!MatchesRuntime(message) || message.Generation != snapshot.Generation || message.Sequence != snapshot.Sequence + 1) return false;
@@ -354,6 +496,9 @@ public sealed class EditorCaptureCoordinator
 
     private static bool ValidConfigurationText(string value, int maximum) => value is not null &&
         value.Length <= maximum && !value.Any(char.IsControl);
+
+    private static bool ValidRequestId(string value) => value is not null &&
+        value.Length == ProtocolLimits.FingerprintCharacters && value.All(Uri.IsHexDigit);
 
         private static IReadOnlyList<ResultRow> BuildRows(CaptureSource source, IReadOnlyList<MethodSample> methods)
     {
@@ -387,6 +532,9 @@ public sealed class EditorCaptureCoordinator
         var quality = snapshot.Quality;
         CompletedResults = new ProfilerResults(groups, checked(quality.Dropped + quality.Overflowed));
         CompletedResultsChanged?.Invoke(CompletedResults);
+        LastTerminalCapture = new ProfilerTerminalCapture(CompletedResults, Timeline,
+            snapshot.Completeness, snapshot.PartialReason, snapshot.Quality);
+        TerminalCaptureChanged?.Invoke(LastTerminalCapture);
         pending.Clear();
     }
 

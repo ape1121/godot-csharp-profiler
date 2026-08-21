@@ -18,6 +18,11 @@ using System.Text.Json;
 [Tool]
 public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfilerCommandTransport, IProfilerOutput
 {
+    private const string ReloadDebuggerInstanceMeta = "_godot_csharp_profiler_debugger_instance";
+    private const string ReloadOwnerPluginInstanceMeta = "_godot_csharp_profiler_owner_plugin_instance";
+    private const string ReloadStateMeta = "_godot_csharp_profiler_reload_state";
+    private const int MaximumReloadStateCharacters = 1_000_000;
+
     public sealed class ProfileFrame
     {
         public long Index;
@@ -59,8 +64,8 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         }
     }
 
-    private readonly List<ProfileFrame> _frames = new();
-    private readonly HashSet<string> _collapsedPaths = new(StringComparer.Ordinal);
+    private List<ProfileFrame> _frames = new();
+    private HashSet<string> _collapsedPaths = new(StringComparer.Ordinal);
     private Button _startButton;
     private Button _stopButton;
     private Button _copyButton;
@@ -108,14 +113,15 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private int _stopSignalInvocations;
     private int _optionsSignalInvocations;
     private bool _rebuildingTree;
-    private readonly List<string> _displayedRowsForTests = new();
+    private List<string> _displayedRowsForTests = new();
     private int _protocolResultRowsForTests;
     private int _samplingResultRowsForTests;
     private bool _sessionActive;
-    private readonly CsProfilerSessionDiscoveryState _discovery = new();
+    private CsProfilerSessionDiscoveryState _discovery = new();
     private string _runtimeDescription = "";
     private double _lastFrameAtSec = double.NegativeInfinity;
     private bool _profilingRequested;
+    private bool _reloadTransportBound;
     private ProfilerDockController _controller;
     internal ModeConfiguration ConfigurationForProtocol => _controller?.Configuration ?? ModeConfiguration.Default;
     internal string StatusTextForTests => _statsLabel?.Text ?? "";
@@ -127,6 +133,134 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     internal int SelectedBatchRowsForTests => _selectedBatchTree?.GetRoot()?.GetChildCount() ?? 0;
     internal bool SettingsVisibleForTests => _settingsPopup?.Visible == true;
     internal void OpenSettingsForTests() => ShowSettings();
+
+    internal void RememberReloadOwners(CsProfilerDebuggerPlugin debugger, CsProfilerPlugin owner)
+    {
+        SetMeta(ReloadDebuggerInstanceMeta, unchecked((long)debugger.GetInstanceId()));
+        SetMeta(ReloadOwnerPluginInstanceMeta, unchecked((long)owner.GetInstanceId()));
+        _reloadTransportBound = true;
+    }
+
+    internal bool RecoverAfterManagedReload()
+    {
+        if (_controller != null && _reloadTransportBound) return true;
+        if (!IsInsideTree()) return false;
+        if (_controller == null)
+        {
+            _frames = new List<ProfileFrame>();
+            _collapsedPaths = new HashSet<string>(StringComparer.Ordinal);
+            _displayedRowsForTests = new List<string>();
+            _expandedGroups = new HashSet<string>(StringComparer.Ordinal);
+            _discovery = new CsProfilerSessionDiscoveryState();
+            _selectedIndex = -1;
+            _liveFollow = true;
+            _runtimeDescription = "";
+            _lastFrameAtSec = double.NegativeInfinity;
+            ClearSurfaceReferences();
+            foreach (var child in GetChildren().OfType<Node>().ToArray())
+            {
+                RemoveChild(child);
+                child.QueueFree();
+            }
+            InitializeSurface();
+        }
+        var debugger = ResolveReloadObject<CsProfilerDebuggerPlugin>(ReloadDebuggerInstanceMeta);
+        if (debugger == null) return false;
+        debugger.Initialize(this);
+        var owner = ResolveReloadObject<CsProfilerPlugin>(ReloadOwnerPluginInstanceMeta);
+        owner?.RecoverPanelAfterManagedReload(this);
+        _reloadTransportBound = true;
+        return _controller != null && _startButton != null && _stopButton != null;
+    }
+
+    private T ResolveReloadObject<T>(string metadata) where T : GodotObject
+    {
+        if (!HasMeta(metadata)) return null;
+        var id = unchecked((ulong)GetMeta(metadata).AsInt64());
+        return id == 0 ? null : InstanceFromId(id) as T;
+    }
+
+    private void PersistReloadState(ProfilerDockReloadState state)
+    {
+        try
+        {
+            var json = JsonSerializer.Serialize(state);
+            if (json.Length <= MaximumReloadStateCharacters)
+                SetMeta(ReloadStateMeta, json);
+            else
+                RemoveMeta(ReloadStateMeta);
+        }
+        catch (Exception error) when (error is JsonException or NotSupportedException or OverflowException)
+        {
+            RemoveMeta(ReloadStateMeta);
+        }
+    }
+
+    private ProfilerDockReloadState ReadReloadState()
+    {
+        if (!HasMeta(ReloadStateMeta)) return null;
+        try
+        {
+            var json = GetMeta(ReloadStateMeta).AsString();
+            if (json.Length == 0 || json.Length > MaximumReloadStateCharacters)
+                throw new JsonException("Profiler reload state is outside the allowed size.");
+            var state = JsonSerializer.Deserialize<ProfilerDockReloadState>(json);
+            if (state?.SchemaVersion != ProfilerDockReloadState.CurrentSchemaVersion)
+                throw new JsonException("Profiler reload state schema is unsupported.");
+            return state;
+        }
+        catch (Exception error) when (error is JsonException or NotSupportedException or ArgumentException)
+        {
+            RemoveMeta(ReloadStateMeta);
+            return null;
+        }
+    }
+
+    private void ClearSurfaceReferences()
+    {
+        _controller = null;
+        _startButton = null;
+        _stopButton = null;
+        _copyButton = null;
+        _exportButton = null;
+        _settingsButton = null;
+        _automaticCaptureButton = null;
+        _includeManualButton = null;
+        _includeProfilerInternals = null;
+        _frameSelector = null;
+        _targetLabel = null;
+        _instanceSelector = null;
+        _expandAllButton = null;
+        _collapseAllButton = null;
+        _statsLabel = null;
+        _performanceLabel = null;
+        _samplingFilter = null;
+        _settingsLabel = null;
+        _qualityLabel = null;
+        _samplingIncludes = null;
+        _samplingExcludes = null;
+        _samplingInterval = null;
+        _automaticIncludes = null;
+        _automaticExcludes = null;
+        _automaticMaximum = null;
+        _manualPrefix = null;
+        _samplingSettings = null;
+        _automaticSettings = null;
+        _manualSettings = null;
+        _previewInstallButton = null;
+        _previewUninstallButton = null;
+        _applyInstallButton = null;
+        _previewDiff = null;
+        _settingsPopup = null;
+        _resultTabs = null;
+        _selectedBatchTree = null;
+        _callContextMenu = null;
+        _selectedTimelinePoint = null;
+        _graph = null;
+        _tree = null;
+        _pendingPreviewToken = null;
+    }
+
     internal bool RunNativeSignalUiProbeForTests()
     {
         _startButton.Disabled = false;
@@ -223,10 +357,14 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
 
     public override void _Ready()
     {
+        if (_controller == null)
+            InitializeSurface();
+    }
+
+    private void InitializeSurface()
+    {
         SizeFlagsVertical = SizeFlags.ExpandFill;
         CustomMinimumSize = Vector2.Zero;
-        _controller = new ProfilerDockController(this, this, CreateInstallerSafely(), this);
-        _controller.UpdateSampling(new SamplingSettings(ProjectAssemblyName(), ProfilerSelfFilter, 2_000_000));
 
         var toolbar = new HBoxContainer();
         AddChild(toolbar);
@@ -377,7 +515,17 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         AddChild(_callContextMenu);
 
         BuildSettingsUi();
-        Connect(Control.SignalName.Resized, new Callable(this, nameof(ApplyResponsiveLayout)));
+        var reloadState = ReadReloadState();
+        _controller = new ProfilerDockController(this, this, CreateInstallerSafely(), this,
+            reloadState, PersistReloadState);
+        if (reloadState is null)
+            _controller.UpdateSampling(new SamplingSettings(ProjectAssemblyName(), ProfilerSelfFilter, 2_000_000));
+        else
+            PersistReloadState(_controller.CreateReloadSnapshot());
+        SyncSettingsControls(_controller.Configuration);
+        var resized = new Callable(this, nameof(ApplyResponsiveLayout));
+        if (!IsConnected(Control.SignalName.Resized, resized))
+            Connect(Control.SignalName.Resized, resized);
         ApplyResponsiveLayout();
 
         if (_discovery.BridgeReady)
@@ -508,12 +656,43 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
 
     private void OnStartPressed()
     {
+        if (_controller == null || !_reloadTransportBound)
+        {
+            if (!TryHandoffRetainedStartIntent())
+            {
+                _profilingRequested = false;
+                GD.PushWarning("Profiler UI could not recover after the game rebuild; disable and re-enable the plugin once.");
+                return;
+            }
+            if (!RecoverAfterManagedReload())
+                GD.PushWarning("Profiler UI could not recover after the game rebuild; disable and re-enable the plugin once.");
+            return;
+        }
+        CompleteStartRequest();
+    }
+
+    private bool TryHandoffRetainedStartIntent()
+    {
+        var debugger = ResolveReloadObject<CsProfilerDebuggerPlugin>(ReloadDebuggerInstanceMeta);
+        if (debugger == null) return false;
+        var configuration = ReadReloadState()?.Configuration ?? ModeConfiguration.Default;
+        debugger.QueueStartAfterManagedReload(configuration);
+        return true;
+    }
+
+    private void CompleteStartRequest()
+    {
         _startSignalInvocations++;
         if (_controller.RequestStart()) _profilingRequested = true;
     }
 
     private void OnStopPressed()
     {
+        if (!RecoverAfterManagedReload())
+        {
+            GD.PushWarning("Profiler UI could not recover after the game rebuild; disable and re-enable the plugin once.");
+            return;
+        }
         _stopSignalInvocations++;
         if (_controller.Stop()) _profilingRequested = false;
     }
@@ -585,7 +764,10 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private void OnSamplingExcludesChanged(string text) =>
         _controller.UpdateSampling(CurrentSampling() with { ExcludeAssemblies = text });
     private void OnSamplingIntervalChanged(double value) =>
-        _controller.UpdateSampling(CurrentSampling() with { RequestedIntervalNanoseconds = (long)value });
+        _controller.UpdateSampling(CurrentSampling() with
+        {
+            RequestedIntervalNanoseconds = (long)(value * 1_000_000)
+        });
     private void OnAutomaticIncludesChanged(string text) =>
         _controller.UpdateAutomatic(CurrentAutomatic() with { IncludePatterns = text });
     private void OnAutomaticExcludesChanged(string text) =>
@@ -657,6 +839,21 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
         return spin;
     }
 
+    private void SyncSettingsControls(ModeConfiguration configuration)
+    {
+        _automaticCaptureButton?.SetPressedNoSignal(
+            configuration.Primary == PrimaryMode.AutomaticInstrumentation);
+        _includeManualButton?.SetPressedNoSignal(configuration.IncludeManual);
+        if (_samplingIncludes != null) _samplingIncludes.Text = configuration.Sampling.IncludeAssemblies;
+        if (_samplingExcludes != null) _samplingExcludes.Text = configuration.Sampling.ExcludeAssemblies;
+        if (_samplingInterval != null)
+            _samplingInterval.SetValueNoSignal(configuration.Sampling.RequestedIntervalNanoseconds / 1_000_000.0);
+        if (_automaticIncludes != null) _automaticIncludes.Text = configuration.Automatic.IncludePatterns;
+        if (_automaticExcludes != null) _automaticExcludes.Text = configuration.Automatic.ExcludePatterns;
+        if (_automaticMaximum != null) _automaticMaximum.SetValueNoSignal(configuration.Automatic.MaxMethods);
+        if (_manualPrefix != null) _manualPrefix.Text = configuration.Manual.LabelPrefix;
+    }
+
     private SamplingSettings CurrentSampling() => new(_samplingIncludes?.Text ?? "",
         _samplingExcludes?.Text ?? "", (long)((_samplingInterval?.Value ?? 2) * 1_000_000));
     private AutomaticSettings CurrentAutomatic() => new(_automaticIncludes?.Text ?? "Game",
@@ -697,8 +894,13 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             return;
         _targetLabel.Text = state.Target;
         _statsLabel.Text = state.Status;
-        _automaticCaptureButton?.SetPressedNoSignal(
-            _controller.Configuration.Primary == PrimaryMode.AutomaticInstrumentation);
+        var samplingSelected = state.ModeSegments.Any(mode =>
+            mode.Label == "Sampling" && mode.Selected);
+        var automaticSelected = state.ModeSegments.Any(mode =>
+            mode.Label == "Automatic" && mode.Selected);
+        var manualSelected = state.ModeSegments.Any(mode =>
+            mode.Label == "Manual" && mode.Selected);
+        _automaticCaptureButton?.SetPressedNoSignal(automaticSelected);
         ApplyMode(_includeManualButton, state.ManualOverlay);
         _startButton.Disabled = !state.Commands.Start;
         _stopButton.Disabled = !state.Commands.Stop;
@@ -708,10 +910,9 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
             ? ""
             : state.InstallerStatus;
         _qualityLabel.Text = state.QualityBanner;
-        var primary = _controller.Configuration.Primary;
-        _samplingSettings.Visible = primary == PrimaryMode.Sampling;
-        _automaticSettings.Visible = primary == PrimaryMode.AutomaticInstrumentation;
-        _manualSettings.Visible = primary == PrimaryMode.None || _controller.Configuration.IncludeManual;
+        _samplingSettings.Visible = samplingSelected;
+        _automaticSettings.Visible = automaticSelected;
+        _manualSettings.Visible = manualSelected || state.ManualOverlay.Selected;
         _previewDiff.Text = state.InstallerPreviewDiff;
         if (string.IsNullOrEmpty(state.InstallerPreviewDiff))
         {
@@ -893,6 +1094,9 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     internal void ApplyProtocolTimeline(CaptureTimeline timeline) =>
         _controller?.UpdateTimeline(timeline);
 
+    internal void ApplyProtocolTerminalCapture(ProfilerTerminalCapture capture) =>
+        _controller?.ReplaceTerminalCapture(capture);
+
     internal void OnBridgeReady(CsProfilerRuntimeIdentity identity)
     {
         _sessionActive = true;
@@ -905,12 +1109,6 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     private void ApplyBridgeReadyUi(CsProfilerRuntimeIdentity identity)
     {
         _runtimeDescription = FormatRuntimeDescription(identity);
-        if (identity.Capturing && !_profilingRequested)
-        {
-            // A managed editor-plugin reload replaces the panel but need not stop runtime capture.
-            _profilingRequested = true;
-            _liveFollow = true;
-        }
         if (_frames.Count == 0 && _statsLabel != null)
         {
             _statsLabel.Text = ProfilingRequested || identity.Capturing
@@ -1193,7 +1391,7 @@ public partial class CsProfilerPanel : VBoxContainer, IProfilerDockView, IProfil
     }
 
     private const string GroupMetadataPrefix = "group:";
-    private readonly HashSet<string> _expandedGroups = new(StringComparer.Ordinal);
+    private HashSet<string> _expandedGroups = new(StringComparer.Ordinal);
 
     private sealed record TimelineRowGroup(string Name, long Samples, double Share, long Calls,
         double WallMilliseconds, double MaximumMilliseconds, IReadOnlyList<ResultRow> Rows);

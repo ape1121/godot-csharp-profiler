@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Runtime.Loader;
 using Apeworks.GodotCSharpProfiler.Runtime.Sampling;
 
 namespace GodotCSharpProfiler.Sampling.Tests;
@@ -15,6 +16,88 @@ public sealed class ManagedSamplingSessionTests
         Assert.Equal(ManagedSamplingSessionState.Running, session.State);
         await Task.WhenAll(session.StopAsync(), session.StopAsync());
         Assert.Equal(ManagedSamplingSessionState.Stopped, session.State);
+    }
+
+    [Fact]
+    public async Task StopTimeoutClosesContinuationAndWaitsForProcessingQuiescence()
+    {
+        var control = new FakeTraceEpochControl(acknowledgeOnStop: false);
+        using var epoch = new ManagedSamplingTraceEpoch(control, TimeSpan.FromMilliseconds(20));
+
+        var first = epoch.StopAsync();
+        var second = epoch.StopAsync();
+        await WaitUntilAsync(() => control.Aborts == 1, TimeSpan.FromSeconds(2));
+
+        Assert.Same(first, second);
+        Assert.False(first.IsCompleted);
+        Assert.Equal(1, control.StopCalls);
+        Assert.True(control.ProcessExited);
+
+        control.AcknowledgeStop();
+        var result = await first.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.True(result.StreamAborted);
+        Assert.Equal(1, control.StopCalls);
+        Assert.Equal(1, control.Aborts);
+        Assert.Equal(1, control.Disposals);
+    }
+
+    [Fact]
+    public async Task ConcurrentEpochStopCallersShareExactlyOneStopOperation()
+    {
+        var control = new FakeTraceEpochControl(acknowledgeOnStop: true);
+        using var epoch = new ManagedSamplingTraceEpoch(control, TimeSpan.FromSeconds(1));
+
+        var results = await Task.WhenAll(epoch.StopAsync(), epoch.StopAsync());
+
+        Assert.Equal(1, control.StopCalls);
+        Assert.Equal(1, control.Disposals);
+        Assert.All(results, result => Assert.False(result.StreamAborted));
+    }
+
+    [Fact]
+    public async Task FailedAbortRetainsOwnershipUntilTheOriginalEpochQuiesces()
+    {
+        var control = new FakeTraceEpochControl(acknowledgeOnStop: false, quiesceOnAbort: false);
+        await using var first = new ManagedSamplingSession(new SamplingOptions(),
+            () => new ManagedSamplingTraceEpoch(control, TimeSpan.FromMilliseconds(20)));
+        await using var replacement = new ManagedSamplingSession(new SamplingOptions(),
+            () => new ManagedSamplingTraceEpoch(new FakeTraceEpochControl(true), TimeSpan.FromSeconds(1)));
+        await first.StartAsync();
+
+        var stop = first.StopAsync();
+        await WaitUntilAsync(() => control.Aborts == 1, TimeSpan.FromSeconds(2));
+        Assert.False(stop.IsCompleted);
+        Assert.Equal(ManagedSamplingSessionState.Stopping, first.State);
+        var busy = await Assert.ThrowsAsync<InvalidOperationException>(() => replacement.StartAsync());
+        Assert.Contains("already active", busy.Message, StringComparison.OrdinalIgnoreCase);
+
+        control.AcknowledgeStop();
+        control.ReleaseProcessing();
+        await stop.WaitAsync(TimeSpan.FromSeconds(2));
+        await replacement.StartAsync();
+        await replacement.StopAsync();
+    }
+
+    [Fact]
+    public async Task LateRotationCannotStopReplacementEpoch()
+    {
+        var firstControl = new FakeTraceEpochControl(true);
+        var replacementControl = new FakeTraceEpochControl(true);
+        var controls = new Queue<FakeTraceEpochControl>([firstControl, replacementControl]);
+        await using var session = new ManagedSamplingSession(new SamplingOptions(),
+            () => new ManagedSamplingTraceEpoch(controls.Dequeue(), TimeSpan.FromSeconds(1)));
+        await session.StartAsync();
+        var first = session.CurrentEpochForTests!;
+
+        await session.RotateTraceEpochAsync(first);
+        var replacement = session.CurrentEpochForTests!;
+        await session.RotateTraceEpochAsync(first);
+
+        Assert.NotSame(first, replacement);
+        Assert.Equal(ManagedSamplingSessionState.Running, session.State);
+        Assert.Equal(1, firstControl.StopCalls);
+        Assert.Equal(0, replacementControl.StopCalls);
+        await session.StopAsync();
     }
 
     [Fact]
@@ -89,6 +172,35 @@ public sealed class ManagedSamplingSessionTests
         await first.StopAsync();
         await second.StartAsync();
         await second.StopAsync();
+    }
+
+    [Fact]
+    public void ProcessLeaseIsExclusiveAcrossCollectibleAssemblyContexts()
+    {
+        var assemblyPath = typeof(ManagedSamplingSessionTests).Assembly.Location;
+        var firstContext = new CollectibleProbeLoadContext("sampling-lease-first");
+        var secondContext = new CollectibleProbeLoadContext("sampling-lease-second");
+        Type? firstProbe = null;
+        Type? secondProbe = null;
+        try
+        {
+            firstProbe = firstContext.LoadFromAssemblyPath(assemblyPath).GetType(
+                "GodotCSharpProfiler.Sampling.Tests.CrossContextSamplingLeaseProbe", throwOnError: true)!;
+            secondProbe = secondContext.LoadFromAssemblyPath(assemblyPath).GetType(
+                "GodotCSharpProfiler.Sampling.Tests.CrossContextSamplingLeaseProbe", throwOnError: true)!;
+
+            Assert.True(InvokeLeaseProbe(firstProbe, "TryAcquire"));
+            Assert.False(InvokeLeaseProbe(secondProbe, "TryAcquire"));
+            InvokeLeaseProbe(firstProbe, "Release");
+            Assert.True(InvokeLeaseProbe(secondProbe, "TryAcquire"));
+        }
+        finally
+        {
+            if (firstProbe is not null) InvokeLeaseProbe(firstProbe, "Release");
+            if (secondProbe is not null) InvokeLeaseProbe(secondProbe, "Release");
+            firstContext.Unload();
+            secondContext.Unload();
+        }
     }
 
     [Fact]
@@ -177,6 +289,42 @@ public sealed class ManagedSamplingSessionTests
         Assert.Equal(artifactsBefore, GetTraceArtifacts());
     }
 
+    private sealed class FakeTraceEpochControl(
+        bool acknowledgeOnStop,
+        bool quiesceOnAbort = true) : IManagedSamplingTraceEpochControl
+    {
+        private readonly TaskCompletionSource<bool> _acknowledged = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource<bool> _processed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public int StopCalls { get; private set; }
+        public int Aborts { get; private set; }
+        public int Disposals { get; private set; }
+        public bool ProcessExited => _processed.Task.IsCompleted;
+
+        public Task ProcessAsync() => _processed.Task;
+        public Task RequestStopAsync()
+        {
+            StopCalls++;
+            if (acknowledgeOnStop)
+            {
+                AcknowledgeStop();
+                _processed.TrySetResult(true);
+            }
+            return _acknowledged.Task;
+        }
+        public void AbortStream()
+        {
+            Aborts++;
+            if (quiesceOnAbort) _processed.TrySetResult(true);
+        }
+        public void ReleaseProcessing() => _processed.TrySetResult(true);
+        public void Dispose()
+        {
+            Disposals++;
+            _processed.TrySetResult(true);
+        }
+        public void AcknowledgeStop() => _acknowledged.TrySetResult(true);
+    }
+
     [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.NoOptimization)]
     private static long SamplingSmokeHotMethod() => SamplingSoakHotMethod();
 
@@ -186,6 +334,15 @@ public sealed class ManagedSamplingSessionTests
         long value = 17;
         for (var i = 0; i < 10_000; i++) value = unchecked(value * 31 + i);
         return value;
+    }
+
+    private static bool InvokeLeaseProbe(Type probe, string method) =>
+        (bool)(probe.GetMethod(method, System.Reflection.BindingFlags.Public |
+            System.Reflection.BindingFlags.Static)!.Invoke(null, null) ?? false);
+
+    private sealed class CollectibleProbeLoadContext(string name) : AssemblyLoadContext(name, isCollectible: true)
+    {
+        protected override System.Reflection.Assembly? Load(System.Reflection.AssemblyName assemblyName) => null;
     }
 
     private static HashSet<string> GetTraceArtifacts() =>

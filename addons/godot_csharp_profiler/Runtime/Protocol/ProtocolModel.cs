@@ -39,7 +39,7 @@ public enum CaptureSource { Sampling, AutomaticSpans, ManualSpans }
 public enum CaptureCompleteness { InProgress, Complete, Partial }
 public enum PartialReason { None, RequestedStop, BufferOverflow, TransportLoss, RuntimeError, Disconnected }
 public enum CaptureState { Disconnected, Negotiating, Ready, Starting, Capturing, Stopping, Complete, Partial, Busy, Error }
-public enum MessageKind { Hello, Capabilities, Configure, Start, State, Batch, Stop, Error }
+public enum MessageKind { Hello, Capabilities, Configure, Start, State, Batch, Stop, Reset, ResetAck, Error }
 public enum ParseFailure { None, Malformed, Oversized, IncompatibleMajor, InvalidSemantics }
 
 public readonly record struct QualityCounters(long Observed, long Dropped, long Overflowed, long Invalid)
@@ -84,6 +84,10 @@ public sealed record BatchMessage(int Major, int Minor, string RuntimeToken, lon
     : ProtocolMessage(Major, Minor, RuntimeToken);
 public sealed record StopMessage(int Major, int Minor, string RuntimeToken, long Generation, long Sequence,
     string Fingerprint) : ProtocolMessage(Major, Minor, RuntimeToken);
+public sealed record ResetMessage(int Major, int Minor, string RuntimeToken, long Generation, string RequestId)
+    : ProtocolMessage(Major, Minor, RuntimeToken);
+public sealed record ResetAckMessage(int Major, int Minor, string RuntimeToken, long Generation, string RequestId)
+    : ProtocolMessage(Major, Minor, RuntimeToken);
 public sealed record ErrorMessage(int Major, int Minor, string RuntimeToken, long Generation, long Sequence,
     int Code, string Message, bool Fatal) : ProtocolMessage(Major, Minor, RuntimeToken);
 
@@ -93,7 +97,8 @@ public static class MessageKindExtensions
     {
         MessageKind.Hello => "hello", MessageKind.Capabilities => "capabilities",
         MessageKind.Configure => "configure", MessageKind.Start => "start", MessageKind.State => "state",
-        MessageKind.Batch => "batch", MessageKind.Stop => "stop", MessageKind.Error => "error",
+        MessageKind.Batch => "batch", MessageKind.Stop => "stop", MessageKind.Reset => "reset",
+        MessageKind.ResetAck => "reset_ack", MessageKind.Error => "error",
         _ => throw new ArgumentOutOfRangeException(nameof(kind))
     };
 }
@@ -110,6 +115,8 @@ public static class ProtocolSchema
             [MessageKind.State] = ["kind", "major", "minor", "runtimeToken", "generation", "sequence", "fingerprint", "state", "source", "completeness", "partialReason", "observed", "dropped", "overflowed", "invalid"],
             [MessageKind.Batch] = ["kind", "major", "minor", "runtimeToken", "generation", "sequence", "fingerprint", "source", "exactCalls", "cpuTime", "observed", "dropped", "overflowed", "invalid", "methods"],
             [MessageKind.Stop] = ["kind", "major", "minor", "runtimeToken", "generation", "sequence", "fingerprint"],
+            [MessageKind.Reset] = ["kind", "major", "minor", "runtimeToken", "generation", "requestId"],
+            [MessageKind.ResetAck] = ["kind", "major", "minor", "runtimeToken", "generation", "requestId"],
             [MessageKind.Error] = ["kind", "major", "minor", "runtimeToken", "generation", "sequence", "code", "message", "fatal"]
         };
 
